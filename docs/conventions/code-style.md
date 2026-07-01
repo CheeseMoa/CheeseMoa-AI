@@ -1,6 +1,6 @@
-# SelecPic-AI 코드 컨벤션
+# CheeseMoa-AI 코드 컨벤션
 
-SelecPic-AI FastAPI 서버(`app/`)의 코드 작성 규칙을 정의한다.
+CheeseMoa-AI 워커 서버(`app/`)의 코드 작성 규칙을 정의한다.
 자동 강제 가능한 항목은 아래 파일로 설정돼 있어 저장 시 자동 적용된다.
 
 - `ruff.toml` (또는 `pyproject.toml`) — 린트·포맷 규칙
@@ -59,7 +59,7 @@ def detect_faces(image: np.ndarray) -> list[FaceResult]:
 import 순서:
 
 1. 표준 라이브러리 (`os`, `pathlib` 등)
-2. 서드파티 패키지 (`fastapi`, `numpy`, `cv2` 등)
+2. 서드파티 패키지 (`boto3`, `numpy`, `cv2` 등)
 3. 프로젝트 내부 모듈 (`app.pipeline`, `app.schemas` 등)
 
 같은 그룹 안에서는 알파벳순. 사용하지 않는 import는 남기지 않는다 (ruff 자동 정리).
@@ -68,12 +68,12 @@ import 순서:
 import os
 from pathlib import Path
 
+import boto3
 import cv2
 import numpy as np
-from fastapi import FastAPI
 
 from app.pipeline.detect import detect_faces
-from app.schemas.classification import ClassificationRequest
+from app.schemas.messages import ClassifyRequest
 ```
 
 ## 함수 규칙
@@ -82,18 +82,17 @@ from app.schemas.classification import ClassificationRequest
 - parameter가 많아지면 Pydantic 모델 또는 dataclass로 묶는다.
 - early return으로 중첩을 줄인다.
 
-## 비동기 규칙
+## 워커 / CPU 바운드 규칙
 
-- FastAPI 엔드포인트는 `async def`로 작성한다.
-- CPU 바운드 작업(AI 추론)은 `run_in_executor`로 스레드풀에 위임한다.
-- async 함수의 return type을 명시한다.
+- 워커는 SQS 메시지를 폴링해 메시지 단위로 파이프라인을 실행한다.
+- AI 추론은 CPU/GPU 바운드다. I/O(SQS 폴링·S3·pgvector)와 추론 단계를 분리해 블로킹을 최소화한다.
+- 동시 처리가 필요하면 스레드/프로세스 풀로 병렬화한다. 한 메시지 실패가 다른 메시지를 죽이지 않게 격리한다.
+- 함수의 return type을 명시한다.
 
 ```python
-async def classify(request: ClassificationRequest) -> ClassificationResult:
-    result = await asyncio.get_event_loop().run_in_executor(
-        None, run_pipeline, request.image_urls
-    )
-    return result
+def handle_message(message: ClassifyRequest) -> ClassifyResult:
+    faces = run_pipeline(message.images)
+    return build_result(message.job_id, faces)
 ```
 
 ## 주석 규칙
@@ -104,11 +103,11 @@ async def classify(request: ClassificationRequest) -> ClassificationResult:
 - TODO: 이슈 번호와 함께 작성.
 
 ```python
-# TODO(CLAS-XX): iOS 갤러리 권한 fallback 제거
+# TODO(CHMO-XX): 재조정 overlap 임계값 설정값으로 분리
 ```
 
 ## AI 파이프라인 코드 특이사항
 
-- 모델 로딩은 서버 시작 시 1회만 수행한다 (FastAPI lifespan 또는 모듈 레벨).
+- 모델 로딩은 워커 시작 시 1회만 수행한다 (모듈 레벨 또는 워커 부트스트랩).
 - numpy 배열 shape은 주석이나 변수명으로 명확히 한다 (예: `face_112x112`).
 - magic number는 상수로 분리한다 (예: `EMBED_DIM = 512`, `ALIGN_SIZE = 112`).
