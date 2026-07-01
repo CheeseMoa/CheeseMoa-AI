@@ -4,6 +4,7 @@
 env/
 venv/
 ENV/
+.claude/
 
 # Python caching
 __pycache__/
