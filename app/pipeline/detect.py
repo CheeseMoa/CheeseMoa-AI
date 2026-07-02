@@ -63,6 +63,21 @@ def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
   return x0, y0, max(0, x1 - x0), max(0, y1 - y0)
 
 
+def _to_contiguous_bgr(image: np.ndarray) -> np.ndarray:
+  """YuNet 입력 계약(C-연속 메모리의 3채널 BGR)에 맞게 정규화한다.
+
+  호출자는 보통 cv2.imdecode(IMREAD_COLOR)로 연속 BGR을 넘기지만, 그레이스케일·알파 채널·
+  RGB→BGR 뷰(`img[..., ::-1]` 등 비연속) 같은 변형 입력이 와도 detect()가 예외 없이 동작하도록
+  방어한다. 비연속 버퍼는 DNN 순전파에 그대로 넘기면 오검출/에러를 낳으므로 마지막에 연속성을
+  보장한다. dtype 변환(uint16/float→uint8)은 스케일 의미가 모호해 여기서 손대지 않는다.
+  """
+  if image.ndim == 2 or (image.ndim == 3 and image.shape[2] == 1):
+    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)  # (H,W) / (H,W,1) 그레이스케일 → BGR
+  elif image.ndim == 3 and image.shape[2] == 4:
+    image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)  # 알파 채널 제거
+  return np.ascontiguousarray(image)  # 3채널 통과 경로 포함, 비연속 뷰를 연속 버퍼로 확정
+
+
 class FaceDetector:
   """YuNet 얼굴 검출기.
 
@@ -87,6 +102,7 @@ class FaceDetector:
 
   def detect(self, image: np.ndarray) -> list[DetectedFace]:
     """디코딩된 BGR 이미지에서 얼굴을 검출한다. 정상 ndarray에는 예외를 던지지 않는다."""
+    image = _to_contiguous_bgr(image)  # 채널/연속성 정규화 후 원본 좌표계(h, w)를 확정
     h, w = image.shape[:2]
     scale = 1.0
     frame = image
