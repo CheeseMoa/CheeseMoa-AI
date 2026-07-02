@@ -31,7 +31,8 @@ app/
     detect.py          # YuNet 얼굴 감지
     align.py           # face_align 직접 구현 (Umeyama)
     embed.py           # AuraFace 임베딩
-    cluster.py         # HDBSCAN 전체 재군집 + cluster_id 재조정
+    cluster.py         # 전체 재군집 + cluster_id 재조정 (순수 로직)
+    hdbscan_standalone.py  # HDBSCAN numpy 전용 이식본 (PoC 검증, cluster.py가 사용)
   schemas/             # Pydantic 메시지 스키마
     messages.py        # ClassifyRequest, ClassifyResult, ClusterFeedback
 ```
@@ -60,7 +61,8 @@ worker ──▶ messaging ──▶ (외부: SQS)
 | `pipeline/detect.py` | YuNet 모델 로딩 및 얼굴 감지 실행 |
 | `pipeline/align.py` | Umeyama 변환 계산 및 112×112 정렬 이미지 생성 |
 | `pipeline/embed.py` | AuraFace 모델 로딩 및 512-dim 벡터 생성 |
-| `pipeline/cluster.py` | 전체 임베딩 HDBSCAN 재군집 + 기존 `cluster_id` 재조정, 클러스터 레이블 반환 |
+| `pipeline/cluster.py` | 전체 임베딩 HDBSCAN 재군집 + 보정 제약 강제 + 기존 `cluster_id` 재조정·대표벡터 계산 (저장소를 모르는 순수 로직) |
+| `pipeline/hdbscan_standalone.py` | HDBSCAN 알고리즘의 numpy 전용 이식본 ([ADR 005](../decisions/005-hdbscan-standalone-port.md)) |
 | `schemas/` | SQS 메시지 입출력 데이터 형식 정의 (Pydantic v2) |
 
 ## 명명

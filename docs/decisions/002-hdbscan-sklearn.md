@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 005](./005-hdbscan-standalone-port.md) — 구현체가 PoC의 numpy 전용
+이식본(`hdbscan_standalone.py`)으로 바뀌었다. HDBSCAN **알고리즘** 채택 근거(아래 Rationale의
+UnionFind 임계값 방식 대비 ARI 2.7배)는 여전히 유효하다.
 
 ## Context
 
