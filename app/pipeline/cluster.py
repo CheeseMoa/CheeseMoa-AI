@@ -3,9 +3,9 @@
 군집의 진실은 group 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집이다 (ADR-003).
 이 모듈은 저장소(pgvector)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
 
-  ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine)
+  ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 균질 blob은 단일 클러스터로 승격
   ② 사용자 보정(must-link/cannot-link) 후처리 강제 — 재군집이 사람 결정을 뒤집지 않게
-  ③ 파편 병합 — centroid 유사도가 동일 인물 수준인 클러스터 병합 (단일 인물 파편화 교정, ADR 005)
+  ③ 파편 병합 — centroid 유사도가 동일 인물 수준인 클러스터 병합 (완전 연결, 단일 인물 파편화 교정, ADR 005)
   ④ 노이즈 구제 — 최근접 centroid 유사도가 충분한 노이즈 얼굴을 클러스터에 편입
   ⑤ 저신뢰 분리 — 절대 유사도·2위 마진 임계 미달 멤버를 ambiguous로 분리 (TBD #3 기본 정책)
   ⑥ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
@@ -73,6 +73,18 @@ class ClusterConfig:
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
         raise ValueError(f"{name}은(는) [0, 1] 범위여야 합니다. 받은 값: {value}")
+    if self.cluster_selection_epsilon > 2.0:
+      # cosine 거리 범위는 [0, 2] — 밖의 값은 기하학적으로 무의미한데도 조용히 동작해 군집 선택을 왜곡한다
+      raise ValueError(
+        f"cluster_selection_epsilon은 cosine 거리 범위 [0, 2] 안이어야 합니다. 받은 값: {self.cluster_selection_epsilon}"
+      )
+    if self.rescue_similarity < self.min_membership_similarity:
+      # 이 순서가 깨지면 [rescue, floor) 대역에서 구제된 얼굴이 같은 실행의 저신뢰 축출에서 곧바로
+      # 노이즈로 재강등된다 — 구제 시점과 축출 시점의 자기 제외 유사도가 정확히 같기 때문 (리뷰 재현).
+      raise ValueError(
+        "rescue_similarity는 min_membership_similarity 이상이어야 합니다. "
+        f"받은 값: rescue={self.rescue_similarity}, floor={self.min_membership_similarity}"
+      )
 
 
 @dataclass(frozen=True)
@@ -96,6 +108,11 @@ class PersonCluster:
   cluster_id: str
   is_new: bool  # 이번 재조정에서 기존 cluster_id 승계에 실패해 새로 발급된 인물인지
   member_indices: tuple[int, ...]  # 입력 embeddings의 행 인덱스 (오름차순)
+  # 멤버별 자기 클러스터 신뢰도 — leave-one-out centroid 코사인 유사도, 저신뢰 축출과 동일 정의
+  # (member_indices와 자리 대응, 단독 멤버는 1.0). 워커가 uncertain reason·저신뢰 표시
+  # (feature-spec §6.2·§7·TBD #2)에 쓸 값을 재계산 없이 노출한다 — 외부 재계산은 LOO 보정·
+  # cannot-link 마진 제외가 빠져 축출 결정과 어긋난 신뢰도를 만든다 (리뷰 지적).
+  membership_similarities: tuple[float, ...]
   # 조회·표시용 파생 캐시(멤버 임베딩의 L2 정규화 평균) — 군집 판단의 원천이 아니다 (ADR-003).
   # ndarray 필드의 자동 __eq__는 진리값 모호성으로 예외를 던지므로 비교 대상에서 제외한다 (DetectedFace와 동일).
   centroid: np.ndarray = field(compare=False)  # shape (EMBED_DIM,), float32
@@ -106,7 +123,9 @@ class ReclusterResult:
   """`recluster` 1회 실행의 결과 — 결과 메시지(classify-result)와 pgvector 갱신의 원천."""
 
   clusters: tuple[PersonCluster, ...]  # 최소 멤버 인덱스 오름차순
-  noise_indices: tuple[int, ...]  # 밀도상 어느 인물에도 못 붙고 구제도 안 된 얼굴 (uncertain 후보)
+  # 어느 인물에도 배정되지 않은 얼굴 (uncertain 후보) — 밀도 노이즈(구제 실패)뿐 아니라
+  # 저신뢰 절대 바닥 미달로 클러스터에서 강등된 얼굴도 포함한다
+  noise_indices: tuple[int, ...]
   ambiguous_indices: tuple[
     int, ...
   ]  # 인물 배정이 저신뢰(절대 유사도·마진 미달)라 분리된 얼굴 (uncertain 'ambiguous' 후보)
@@ -157,6 +176,10 @@ def _must_link_components(n: int, constraints: Constraints) -> tuple[list[int], 
   for idx in range(n):
     components.setdefault(comp_of[idx], []).append(idx)
   for i, j in constraints.cannot_link:
+    if i == j:
+      # 일반 모순 검사(comp_of[i] == comp_of[j])에 맡기면 존재하지 않는 must-link를 탓하는
+      # 오도성 메시지가 나간다 (리뷰 재현) — 보정 메시지 번역 버그는 원인 그대로 알려준다
+      raise ValueError(f"cannot-link 쌍은 서로 다른 얼굴이어야 합니다. 받은 쌍: ({i}, {j})")
     if comp_of[i] == comp_of[j]:
       raise ValueError(f"모순된 제약입니다: must-link로 연결된 얼굴 쌍 ({i}, {j})에 cannot-link가 지정되었습니다.")
   return comp_of, components
@@ -198,6 +221,24 @@ def _normalized_mean(embeddings: np.ndarray, members: Sequence[int]) -> np.ndarr
   return (mean / norm).astype(np.float32)
 
 
+def _loo_similarities(embeddings: np.ndarray, members: Sequence[int]) -> np.ndarray:
+  """멤버별 자기 클러스터 leave-one-out centroid 코사인 유사도 — 신뢰도의 공통 정의.
+
+  자기가 포함된 centroid는 유사도를 부풀려 경계 얼굴이 신뢰도 검사를 통과해 버리므로 자기를 뺀
+  평균과 비교한다. 저신뢰 축출 판정과 결과(PersonCluster.membership_similarities) 노출이 같은
+  함수를 쓰게 해 두 값이 어긋나지 않게 한다. 단독 멤버와 퇴화(LOO 합이 영벡터)는 판단 불능이라
+  1.0(유지)으로 둔다.
+  """
+  block = embeddings[list(members)]
+  if len(members) < 2:
+    return np.ones(len(members), dtype=np.float64)
+  loo = block.astype(np.float64).sum(axis=0) - block
+  norms = np.linalg.norm(loo, axis=1)
+  sims = np.einsum("ij,ij->i", block.astype(np.float64), loo)
+  safe_norms = np.where(norms == 0.0, 1.0, norms)
+  return np.where(norms == 0.0, 1.0, sims / safe_norms)
+
+
 def _enforce_cannot_link(
   labels: np.ndarray,
   comp_of: list[int],
@@ -205,17 +246,22 @@ def _enforce_cannot_link(
   cannot_link: tuple[tuple[int, int], ...],
   embeddings: np.ndarray,
   next_label: int,
-) -> int:
+) -> None:
   """같은 클러스터에 남은 cannot-link 쌍을 분리한다 (labels 제자리 수정, TBD #5의 기본 정책).
 
   이동 단위는 must-link 컴포넌트(또는 단독 얼굴)라 컴포넌트가 쪼개지지 않는다. 위반 쌍에 관여한
   컴포넌트(앵커)들을 greedy 그래프 컬러링으로 최소한만 갈라(제약 없는 앵커끼리는 과분리하지 않음),
   가장 큰 앵커 무리가 원 라벨을 유지하고 나머지 색은 새 라벨을 받는다. 제약에 안 걸린 나머지 멤버는
   컴포넌트 단위로 코사인 최근접 앵커 대표벡터를 따라간다. 앵커 처리 순서(크기 내림차순 → 최소 인덱스)와
-  라벨 오름차순 순회로 결과는 결정적이다. 반환: 다음 합성 라벨 번호.
+  라벨 오름차순 순회로 결과는 결정적이다.
+
+  next_label은 여기서 발급할 합성 라벨의 시작값일 뿐, 진행된 카운터를 반환하지 않는다 — 반환하면
+  버리는 호출부가 생기고, 그 오래된 카운터로 라벨을 발급하는 후속 단계가 여기서 만든 라벨과
+  조용히 충돌한다 (리뷰 지적). 라벨을 발급하는 후속 단계를 추가하려면 카운터가 아니라
+  `labels.max() + 1`에서 다시 시작할 것.
   """
   if not cannot_link:
-    return next_label
+    return
   # 처리 중 이동은 처리 대상 라벨 안에서 새 라벨로만 일어나므로(기존 라벨로 유입 없음),
   # 위반 라벨 집합을 처음 한 번만 계산해도 안전하다. 노이즈(-1)는 클러스터가 아니라 위반이 아니다.
   violated_labels = sorted({int(labels[i]) for i, j in cannot_link if labels[i] == labels[j] and labels[i] != _NOISE})
@@ -263,17 +309,15 @@ def _enforce_cannot_link(
     for members in units.values():
       similarities = anchor_centroids @ embeddings[members].mean(axis=0)
       labels[members] = anchor_labels[int(np.argmax(similarities))]  # argmax 동률 시 앞선(큰) 앵커
-  return next_label
 
 
-def _cannot_link_blocked(
-  idx: int, target_label: int, labels: np.ndarray, cannot_link: tuple[tuple[int, int], ...]
-) -> bool:
-  """얼굴 idx가 target_label 클러스터의 현재 멤버와 cannot-link로 묶여 있는지."""
+def _cannot_link_partners(cannot_link: tuple[tuple[int, int], ...]) -> dict[int, list[int]]:
+  """얼굴 → cannot-link 상대 목록. 대다수인 비제약 얼굴의 차단 검사가 O(전체 쌍) 스캔 대신 O(1)이 된다."""
+  partners: dict[int, list[int]] = {}
   for a, b in cannot_link:
-    if (a == idx and labels[b] == target_label) or (b == idx and labels[a] == target_label):
-      return True
-  return False
+    partners.setdefault(a, []).append(b)
+    partners.setdefault(b, []).append(a)
+  return partners
 
 
 def _sets_blocked(set_a: set[int], set_b: set[int], cannot_link: tuple[tuple[int, int], ...]) -> bool:
@@ -293,6 +337,23 @@ def _cluster_groups(labels: np.ndarray) -> list[tuple[int, list[int]]]:
   return sorted(groups.items(), key=lambda item: item[1][0])
 
 
+def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, threshold: float) -> None:
+  """HDBSCAN이 클러스터를 하나도 못 만들었을 때, 전체가 동일 인물 수준의 밀집이면 단일 클러스터로 승격한다.
+
+  allow_single_cluster=False에서 group 전체가 사실상 단일 군집이면 두 갈래로 깨진다: 파편화되거나
+  (파편 병합이 교정), 분할 지점이 아예 없으면 클러스터 0개(전원 노이즈)가 된다 — 후자는 병합·구제가
+  손댈 클러스터가 없어 인물 앨범이 아예 생기지 않는 것이 리뷰에서 재현됐다(동일 사진 버스트 등).
+  모든 쌍별 유사도가 threshold 이상일 때만(완전 연결 기준) 전체를 라벨 0 하나로 승격한다 — 낯선
+  두 얼굴(유사도 ~0)은 승격되지 않고, 이후 must/cannot-link 강제는 이 라벨 위에서 정상 동작한다.
+  """
+  if labels.size == 0 or (labels != _NOISE).any():
+    return
+  # 전원 노이즈일 때만 계산 — 실사용에서 이 경로는 소규모 blob이고, N² 행렬은 HDBSCAN이 이미 만든 규모다
+  gram = embeddings @ embeddings.T
+  if float(gram.min()) >= threshold:
+    labels[:] = 0
+
+
 def _merge_fragments(
   labels: np.ndarray,
   embeddings: np.ndarray,
@@ -303,8 +364,10 @@ def _merge_fragments(
 
   allow_single_cluster=False 특성상 한 인물 위주의 밀집이 파편화되는 케이스(ADR 005)와 일반적인
   과분할을 함께 교정한다. cannot-link로 연결된 클러스터 쌍은 병합하지 않는다(사용자 분리 결정 보존).
-  유사도 내림차순 greedy(전이 병합 허용)에 병합 컴포넌트의 대표 라벨을 최소 멤버 인덱스 클러스터로
-  고정해 결과가 결정적이다. 유사도는 병합 전 centroid 스냅샷 기준이다.
+  병합 조건은 완전 연결(complete linkage): 두 컴포넌트의 모든 구성 클러스터 쌍이 임계 이상이어야
+  한다 — 쌍별 검사만 하면 전이 체인(A~B, B~C)이 서로 타인인 A와 C(유사도 ~0.1)를 한 앨범으로
+  융합하는 것이 리뷰에서 재현됐다. 유사도 내림차순 greedy에 병합 컴포넌트의 대표 라벨을 최소 멤버
+  인덱스 클러스터로 고정해 결과가 결정적이다. 유사도는 병합 전 centroid 스냅샷 기준이다.
   """
   ordered = _cluster_groups(labels)
   if len(ordered) < 2:
@@ -329,16 +392,20 @@ def _merge_fragments(
     return x
 
   merged_members = {pos: set(members) for pos, (_, members) in enumerate(ordered)}
+  merged_positions = {pos: {pos} for pos in range(len(ordered))}  # 완전 연결 검사용 구성 클러스터 위치
   for _, i, j in sorted(candidates):
     root_i, root_j = find(i), find(j)
     if root_i == root_j:
       continue
     if _sets_blocked(merged_members[root_i], merged_members[root_j], cannot_link):
       continue
+    if not all(similarities[p, q] >= threshold for p in merged_positions[root_i] for q in merged_positions[root_j]):
+      continue  # 완전 연결 위반 — 다리(bridge) 클러스터를 통한 타인 융합 차단
     if root_j < root_i:  # 작은 위치가 루트 — 컴포넌트 라벨이 최소 멤버 인덱스 클러스터로 수렴
       root_i, root_j = root_j, root_i
     parent[root_j] = root_i
     merged_members[root_i] |= merged_members.pop(root_j)
+    merged_positions[root_i] |= merged_positions.pop(root_j)
 
   for pos, (_, members) in enumerate(ordered):
     root = find(pos)
@@ -354,26 +421,37 @@ def _rescue_noise(
 ) -> None:
   """최근접 centroid 유사도가 threshold 이상인 노이즈 얼굴을 그 클러스터에 편입한다 (labels 제자리 수정).
 
-  파편 병합 뒤에 실행해 병합된 centroid를 기준으로 삼는다. cannot-link 상대가 있는 클러스터는
-  건너뛰고 다음 후보를 본다. centroid는 시작 시점 스냅샷 — 구제 순서(인덱스 오름차순)에 결과가
-  의존하지 않게 한다. must-link로 묶인 전원-노이즈 컴포넌트는 이미 클러스터로 승격됐으므로
-  여기 도달하는 노이즈는 전부 제약상 단독 얼굴이다.
+  파편 병합 뒤에 실행해 병합된 centroid를 기준으로 삼는다 (centroid는 시작 시점 스냅샷).
+  (얼굴, 클러스터) 후보를 전역 유사도 내림차순으로 처리한다 — 얼굴별 인덱스 순 처리는 cannot-link
+  경합(서로 배타인 두 노이즈 얼굴이 같은 클러스터를 원할 때) 시 유사도가 낮은 쪽이 자리를 선점하는
+  역전이 리뷰에서 재현됐다. 전역 내림차순에서는 더 나은 매치가 항상 먼저 배정되고, 결과는 결정적이다
+  (동률은 얼굴 인덱스 → 클러스터 순). cannot-link 상대가 있는 클러스터는 건너뛰고 다음 후보를 본다.
+  must-link로 묶인 전원-노이즈 컴포넌트는 이미 클러스터로 승격됐으므로 여기 도달하는 노이즈는
+  전부 제약상 단독 얼굴이다.
   """
   noise_idx = [int(i) for i in np.flatnonzero(labels == _NOISE)]
   ordered = _cluster_groups(labels)
   if not noise_idx or not ordered:
     return
   centroids = np.stack([_normalized_mean(embeddings, members) for _, members in ordered])
-  for idx in noise_idx:
-    similarities = centroids @ embeddings[idx]
-    for pos in np.argsort(-similarities, kind="stable"):  # 동률 시 앞선(작은 인덱스) 클러스터
-      if similarities[pos] < threshold:
-        break
-      target = ordered[int(pos)][0]
-      if _cannot_link_blocked(idx, target, labels, cannot_link):
-        continue
-      labels[idx] = target
-      break
+  similarities = embeddings[noise_idx] @ centroids.T  # (노이즈 수, 클러스터 수) — 얼굴별 GEMV 대신 1회 GEMM
+  candidates = sorted(
+    (-float(similarities[row, pos]), idx, pos)
+    for row, idx in enumerate(noise_idx)
+    for pos in range(len(ordered))
+    if similarities[row, pos] >= threshold
+  )
+  partners = _cannot_link_partners(cannot_link)
+  rescued: set[int] = set()
+  for _, idx, pos in candidates:
+    if idx in rescued:
+      continue
+    target = ordered[pos][0]
+    # 라이브 labels 검사 — 먼저(더 높은 유사도로) 구제된 상대가 있으면 그 클러스터는 차단된다
+    if any(labels[partner] == target for partner in partners.get(idx, ())):
+      continue
+    labels[idx] = target
+    rescued.add(idx)
 
 
 def _evict_ambiguous(
@@ -392,8 +470,8 @@ def _evict_ambiguous(
     ambiguous로 분리해 반환한다.
   자기 클러스터 유사도는 leave-one-out centroid(자기를 뺀 평균) 기준이다 — 자기가 포함된
   centroid는 유사도를 부풀려 경계 얼굴이 마진 검사를 통과해 버린다. 두 가지 예외:
-  - must-link 컴포넌트(사용자가 인물을 확정한 얼굴)와 단독 멤버 클러스터(자기가 곧 centroid,
-    cannot-link 단독 앵커 등)는 빼지 않는다.
+  - 사용자 제약에 직접 걸린 얼굴(must-link 컴포넌트, cannot-link 당사자 — 호출자가 protected로 전달)과
+    단독 멤버 클러스터(자기가 곧 centroid)는 빼지 않는다.
   - cannot-link로 연결된 클러스터 쌍은 마진 비교에서 서로 제외한다 — 사용자가 갈라둔 동일 인물
     양쪽에 가까운 것은 당연하므로, 분리 유지가 애매함으로 오판되면 split된 앨범이 전부 비게 된다.
   평가는 시작 시점 멤버십 스냅샷으로 일괄 수행해 축출 순서에 결과가 의존하지 않는다.
@@ -402,7 +480,6 @@ def _evict_ambiguous(
   if not ordered:
     return ()
   centroids = np.stack([_normalized_mean(embeddings, members) for _, members in ordered])
-  member_sums = [embeddings[members].astype(np.float64).sum(axis=0) for _, members in ordered]
   position_of = {label: pos for pos, (label, _) in enumerate(ordered)}
   count = len(ordered)
   linked = np.zeros((count, count), dtype=bool)
@@ -419,17 +496,13 @@ def _evict_ambiguous(
     if len(members) < 2:
       continue
     member_arr = np.asarray(members)
-    loo = member_sums[pos] - embeddings[member_arr]  # (k, EMBED_DIM) leave-one-out 합
-    loo_norms = np.linalg.norm(loo, axis=1)
-    sim_own_all = np.einsum("ij,ij->i", embeddings[member_arr].astype(np.float64), loo)
+    loo_sims = _loo_similarities(embeddings, members)
     unlinked = [q for q in range(count) if q != pos and not linked[pos, q]]
     others_max = all_sims[member_arr][:, unlinked].max(axis=1) if unlinked else None
     for row, idx in enumerate(members):
       if idx in protected:
         continue
-      if loo_norms[row] == 0.0:
-        continue  # 퇴화(사실상 발생 불가) — 판단 불능이면 유지
-      sim_own = float(sim_own_all[row] / loo_norms[row])
+      sim_own = float(loo_sims[row])
       if sim_own < config.min_membership_similarity:
         demoted_noise.append(idx)
       elif others_max is not None and sim_own - float(others_max[row]) < config.min_membership_margin:
@@ -518,6 +591,14 @@ def recluster(
     # 비유한 벡터는 cosine 거리가 정의되지 않아 군집 전체를 오염시킨다 — embed 단계가 None으로
     # 걸러 보냈어야 하는 값이므로 프로그래밍 오류로 거부한다 (embed._preprocess와 동일 철학).
     raise ValueError("embeddings에 비유한값(NaN/inf)이 있습니다. embed 단계는 퇴화 임베딩을 걸러야 합니다.")
+  if emb.size:
+    norms = np.linalg.norm(emb, axis=1)
+    if not np.allclose(norms, 1.0, atol=1e-3):
+      # HDBSCAN cosine 경로는 내부 정규화하지만 병합·구제·저신뢰 후처리는 단위벡터 전제의 생 내적을
+      # 코사인으로 쓴다 — 비정규 입력은 모든 유사도 임계를 조용히 우회하는 것이 리뷰에서 재현됐으므로
+      # 거부한다 (embed는 항상 L2 정규화 출력, 저장소 왕복 오차는 atol로 흡수).
+      worst = float(norms[int(np.argmax(np.abs(norms - 1.0)))])
+      raise ValueError(f"embeddings는 L2 정규화 단위벡터여야 합니다. 받은 norm 예: {worst:.4f}")
   n = emb.shape[0]
   if len(previous_cluster_ids) != n:
     raise ValueError(
@@ -537,6 +618,8 @@ def recluster(
       cluster_selection_epsilon=resolved_config.cluster_selection_epsilon,
     ).fit_predict(emb)
     labels = np.asarray(labels, dtype=np.int64)
+    # 균질 blob 퇴화(클러스터 0개) 교정 — 제약 강제 전에 승격해야 cannot-link가 승격된 라벨을 분리할 수 있다
+    _promote_single_blob(labels, emb, resolved_config.merge_centroid_similarity)
   else:
     labels = np.full(n, _NOISE, dtype=np.int64)
 
@@ -550,6 +633,10 @@ def recluster(
   _merge_fragments(labels, emb, resolved_constraints.cannot_link, resolved_config.merge_centroid_similarity)
   _rescue_noise(labels, emb, resolved_constraints.cannot_link, resolved_config.rescue_similarity)
   protected = {idx for members in components.values() if len(members) >= 2 for idx in members}
+  # cannot-link 당사자도 보호 — split로 생긴 소형 클러스터는 구성상 내부 유사도가 낮을 수 있어,
+  # 절대 바닥 축출이 클러스터를 통째로 비워 사용자 분리 결정과 cluster_id를 지우는 것이 리뷰에서
+  # 재현됐다. 제약 당사자는 사람이 직접 지목한 얼굴이므로 어느 축출 경로로도 빼지 않는다.
+  protected.update(idx for pair in resolved_constraints.cannot_link for idx in pair)
   ambiguous_indices = _evict_ambiguous(labels, emb, resolved_constraints.cannot_link, protected, resolved_config)
   ambiguous_set = set(ambiguous_indices)
 
@@ -568,6 +655,7 @@ def recluster(
         cluster_id=inherited if inherited is not None else factory(),
         is_new=inherited is None,
         member_indices=tuple(members),
+        membership_similarities=tuple(float(s) for s in _loo_similarities(emb, members)),
         centroid=centroid,
       )
     )

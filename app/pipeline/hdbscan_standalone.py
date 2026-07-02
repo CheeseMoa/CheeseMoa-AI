@@ -5,7 +5,9 @@ hdbscan_standalone.py
 scikit-learn(`sklearn.cluster.HDBSCAN`)의 HDBSCAN 알고리즘을 **numpy만으로** 재구현한
 독립 모듈. sklearn / scipy / hdbscan 패키지 버전과 무관하게 항상 동일한 결과를 내도록
 알고리즘 핵심(`_reachability.pyx`, `_linkage.pyx`, `_tree.pyx`, `hdbscan.py`의 brute 경로)을
-그대로 옮겨왔다. face-detection-PoC의 검증본을 로직 무변경으로 이식했다 (포맷만 레포 컨벤션).
+그대로 옮겨왔다. face-detection-PoC의 검증본 이식이며, 결과 라벨이 비트 동일함을 확인한
+안전 수정 3가지만 가했다 (상세: ADR 005): 재귀 → 반복 전환(깊은 체인 tree의 RecursionError 방지),
+표본 2개 미만 사전 검증(sklearn 동일 동작), in-place 연산 2건(N×N 임시 행렬 제거).
 
 참고 원본: scikit-learn cc50648cc
     sklearn/cluster/_hdbscan/_reachability.pyx  (mutual reachability graph)
@@ -99,10 +101,12 @@ def _pairwise_distance(X, metric):
     norms[norms == 0.0] = 1.0
     Xn = X / norms[:, None]
     S = Xn @ Xn.T
-    D = 1.0 - S
-    np.clip(D, 0.0, 2.0, out=D)  # sklearn cosine_distances와 동일하게 [0, 2]로 제한
-    np.fill_diagonal(D, 0.0)
-    return D
+    # sklearn cosine_distances처럼 in-place 변환 — `D = 1.0 - S`는 N×N float64 사본을 하나 더 만들어
+    # N=1만에서 피크를 0.8GB 키운다 (PoC 원본의 사본 방식과 결과 비트 동일 검증, ADR 005)
+    np.subtract(1.0, S, out=S)
+    np.clip(S, 0.0, 2.0, out=S)  # sklearn cosine_distances와 동일하게 [0, 2]로 제한
+    np.fill_diagonal(S, 0.0)
+    return S
 
   raise NotImplementedError(f"지원하지 않는 metric='{metric}'. 'euclidean', 'cosine', 'precomputed'만 지원합니다.")
 
@@ -122,7 +126,7 @@ def _mutual_reachability_graph(distance_matrix, min_samples):
 
   # MRD(i, j) = max(core_i, core_j, d_ij)
   mr = np.maximum(distance_matrix, core_distances[:, None])
-  mr = np.maximum(mr, core_distances[None, :])
+  np.maximum(mr, core_distances[None, :], out=mr)  # out= 으로 N×N 추가 할당 제거 (결과 비트 동일 검증, ADR 005)
   return mr
 
 
@@ -382,13 +386,18 @@ class _TreeUnionFind:
 
 
 def _recurse_leaf_dfs(cluster_tree, current_node):
-  children = cluster_tree[cluster_tree["parent"] == current_node]["child"]
-  if children.shape[0] == 0:
-    return [current_node]
-  out = []
-  for child in children:
-    out.extend(_recurse_leaf_dfs(cluster_tree, int(child)))
-  return out
+  # 원본(재귀 DFS)을 명시적 스택으로 전환 — 자식을 역순으로 쌓아 방문 순서까지 동일하다.
+  # 깊은 체인형 cluster tree의 RecursionError 방지 (leaf 선택 모드 경로, ADR 005).
+  result = []
+  stack = [current_node]
+  while stack:
+    node = stack.pop()
+    children = cluster_tree[cluster_tree["parent"] == node]["child"]
+    if children.shape[0] == 0:
+      result.append(node)
+    else:
+      stack.extend(int(child) for child in reversed(children.tolist()))
+  return result
 
 
 def _get_cluster_tree_leaves(cluster_tree):
@@ -399,15 +408,18 @@ def _get_cluster_tree_leaves(cluster_tree):
 
 
 def _traverse_upwards(cluster_tree, cluster_selection_epsilon, leaf, allow_single_cluster):
+  # 원본(꼬리 재귀)을 반복문으로 전환 — 결과 동일. Cython 원본과 달리 순수 파이썬 재귀는 깊은
+  # 체인형 cluster tree에서 RecursionError로 죽는 것이 프로덕션 경로(eom+eps)에서 재현됐다 (ADR 005).
   root = int(cluster_tree["parent"].min())
-  parent = int(cluster_tree[cluster_tree["child"] == leaf]["parent"][0])
-  if parent == root:
-    return parent if allow_single_cluster else leaf
-
-  parent_eps = 1.0 / cluster_tree[cluster_tree["child"] == parent]["value"][0]
-  if parent_eps > cluster_selection_epsilon:
-    return parent
-  return _traverse_upwards(cluster_tree, cluster_selection_epsilon, parent, allow_single_cluster)
+  node = leaf
+  while True:
+    parent = int(cluster_tree[cluster_tree["child"] == node]["parent"][0])
+    if parent == root:
+      return parent if allow_single_cluster else node
+    parent_eps = 1.0 / cluster_tree[cluster_tree["child"] == parent]["value"][0]
+    if parent_eps > cluster_selection_epsilon:
+      return parent
+    node = parent
 
 
 def _epsilon_search(leaves, cluster_tree, cluster_selection_epsilon, allow_single_cluster):
@@ -638,6 +650,10 @@ def _run_hdbscan(
 
   X = np.asarray(X)
   n_samples = X.shape[0]
+  if n_samples < 2:
+    # sklearn과 동일한 사전 검증 — 없으면 n=1·min_samples=1 조합이 빈 condensed tree로 흘러가
+    # 불투명한 numpy 예외(zero-size reduction)로 죽는다 (리뷰 재현)
+    raise ValueError(f"HDBSCAN에는 표본이 2개 이상 필요합니다. 받은 표본 수: {n_samples}")
   if min_samples > n_samples:
     raise ValueError(f"min_samples({min_samples})는 샘플 수({n_samples}) 이하여야 합니다.")
 
