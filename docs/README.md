@@ -16,7 +16,9 @@
 - [001-face-align-custom.md](./decisions/001-face-align-custom.md) — face_align 직접 구현 결정
 - [002-hdbscan-sklearn.md](./decisions/002-hdbscan-sklearn.md) — HDBSCAN sklearn 라이브러리 유지 결정 (구현체 선택은 005로 대체)
 - [003-full-reclustering.md](./decisions/003-full-reclustering.md) — 전체 재군집을 군집의 원천으로 삼는 결정
+- [004-embedding-onnxruntime.md](./decisions/004-embedding-onnxruntime.md) — AuraFace 추론 런타임으로 onnxruntime을 채택한 결정
 - [005-hdbscan-standalone-port.md](./decisions/005-hdbscan-standalone-port.md) — HDBSCAN을 PoC numpy 이식본으로 쓰는 결정
+- [006-postprocessing-accuracy-hardening.md](./decisions/006-postprocessing-accuracy-hardening.md) — 재군집 후처리 정확도 보강 설계 (코드리뷰 반영 선택 기록)
 
 ## conventions — 개발 규칙
 

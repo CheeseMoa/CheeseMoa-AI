@@ -40,11 +40,20 @@ scikit-learn은 의존성에 추가하지 않는다.
 - `app/pipeline/cluster.py`는 `app.pipeline.hdbscan_standalone.HDBSCAN`을 사용한다.
 - sklearn 업스트림 개선을 자동으로 따라가지 않는다 — 알고리즘은 원본 커밋(cc50648cc) 기준으로
   고정이며, 갱신이 필요하면 이식본을 직접 수정한다.
-- dense O(N²) 메모리·시간 — 모임당 수만 벡터 규모까지 수용하고, 그 이상은 feature-spec §4의
+- **PoC 원본과의 편차는 안전 수정 3가지 + 포맷이 전부다** (모두 결과 라벨 비트 동일을 검증):
+  ① 재귀 → 반복 전환(`_traverse_upwards`·`_recurse_leaf_dfs`) — 순수 파이썬 재귀는 깊은 체인형
+  cluster tree에서 RecursionError로 죽는 것이 프로덕션 경로(eom + eps)에서 재현됐다(Cython
+  원본에는 없던 제약). ② 표본 2개 미만 사전 검증 — sklearn과 동일하게 명확한 ValueError로
+  거부(없으면 n=1·min_samples=1이 불투명한 numpy 예외로 죽음). ③ in-place 연산 2건
+  (`1.0 - S`, 두 번째 `np.maximum`) — N×N float64 임시 행렬 2개 제거.
+- dense O(N²) 메모리·시간 — ③ 적용 후 피크는 약 2×N² float64(N=1만 ≈ 1.6GB, N=3만 ≈ 14GB).
+  모임당 **~1만 벡터**까지는 8vCPU 워커에서 무리가 없고, 그 이상은 feature-spec §4의
   규모 탈출구(fast-path + 주기 재군집)로 대응한다.
 - `allow_single_cluster=False`(sklearn 기본값이자 PoC 레시피)에서는 **group 전체가 사실상
-  단일 군집(전원 같은 인물)이면 루트를 선택할 수 없어 군집이 파편화**된다. 이는 `cluster.py`의
-  **파편 병합 후처리**(centroid 유사도가 동일 인물 수준인 클러스터 병합)로 교정한다 — 합성 검증:
-  1인물 20장 `[14, 2]+노이즈 4` → 1클러스터 20장. `allow_single_cluster=True`는 해법이 아니다:
-  단일 클러스터 모드의 루트 소속 판정이 `cluster_selection_epsilon=0.15`(유사도 0.85 이내)를
-  요구해 실제 동일 인물 분산(유사도 ~0.7)이 전원 노이즈로 떨어짐을 실험으로 확인했다.
+  단일 군집(전원 같은 인물)이면 루트를 선택할 수 없어** 두 형태로 깨진다: 분산이 있으면 파편화
+  (1인물 20장 → `[14, 2]+노이즈 4`), 분할 지점이 없으면 클러스터 0개(중복 사진 버스트 → 전원 노이즈).
+  전자는 `cluster.py`의 **파편 병합**(완전 연결 기준 centroid 유사도 병합)이, 후자는 **균질 blob
+  승격**(전 쌍별 유사도가 동일 인물 수준이면 단일 클러스터로)이 교정한다 — 둘 다 합성 검증 완료.
+  `allow_single_cluster=True`는 해법이 아니다: 단일 클러스터 모드의 루트 소속 판정이
+  `cluster_selection_epsilon=0.15`(유사도 0.85 이내)를 요구해 실제 동일 인물 분산(유사도 ~0.7)이
+  전원 노이즈로 떨어짐을 실험으로 확인했다.
