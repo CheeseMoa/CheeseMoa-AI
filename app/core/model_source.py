@@ -13,6 +13,12 @@ YUNET_REPO_ID = "opencv/face_detection_yunet"
 YUNET_MODEL_FILENAME = "face_detection_yunet_2023mar.onnx"
 YUNET_MODEL_PATH_ENV = "YUNET_MODEL_PATH"
 
+# PoC는 snapshot_download로 레포 전체(~427MB)를 받았지만, 임베딩에는 glintr100.onnx(~261MB)만
+# 필요하므로 단일 파일 다운로드를 사용한다 — 받은 파일 내용은 동일하다.
+AURAFACE_REPO_ID = "fal/AuraFace-v1"
+AURAFACE_MODEL_FILENAME = "glintr100.onnx"
+AURAFACE_MODEL_PATH_ENV = "AURAFACE_MODEL_PATH"
+
 
 @runtime_checkable
 class ModelSource(Protocol):
@@ -72,3 +78,8 @@ class HybridModelSource:
 def default_yunet_source() -> ModelSource:
   """YuNet 검출기가 모델 파일을 얻을 때 사용하는 기본 소스."""
   return HybridModelSource(os.getenv(YUNET_MODEL_PATH_ENV), YUNET_REPO_ID, YUNET_MODEL_FILENAME)
+
+
+def default_auraface_source() -> ModelSource:
+  """AuraFace 임베더가 모델 파일을 얻을 때 사용하는 기본 소스."""
+  return HybridModelSource(os.getenv(AURAFACE_MODEL_PATH_ENV), AURAFACE_REPO_ID, AURAFACE_MODEL_FILENAME)
