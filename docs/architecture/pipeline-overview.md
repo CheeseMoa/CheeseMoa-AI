@@ -36,7 +36,7 @@ OpenCV DNN 기반 경량 얼굴 감지 모델이다. 얼굴 바운딩 박스와 
 ### 2. 얼굴 정렬 — face_align
 
 5점 랜드마크를 ArcFace 기준 좌표(`_ARCFACE_DST`)에 맞춰 Umeyama 유사변환으로
-정렬한다. 출력은 항상 112×112 RGB 이미지다.
+정렬한다. 출력은 항상 112×112 BGR 이미지다. RGB 변환은 embed 전처리에서 수행한다.
 
 외부 의존성(insightface, skimage) 없이 OpenCV + NumPy만으로 직접 구현했다.
 결정 근거: [decisions/001-face-align-custom.md](../decisions/001-face-align-custom.md)

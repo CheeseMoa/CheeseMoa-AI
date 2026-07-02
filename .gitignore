@@ -32,3 +32,6 @@ Thumbs.db
 
 # Databases
 *.sqlite3
+
+# 로컬 검증 스크립트 디렉토리 (커밋 제외)
+scripts/
