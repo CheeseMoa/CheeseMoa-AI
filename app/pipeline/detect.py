@@ -5,7 +5,7 @@
 `ModelSource` 뒤로 완전히 캡슐화되어 있다.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -28,7 +28,10 @@ class DetectedFace:
   """원본 이미지 픽셀 좌표로 표현된, 검출된 얼굴 1개."""
 
   bbox: tuple[int, int, int, int]  # (x, y, w, h), 원본 이미지 픽셀 좌표
-  landmarks: np.ndarray  # shape (5, 2), float32 — YuNet 원본 순서, 재배열 금지
+  # frozen 데이터클래스가 ndarray 필드로 자동 생성하는 __eq__/__hash__는 예외를 던진다
+  # (배열 == 비교의 진리값 모호성, ndarray unhashable). compare=False로 eq·hash 대상에서
+  # 제외해 값 동등성을 bbox+score로만 판단한다 — set/dict 키·중복 제거·테스트 비교를 안전하게.
+  landmarks: np.ndarray = field(compare=False)  # shape (5, 2), float32 — YuNet 원본 순서, 재배열 금지
   score: float  # 신뢰도 [0, 1]
 
 
@@ -41,6 +44,12 @@ class DetectorConfig:
   nms_threshold: float = NMS_THRESHOLD
   top_k: int = TOP_K
   max_side: int | None = DEFAULT_MAX_SIDE
+
+  def __post_init__(self) -> None:
+    # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
+    # 유발하므로 생성 시점에 거부한다.
+    if self.max_side is not None and self.max_side <= 0:
+      raise ValueError(f"max_side는 양의 정수 또는 None이어야 합니다. 받은 값: {self.max_side}")
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -104,7 +113,7 @@ class FaceDetector:
     bbox_f = row[_BBOX_SLICE] * inv
     landmarks = (row[_LMK_SLICE].reshape(_NUM_LANDMARKS, 2) * inv).astype(np.float32)  # 원본 순서 유지
     score = float(row[_SCORE_IDX])
-    if not (np.isfinite(bbox_f).all() and np.isfinite(landmarks).all()):
+    if not (np.isfinite(bbox_f).all() and np.isfinite(landmarks).all() and np.isfinite(score)):
       return None
     x, y, bw, bh = _clamp_bbox(bbox_f, w, h)
     if bw <= 0 or bh <= 0:
