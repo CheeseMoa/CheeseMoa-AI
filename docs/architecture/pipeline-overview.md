@@ -45,8 +45,18 @@ OpenCV DNN 기반 경량 얼굴 감지 모델이다. 얼굴 바운딩 박스와 
 
 ### 3. 임베딩 생성 — AuraFace
 
-정렬된 얼굴 이미지를 512차원 벡터로 변환한다. 같은 인물의 얼굴은 코사인 공간에서
-가깝게, 다른 인물은 멀게 위치한다.
+정렬된 112×112 BGR 얼굴 크롭을 L2 정규화된 512차원 float32 벡터로 변환한다.
+같은 인물의 얼굴은 코사인 공간에서 가깝게, 다른 인물은 멀게 위치한다.
+
+- 모델: `fal/AuraFace-v1`의 `glintr100.onnx`를 onnxruntime(CPUExecutionProvider)으로 실행
+- 전처리: BGR→RGB → NCHW float32 → `(x - 127.5) / 127.5` — PoC 검증 레시피와 수치 동일 (최대 절대 오차 0 확인)
+- 후처리: 항상 L2 정규화 — 하류(HDBSCAN cosine, pgvector, 대표벡터 평균)가 전부 단위벡터를 전제
+- 배치 처리: 모델이 동적 배치를 지원해 한 이미지의 여러 얼굴을 1회 추론으로 처리
+- 퇴화 출력(비유한값·영벡터)은 해당 얼굴만 `None`으로 스킵 — align의 `None` 정책과 일관
+
+모델 로딩(HuggingFace 다운로드 포함)은 `FaceEmbedder` 생성 시 1회만 일어난다.
+워커는 부트스트랩에서 임베더를 생성해 모델을 메모리에 적재한 뒤 SQS 폴링을 시작한다.
+추론 런타임 결정 근거: [decisions/004-embedding-onnxruntime.md](../decisions/004-embedding-onnxruntime.md)
 
 구현 위치: `app/pipeline/embed.py`
 
