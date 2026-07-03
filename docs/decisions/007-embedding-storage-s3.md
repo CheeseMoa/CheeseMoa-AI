@@ -54,7 +54,8 @@ AI 워커의 raw face embedding을 어디에 저장할지 재결정이 필요했
 ### 저장 레이아웃 — 한 이벤트 = 한 `.npz` 객체
 
 ```
-s3://{bucket}/embeddings/{eventId}.npz
+s3://{bucket}/embeddings/{event_id}.npz
+  schema_version    스칼라            — 레이아웃 버전 (현재 1). 배열 추가/의미 변경 시 로더의 마이그레이션 판별 키
   embeddings        (N×D) float32   — ①  recluster() 입력
   face_ids          (N)              — id 매핑
   photo_ids         (N)              — id 매핑 + 삭제 마스킹 키
@@ -69,6 +70,21 @@ s3://{bucket}/embeddings/{eventId}.npz
   생기는 정합성 창이 없다. (b) 하드 삭제로 face가 사라지면 그 face를 참조하는 제약 쌍도 dangling이
   되는데, 어차피 파일 전체 rewrite니까 같은 마스크 로직에서 함께 정리된다.
 - `.npy`는 단일 배열만 담으므로 다중 배열용 `.npz` 사용. 향후 컬럼 필터가 필요하면 parquet 전환 고려.
+
+#### 직렬화 세부 (결정 2026-07-03, CHMO-167)
+
+- **id 배열 dtype = numpy 유니코드 문자열**(`np.str_`). object 배열은 저장에 pickle이 필요해 배제 —
+  **`allow_pickle=False`로 저장·로드**해 손상/악성 파일의 임의 코드 실행을 차단한다.
+- **"직전 배정 없음" 인코딩 = 빈 문자열 `""`** — numpy 문자열 배열엔 null이 없다. 로드 시
+  `"" → None`으로 번역해 `recluster(previous_cluster_ids=...)`에 전달한다 (신규 얼굴, 직전에
+  노이즈/ambiguous였던 얼굴).
+- **face_id는 워커가 임베딩 생성 시 uuid4로 발급**한다. Spring은 face 개념을 모른다 — 메시지 계약
+  (feature-spec §6)이 전부 image_id 단위인 이유. face_id는 `.npz` 내부(행 매핑·제약 참조)에서만
+  쓰는 안정 키이며, 한 image_id에 얼굴이 여러 개면 face_id도 여러 개다.
+- **`np.savez_compressed`로 저장** — 이벤트당 수백 KB 수준이라 압축 비용은 무시 가능, S3 전송량 절감.
+- **로드 시 불변식 검증**: N을 공유하는 배열들(embeddings·face_ids·photo_ids·cluster_ids)의 길이
+  정합, face_id 유일성, 제약 쌍이 존재하는 face_id만 참조하는지 확인하고 위반 시 거부한다 —
+  손상 파일이 조용히 잘못된 군집을 만들지 않게 (`recluster`의 입력 검증과 같은 철학).
 
 ### 재군집 흐름 (분류 요청 수신)
 
@@ -154,6 +170,8 @@ Spring이 **삭제 요청을 FIFO 큐로 발행**하면(분류·보정과 동일
 - **소프트 삭제 복원 UI 없음(MVP)** → 소프트·하드 구분 없는 단일 제거 마스크(§반드시 챙길 2).
 - **PIPA 삭제 = 워커가 처리(별도 Lambda 불필요)**(§3) — Spring이 삭제 요청을 FIFO 큐로 발행하고, 상시 폴링 워커가 소비해 `.npz` rewrite. 삭제 메시지 자체가 트리거라 사각지대 없음.
 - **동시성 = SQS FIFO** `messageGroupId = event_id`, **워커가 이벤트 파일의 단일 writer**(§4).
+- **직렬화 세부**(id dtype·None 인코딩·face_id 발급 주체·schema_version·압축·로드 검증) —
+  §저장 레이아웃의 "직렬화 세부" 참고 (CHMO-167).
 
 ## 미해결 / 확인 필요
 
