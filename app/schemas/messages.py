@@ -211,10 +211,15 @@ class ResultCluster(_MessageBase):
 
 
 class UncertainImage(_MessageBase):
-  """인물에 자신 있게 붙이지 못한 사진 ("분류가 어려워요" 앨범, 뷰어 비노출)."""
+  """인물에 자신 있게 붙이지 못한 사진 ("분류가 어려워요" 앨범, 뷰어 비노출).
+
+  reason 매핑 (ReclusterResult 기준): ambiguous = 두 인물 사이 저신뢰(ambiguous_indices),
+  unmatched = 얼굴은 검출됐으나 어느 인물과도 매칭되지 않음(noise_indices, 예: 행인).
+  얼굴 미검출(인물 없는) 사진은 uncertain이 아니라 common_album으로 간다 (feature-spec §6.2).
+  """
 
   image_id: Id
-  reason: Literal["ambiguous"]  # TBD #2: no_face·back·duplicate 추가 합의 시 Literal 확장
+  reason: Literal["ambiguous", "unmatched"]  # TBD #2: back·duplicate 추가 합의 시 Literal 확장
 
 
 class FailedImage(_MessageBase):
@@ -336,7 +341,10 @@ if __name__ == "__main__":
       )
     ],
     common_album=["img-9"],
-    uncertain=[UncertainImage(image_id="img-5", reason="ambiguous")],
+    uncertain=[
+      UncertainImage(image_id="img-5", reason="ambiguous"),
+      UncertainImage(image_id="img-6", reason="unmatched"),
+    ],
     eyes_closed=["img-3"],
     blurry=["img-4"],
     failed_images=[FailedImage(image_id="img-8", reason="timeout")],
