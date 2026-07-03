@@ -1,7 +1,7 @@
 """순수 파이프라인 단계로서의 인물 클러스터링 (전체 재군집 + cluster_id 재조정).
 
-군집의 진실은 group 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집이다 (ADR-003).
-이 모듈은 저장소(pgvector)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
+군집의 진실은 event 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집이다 (ADR-003, 재군집 단위=event는 ADR-007).
+이 모듈은 저장소(S3 event .npz)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
 
   ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 균질 blob은 단일 클러스터로 승격
   ② 사용자 보정(must-link/cannot-link) 후처리 강제 — 재군집이 사람 결정을 뒤집지 않게
@@ -120,7 +120,7 @@ class PersonCluster:
 
 @dataclass(frozen=True)
 class ReclusterResult:
-  """`recluster` 1회 실행의 결과 — 결과 메시지(classify-result)와 pgvector 갱신의 원천."""
+  """`recluster` 1회 실행의 결과 — 결과 메시지(classify-result)와 event .npz 갱신의 원천."""
 
   clusters: tuple[PersonCluster, ...]  # 최소 멤버 인덱스 오름차순
   # 어느 인물에도 배정되지 않은 얼굴 (uncertain 후보) — 밀도 노이즈(구제 실패)뿐 아니라
@@ -340,7 +340,7 @@ def _cluster_groups(labels: np.ndarray) -> list[tuple[int, list[int]]]:
 def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, threshold: float) -> None:
   """HDBSCAN이 클러스터를 하나도 못 만들었을 때, 전체가 동일 인물 수준의 밀집이면 단일 클러스터로 승격한다.
 
-  allow_single_cluster=False에서 group 전체가 사실상 단일 군집이면 두 갈래로 깨진다: 파편화되거나
+  allow_single_cluster=False에서 event 전체가 사실상 단일 군집이면 두 갈래로 깨진다: 파편화되거나
   (파편 병합이 교정), 분할 지점이 아예 없으면 클러스터 0개(전원 노이즈)가 된다 — 후자는 병합·구제가
   손댈 클러스터가 없어 인물 앨범이 아예 생기지 않는 것이 리뷰에서 재현됐다(동일 사진 버스트 등).
   모든 쌍별 유사도가 threshold 이상일 때만(완전 연결 기준) 전체를 라벨 0 하나로 승격한다 — 낯선
@@ -566,13 +566,13 @@ def recluster(
   config: ClusterConfig | None = None,
   new_id_factory: Callable[[], str] | None = None,
 ) -> ReclusterResult:
-  """group 전체 임베딩을 재군집하고 기존 cluster_id를 재조정한다 (feature-spec §4 ③④⑤).
+  """event 전체 임베딩을 재군집하고 기존 cluster_id를 재조정한다 (feature-spec §4 ③④⑤).
 
   재군집 뒤 결정적 후처리를 순서대로 적용한다: 보정 강제(must→cannot-link) → 파편 병합 →
   노이즈 구제 → 저신뢰 ambiguous 분리 → ID 재조정 → 대표벡터 (모듈 독스트링 ①~⑦).
 
   Args:
-    embeddings: shape (N, EMBED_DIM) — group 전체(기존+신규) 임베딩. L2 정규화 단위벡터 전제.
+    embeddings: shape (N, EMBED_DIM) — event 전체(기존+신규) 임베딩. L2 정규화 단위벡터 전제.
     previous_cluster_ids: 길이 N — 각 행의 직전 클러스터 배정 (신규·직전 노이즈는 None).
     constraints: 사용자 보정 제약. 모순 셋은 ValueError.
     config: HDBSCAN·후처리·매칭 파라미터 (기본: PoC 검증 레시피 + 보수적 후처리 임계).
@@ -669,7 +669,7 @@ def recluster(
 
 
 if __name__ == "__main__":
-  # SQS/pgvector 없이 파이프라인 파리티를 확인: 로컬 이미지들에서 검출→정렬→임베딩→재군집을
+  # SQS/S3 없이 파이프라인 파리티를 확인: 로컬 이미지들에서 검출→정렬→임베딩→재군집을
   # 실행해 인물 클러스터 구성을 출력한다 (최초 군집 시나리오 — previous_cluster_ids 전부 None).
   import sys
   import time

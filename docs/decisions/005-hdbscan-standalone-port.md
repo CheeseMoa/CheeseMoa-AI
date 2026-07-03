@@ -46,10 +46,10 @@ scikit-learn은 의존성에 추가하지 않는다.
   원본에는 없던 제약). ② 표본 2개 미만 사전 검증 — sklearn과 동일하게 명확한 ValueError로
   거부(없으면 n=1·min_samples=1이 불투명한 numpy 예외로 죽음). ③ in-place 연산 2건
   (`1.0 - S`, 두 번째 `np.maximum`) — N×N float64 임시 행렬 2개 제거.
-- dense O(N²) 메모리·시간 — ③ 적용 후 피크는 약 2×N² float64(N=1만 ≈ 1.6GB, N=3만 ≈ 14GB).
-  모임당 **~1만 벡터**까지는 8vCPU 워커에서 무리가 없고, 그 이상은 feature-spec §4의
-  규모 탈출구(fast-path + 주기 재군집)로 대응한다.
-- `allow_single_cluster=False`(sklearn 기본값이자 PoC 레시피)에서는 **group 전체가 사실상
+- dense O(N²) 메모리·시간 — ③ 적용 후 피크는 약 2×N² float64. **재군집 격리 단위가 event
+  (이벤트당 수백 벡터)라 사실상 무시 가능**하다(참고: N=1만 ≈ 1.6GB, N=3만 ≈ 14GB). 극단적으로
+  한 이벤트가 수만+로 커지는 경우에만 feature-spec §4의 규모 탈출구(fast-path + 주기 재군집)로 대응한다.
+- `allow_single_cluster=False`(sklearn 기본값이자 PoC 레시피)에서는 **event 전체가 사실상
   단일 군집(전원 같은 인물)이면 루트를 선택할 수 없어** 두 형태로 깨진다: 분산이 있으면 파편화
   (1인물 20장 → `[14, 2]+노이즈 4`), 분할 지점이 없으면 클러스터 0개(중복 사진 버스트 → 전원 노이즈).
   전자는 `cluster.py`의 **파편 병합**(완전 연결 기준 centroid 유사도 병합)이, 후자는 **균질 blob
