@@ -63,7 +63,7 @@ def _l2_normalize(raw: np.ndarray) -> np.ndarray | None:
   """원시 임베딩을 단위벡터로 정규화한다. 퇴화(비유한값·영벡터) 시 None을 반환한다.
 
   PoC는 norm==0일 때 raw를 그대로 반환하지만, 영벡터·NaN 벡터는 코사인 거리가 정의되지 않아
-  하류(HDBSCAN cosine, pgvector, L2 정규화 평균 대표벡터)를 깨뜨린다. 얼굴 단위 None 스킵이
+  하류(HDBSCAN cosine, L2 정규화 평균 대표벡터)를 깨뜨린다. 얼굴 단위 None 스킵이
   파이프라인 정책(align의 퇴화 None)과 정합하므로 의도적으로 이탈한다.
   """
   if not np.isfinite(raw).all():

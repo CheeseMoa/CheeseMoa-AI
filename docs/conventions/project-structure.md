@@ -41,7 +41,7 @@ app/
 
 ```text
 worker ──▶ messaging ──▶ (외부: SQS)
-   │  ──▶ pipeline ──▶ (모델 파일, 외부: S3, pgvector)
+   │  ──▶ pipeline ──▶ (모델 파일, 외부: S3 — 원본 이미지 + event 단위 .npz)
    └──▶ schemas, core ◀──┘
 ```
 

@@ -21,7 +21,7 @@ AuraFace (512-dim 임베딩 벡터 생성)
 HDBSCAN (인물별 클러스터링, cosine distance)
   │
   ▼
-클러스터 결과 → SQS 결과 큐 발행 / pgvector 저장
+클러스터 결과 → SQS 결과 큐 발행 / event .npz 저장(S3)
 ```
 
 ## 각 단계
@@ -50,7 +50,7 @@ OpenCV DNN 기반 경량 얼굴 감지 모델이다. 얼굴 바운딩 박스와 
 
 - 모델: `fal/AuraFace-v1`의 `glintr100.onnx`를 onnxruntime(CPUExecutionProvider)으로 실행
 - 전처리: BGR→RGB → NCHW float32 → `(x - 127.5) / 127.5` — PoC 검증 레시피와 수치 동일 (최대 절대 오차 0 확인)
-- 후처리: 항상 L2 정규화 — 하류(HDBSCAN cosine, pgvector, 대표벡터 평균)가 전부 단위벡터를 전제
+- 후처리: 항상 L2 정규화 — 하류(HDBSCAN cosine, 대표벡터 평균)가 전부 단위벡터를 전제
 - 배치 처리: 모델이 동적 배치를 지원해 한 이미지의 여러 얼굴을 1회 추론으로 처리
 - 퇴화 출력(비유한값·영벡터)은 해당 얼굴만 `None`으로 스킵 — align의 `None` 정책과 일관
 
@@ -68,20 +68,21 @@ HDBSCAN 구현은 PoC 검증 이식본 `hdbscan_standalone.py`(sklearn 알고리
 파라미터는 PoC 검증 레시피: `min_cluster_size=2, min_samples=2, metric='cosine',
 cluster_selection_epsilon=0.15`.
 
-증분 매칭이 아니라 **매 트리거마다 group 전체 임베딩(기존+신규)을 재군집**하고, 그 결과를
-기존 `cluster_id`에 재조정해 인물 번호의 연속성을 유지한다(정확도 최우선). 전략 상세:
+증분 매칭이 아니라 **매 트리거마다 event 전체 임베딩(기존+신규)을 재군집**하고, 그 결과를
+기존 `cluster_id`에 재조정해 인물 번호의 연속성을 유지한다(정확도 최우선). 재군집 격리 단위는
+event다([ADR 007](../decisions/007-embedding-storage-s3.md)). 전략 상세:
 [decisions/003-full-reclustering.md](../decisions/003-full-reclustering.md) 및 [spec/feature-spec.md](../spec/feature-spec.md) §4.
 
-`recluster()`는 pgvector·SQS를 모르는 **순수 함수**다 — 임베딩 로드/저장은 워커(호출자)의 책임.
+`recluster()`는 저장소·SQS를 모르는 **순수 함수**다 — 임베딩 로드/저장(S3 `.npz`)은 워커(호출자)의 책임.
 
-- 입력: group 전체 임베딩 행렬 `(N, 512)` + 직전 클러스터 배정 + 사용자 보정 제약
+- 입력: event 전체 임베딩 행렬 `(N, 512)` + 직전 클러스터 배정 + 사용자 보정 제약
 - 사용자 보정(must-link/cannot-link)은 재군집 후 **결정적 후처리로 강제**한다 — must-link
   컴포넌트는 비노이즈 다수결 라벨로 병합(전원 노이즈면 클러스터로 승격), cannot-link 위반은
   greedy 그래프 컬러링으로 최소 분리하고 비제약 멤버는 코사인 최근접 앵커를 따라간다
   (split 처리 방식 TBD #5의 기본 정책)
 - 재군집 결과에 **정확도 보강 후처리**를 순서대로 적용한다 (임계는 전부 `ClusterConfig` 설정값):
   1. **균질 blob 승격** (보정 강제 전) — HDBSCAN이 클러스터를 하나도 못 만든 경우(동일 사진 버스트 등
-     분할 지점이 없는 균질 group), 전 쌍별 유사도가 동일 인물 수준이면 전체를 단일 클러스터로 승격
+     분할 지점이 없는 균질 event), 전 쌍별 유사도가 동일 인물 수준이면 전체를 단일 클러스터로 승격
   2. **파편 병합** — centroid 코사인 유사도가 동일 인물 수준(기본 0.7) 이상인 클러스터끼리 병합.
      **완전 연결(complete linkage)**: 병합될 모든 구성 쌍이 임계 이상이어야 하며(전이 체인으로 타인이
      융합되는 것 차단), cannot-link로 연결된 클러스터 쌍은 병합하지 않는다(사용자 분리 결정 보존)
@@ -96,7 +97,7 @@ cluster_selection_epsilon=0.15`.
 - 출력: 클러스터(멤버 + L2 정규화 평균 대표벡터) + 노이즈 + 저신뢰 `ambiguous` + 은퇴 id 목록
   — 노이즈(어디에도 못 붙음)와 `ambiguous`(두 인물 사이 저신뢰)는 둘 다 `uncertain` 후보지만 사유가 다르다
 
-> 단일 인물 group 엣지(ADR 005)는 두 갈래로 깨지며 각각 교정한다: **파편화**(1인물 20장 →
+> 단일 인물 event 엣지(ADR 005)는 두 갈래로 깨지며 각각 교정한다: **파편화**(1인물 20장 →
 > `[14, 2]+노이즈 4`)는 파편 병합이, **클러스터 0개 퇴화**(분할 지점이 없는 중복 사진 버스트 →
 > 전원 노이즈)는 균질 blob 승격이 처리한다 — 둘 다 합성 데이터로 검증. `allow_single_cluster=True`는
 > `cluster_selection_epsilon=0.15`와의 상호작용으로 전원 노이즈가 되어 해법이 아님도 실험으로 확인.
