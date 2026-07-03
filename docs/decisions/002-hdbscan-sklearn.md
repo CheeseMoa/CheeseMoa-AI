@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR 005](./005-hdbscan-standalone-port.md) — 구현체가 PoC의 numpy 전용
+이식본(`hdbscan_standalone.py`)으로 바뀌었다. HDBSCAN **알고리즘** 채택 근거(아래 Rationale의
+UnionFind 임계값 방식 대비 ARI 2.7배)는 여전히 유효하다. 단, Rationale의 **확장성(O(n²) 회피)
+주장은 이 프로젝트에는 성립하지 않는다** — `metric='cosine'`은 sklearn에서도 KD/Ball-Tree를
+못 쓰고 brute(dense O(N²)) 경로로 떨어진다 (ADR 005 참고).
 
 ## Context
 

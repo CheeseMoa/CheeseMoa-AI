@@ -85,7 +85,7 @@ from app.schemas.messages import ClassifyRequest
 ## 워커 / CPU 바운드 규칙
 
 - 워커는 SQS 메시지를 폴링해 메시지 단위로 파이프라인을 실행한다.
-- AI 추론은 CPU/GPU 바운드다. I/O(SQS 폴링·S3·pgvector)와 추론 단계를 분리해 블로킹을 최소화한다.
+- AI 추론은 CPU/GPU 바운드다. I/O(SQS 폴링·S3)와 추론 단계를 분리해 블로킹을 최소화한다.
 - 동시 처리가 필요하면 스레드/프로세스 풀로 병렬화한다. 한 메시지 실패가 다른 메시지를 죽이지 않게 격리한다.
 - 함수의 return type을 명시한다.
 
