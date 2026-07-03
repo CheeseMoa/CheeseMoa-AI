@@ -110,9 +110,10 @@
       "representative_vector": [0.0123, -0.0456 /* …총 512개 float (L2 정규화 평균, 표시용 파생값) */]
     }
   ],
-  "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경) — 뷰어 노출
-  "uncertain": [                                  // "분류가 어려워요" — 저신뢰 매칭, 뷰어 비노출
-    { "image_id": "img-5", "reason": "ambiguous" }
+  "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경·얼굴 미검출) — 뷰어 노출
+  "uncertain": [                                  // "분류가 어려워요" — 뷰어 비노출
+    { "image_id": "img-5", "reason": "ambiguous" },  // 두 인물 사이 저신뢰
+    { "image_id": "img-6", "reason": "unmatched" }   // 얼굴은 있으나 어느 인물과도 매칭 안 됨 (예: 행인)
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
   "blurry": ["img-4"],                            // exclude_blurry=ON일 때만 — 뷰어 비노출

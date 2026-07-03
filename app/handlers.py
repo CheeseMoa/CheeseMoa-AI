@@ -1,0 +1,737 @@
+"""인바운드 메시지 3종(classify/feedback/delete)의 처리 로직 — 워커 계층의 두뇌.
+
+detect/embed(onnxruntime·cv2 모델 임포트 체인)를 직접 알지 않는다: 얼굴 추출은
+`FaceExtractor` 콜러블로 주입받고 합성은 core.deps의 책임이다 — 덕분에 이 모듈의 스모크는
+모델 다운로드 없이 돈다. 저장소·이미지 소스도 Protocol로만 알아 페이크 주입이 가능하다.
+
+계약 (ADR-007 재군집 흐름):
+  - 핸들러는 store.save(event .npz rewrite)까지 마친 ClassifyResult를 반환한다.
+    결과 발행(publish)과 SQS 메시지 삭제는 worker.py의 몫이다 — 저장 → 발행 → 삭제 순서가
+    photo_id 멱등 append와 합쳐져 재전달에 안전한 at-least-once를 만든다.
+  - image_id ↔ face_id ↔ 행 인덱스 번역, 보정 메시지 → 제약 변환, 보정 간 충돌의
+    시간순 해소(later-wins)는 전부 여기서 끝낸다 — recluster에는 일관된 제약 셋만 전달한다
+    (cluster.Constraints 독스트링의 요구).
+"""
+
+import logging
+import uuid
+from collections import Counter
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+
+import numpy as np
+
+from app.pipeline.cluster import ClusterConfig, Constraints, PersonCluster, recluster
+from app.schemas.messages import (
+  ClassifyRequest,
+  ClassifyResult,
+  DeleteRequest,
+  FailedImage,
+  MergeFeedback,
+  ReassignFeedback,
+  ResultCluster,
+  SplitFeedback,
+  UncertainImage,
+)
+from app.storage.embedding_store import EmbeddingStore
+from app.storage.event_embeddings import EventEmbeddings
+from app.storage.image_source import ImageSource
+
+logger = logging.getLogger(__name__)
+
+# 디코딩된 BGR 이미지 → 그 이미지에서 추출한 얼굴별 L2 정규화 (512,) float32 임베딩 목록.
+# 빈 목록 = 얼굴 미검출(또는 전부 퇴화) → common_album 라우팅 (feature-spec §6.2).
+# detect→align→embed 합성은 core.deps.build_face_extractor가 만든다.
+FaceExtractor = Callable[[np.ndarray], list[np.ndarray]]
+
+InboundParsed = ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | DeleteRequest
+
+_FaceIdPair = tuple[str, str]
+
+
+class _FaceUnionFind:
+  """face_id 문자열 위의 union-find — later-wins 제약 조정 전용.
+
+  cluster.py의 인덱스판 _UnionFind는 private이고 "모순이면 raise" 계약이라 재사용하지 않는다 —
+  여기서는 "연결되는가"를 질의해 어느 쌍을 버릴지 결정해야 한다.
+  """
+
+  def __init__(self) -> None:
+    self._parent: dict[str, str] = {}
+
+  def find(self, x: str) -> str:
+    self._parent.setdefault(x, x)
+    root = x
+    while self._parent[root] != root:
+      root = self._parent[root]
+    while self._parent[x] != root:  # 경로 압축
+      self._parent[x], x = root, self._parent[x]
+    return root
+
+  def union(self, a: str, b: str) -> None:
+    root_a, root_b = self.find(a), self.find(b)
+    if root_a != root_b:
+      self._parent[root_b] = root_a
+
+  def connected(self, a: str, b: str) -> bool:
+    return self.find(a) == self.find(b)
+
+  def would_connect(self, a: str, b: str, x: str, y: str) -> bool:
+    """union(a, b)를 수행하면 (수행 전 미연결이던) x-y가 새로 연결되는가."""
+    root_x, root_y = self.find(x), self.find(y)
+    return root_x != root_y and {root_x, root_y} == {self.find(a), self.find(b)}
+
+
+def _normalize_pair(pair: _FaceIdPair) -> _FaceIdPair:
+  a, b = pair
+  return (a, b) if a <= b else (b, a)
+
+
+def _dedupe_pairs(pairs: Iterable[_FaceIdPair]) -> tuple[_FaceIdPair, ...]:
+  """쌍을 (작은 id, 큰 id)로 정규화하고 첫 등장 순서를 보존해 중복을 제거한다."""
+  seen: set[_FaceIdPair] = set()
+  result: list[_FaceIdPair] = []
+  for pair in pairs:
+    normalized = _normalize_pair(pair)
+    if normalized in seen:
+      continue
+    seen.add(normalized)
+    result.append(normalized)
+  return tuple(result)
+
+
+def _reconcile_constraints(
+  old_must: Sequence[_FaceIdPair],
+  old_cannot: Sequence[_FaceIdPair],
+  new_must: Sequence[_FaceIdPair],
+  new_cannot: Sequence[_FaceIdPair],
+) -> tuple[tuple[_FaceIdPair, ...], tuple[_FaceIdPair, ...]]:
+  """기존 제약과 새 보정을 later-wins(나중 결정 우선)로 조정해 모순 없는 셋을 만든다.
+
+  저장된 셋은 매 보정마다 이 함수를 통과해 항상 자체 일관이므로, 모순은 새 쌍 vs 기존 쌍
+  사이에서만 생긴다. 새 쌍은 무조건 수용하고, 기존 쌍은 최신 것부터(배열 뒤부터) 걸러
+  나중 결정과 충돌하는 오래된 결정이 먼저 탈락한다. 기존 must/cannot은 종류별 배열이라
+  상대 시간순이 없다 — 동률에서는 must(병합 결정)를 먼저 수용한다.
+  """
+  uf = _FaceUnionFind()
+  for a, b in new_must:
+    uf.union(a, b)
+  for x, y in new_cannot:
+    if uf.connected(x, y):
+      # 한 메시지의 번역 결과는 구성상 모순이 없어야 한다 — 걸리면 번역 버그이므로 원인 그대로 거부
+      raise ValueError(f"번역된 새 제약이 자체 모순입니다: must-link로 연결된 ({x}, {y})에 cannot-link")
+  kept_cannot = list(new_cannot)
+
+  surviving_must: list[_FaceIdPair] = []
+  for pair in reversed(old_must):
+    a, b = pair
+    if any(uf.would_connect(a, b, x, y) for x, y in kept_cannot):
+      continue  # 이 must를 살리면 더 새로운 cannot이 깨진다 → 오래된 결정 폐기
+    uf.union(a, b)
+    surviving_must.append(pair)
+  surviving_must.reverse()  # 시간순 복원
+
+  surviving_cannot = [pair for pair in reversed(old_cannot) if not uf.connected(*pair)]
+  surviving_cannot.reverse()
+
+  return (
+    _dedupe_pairs([*surviving_must, *new_must]),
+    _dedupe_pairs([*surviving_cannot, *new_cannot]),
+  )
+
+
+@dataclass(frozen=True)
+class _ClusterSnapshot:
+  """재군집 + 단일 사진 클러스터 강등까지 끝난, 결과 조립에 필요한 event 스냅샷 요약."""
+
+  event: EventEmbeddings  # 저장까지 마친 최종 상태
+  clusters: tuple[PersonCluster, ...]  # 인물로 승격된 클러스터만 (강등분 제외)
+  unmatched_indices: tuple[int, ...]  # 재군집 노이즈 + 강등된 얼굴
+  ambiguous_indices: tuple[int, ...]
+  retired_cluster_ids: tuple[str, ...]  # 재군집 은퇴분 + 강등된 기존 id
+
+
+class JobHandlers:
+  """인바운드 메시지 1건 → (event .npz 갱신 저장 + ClassifyResult) 변환기."""
+
+  def __init__(
+    self,
+    store: EmbeddingStore,
+    images: ImageSource,
+    extract_faces: FaceExtractor,
+    cluster_config: ClusterConfig | None = None,
+    new_cluster_id: Callable[[], str] | None = None,
+    new_face_id: Callable[[], str] | None = None,
+  ) -> None:
+    self._store = store
+    self._images = images
+    self._extract_faces = extract_faces
+    self._cluster_config = cluster_config if cluster_config is not None else ClusterConfig()
+    # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
+    self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
+    self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
+
+  def handle(self, message: InboundParsed) -> ClassifyResult:
+    """메시지 타입별 핸들러로 분기한다. 예외는 그대로 전파 — 재시도/DLQ 정책은 worker의 몫."""
+    match message:
+      case ClassifyRequest():
+        return self._handle_classify(message)
+      case MergeFeedback() | SplitFeedback() | ReassignFeedback():
+        return self._handle_feedback(message)
+      case DeleteRequest():
+        return self._handle_delete(message)
+    raise TypeError(f"처리할 수 없는 메시지 타입입니다: {type(message).__name__}")
+
+  # ── classify_request ─────────────────────────────────────────────────────
+
+  def _handle_classify(self, request: ClassifyRequest) -> ClassifyResult:
+    stored = self._store.load(request.event_id) or EventEmbeddings.empty()
+    known_photo_ids = set(stored.photo_ids)
+
+    common_album: list[str] = []
+    failed_images: list[FailedImage] = []
+    new_rows: list[tuple[str, str, np.ndarray]] = []
+    for ref in request.images:
+      if ref.image_id in known_photo_ids:
+        continue  # 재전달/중복 요청 멱등: 이미 임베딩된 사진은 건너뛴다 (ADR-007 재군집 흐름 3단계)
+      try:
+        image = self._images.fetch(ref.s3_key)
+        face_embeddings = self._extract_faces(image)
+      except Exception as exc:
+        # 이미지 단위 격리 (feature-spec §9) — 한 장의 실패가 작업 전체를 죽이지 않는다
+        logger.warning("이미지 처리 실패 image_id=%s s3_key=%s", ref.image_id, ref.s3_key, exc_info=exc)
+        failed_images.append(FailedImage(image_id=ref.image_id, reason=type(exc).__name__))
+        continue
+      if not face_embeddings:
+        # 얼굴 미검출(단체/배경 사진) → 공용 앨범 (feature-spec §6.2 확정: uncertain이 아니다).
+        # .npz에는 행이 없으므로 재전달 시 재추출된다 — 결과가 같아 멱등이다.
+        common_album.append(ref.image_id)
+        continue
+      new_rows.extend((self._new_face_id(), ref.image_id, embedding) for embedding in face_embeddings)
+
+    event = stored.append_faces(new_rows)
+    snapshot = self._recluster_and_save(request.event_id, event)
+    # TODO(CHMO-165): request.options(눈감음/흔들림 제외 토글)는 품질 판정 파이프라인 미구현으로 아직 무시된다
+    return self._assemble_result(request.job_id, snapshot, common_album=common_album, failed_images=failed_images)
+
+  # ── cluster_feedback (merge / split / reassign) ──────────────────────────
+
+  def _handle_feedback(self, message: MergeFeedback | SplitFeedback | ReassignFeedback) -> ClassifyResult:
+    stored = self._store.load(message.event_id)
+    if stored is None:
+      # 보정 대상 event가 저장된 적 없음 — 재시도가 파일을 만들어주지 않는 결정적 이상이므로
+      # failed를 반환해 (worker가 발행 후 삭제) FIFO 그룹이 막히지 않게 한다
+      logger.error("보정 대상 event가 없습니다. event_id=%s job_id=%s", message.event_id, message.job_id)
+      return ClassifyResult(job_id=message.job_id, status="failed")
+
+    new_must, new_cannot, superseded_faces = self._translate_feedback(message, stored)
+    # reassign 이동 얼굴의 기존 must-link는 전부 폐기한다: 체인 구조상 어느 쌍이 "낡은 결정"인지
+    # 특정할 수 없어 later-wins에 맡기면 이동 얼굴이 옛 그룹 동료를 새 인물로 끌고 갈 수 있다.
+    # 기존 cannot-link는 남긴다 — 새 must와 충돌하면 later-wins가 알아서 폐기한다.
+    old_must = [
+      pair for pair in stored.must_link_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
+    ]
+    must, cannot = _reconcile_constraints(old_must, stored.cannot_link_pairs, new_must, new_cannot)
+    event = stored.with_constraints(must, cannot)
+    snapshot = self._recluster_and_save(message.event_id, event)
+    return self._assemble_result(message.job_id, snapshot)
+
+  def _translate_feedback(
+    self, message: MergeFeedback | SplitFeedback | ReassignFeedback, stored: EventEmbeddings
+  ) -> tuple[list[_FaceIdPair], list[_FaceIdPair], set[str]]:
+    """보정 메시지(image_id·cluster_id 기준)를 face_id 제약 쌍으로 번역한다.
+
+    반환: (새 must 쌍, 새 cannot 쌍, 기존 must-link가 무효화되는 얼굴 — reassign 이동 얼굴만 해당).
+    스테일 참조(이미 사라진 cluster_id·사진)는 경고 후 건너뛴다 — 빈 번역이어도 재군집·결과
+    발행은 진행해 Spring이 현재 상태 스냅샷을 받게 한다. 대표 얼굴은 행 순서상 첫 얼굴로
+    고정해 결정성을 지킨다.
+    """
+    faces_by_cluster: dict[str, list[str]] = {}
+    for face_id, cluster_id in zip(stored.face_ids, stored.cluster_ids):
+      if cluster_id is not None:
+        faces_by_cluster.setdefault(cluster_id, []).append(face_id)
+
+    match message:
+      case MergeFeedback():
+        payload = message.merge
+        cluster_ids = [payload.target_cluster_id, *payload.source_cluster_ids]
+        stale = [cluster_id for cluster_id in cluster_ids if cluster_id not in faces_by_cluster]
+        if stale:
+          logger.warning("merge 보정의 stale cluster_id 무시: %s (job_id=%s)", stale, message.job_id)
+        members = [face_id for cluster_id in cluster_ids for face_id in faces_by_cluster.get(cluster_id, [])]
+        if len(members) < 2:
+          logger.warning("merge 보정으로 연결할 얼굴이 2개 미만 — 무시 (job_id=%s)", message.job_id)
+          return [], [], set()
+        # 체인 (f0,f1),(f1,f2),… — must-link 전이성으로 전원이 한 컴포넌트가 된다
+        return list(zip(members, members[1:])), [], set()
+
+      case SplitFeedback():
+        payload = message.split
+        groups_faces: list[list[str]] = []
+        for group in payload.groups:
+          group_set = set(group)
+          faces = [
+            face_id
+            for face_id, photo_id, cluster_id in zip(stored.face_ids, stored.photo_ids, stored.cluster_ids)
+            if cluster_id == payload.cluster_id and photo_id in group_set
+          ]
+          if faces:
+            groups_faces.append(faces)
+          else:
+            logger.warning("split 보정의 stale 그룹 무시: %s (job_id=%s)", sorted(group_set), message.job_id)
+        if len(groups_faces) < 2:
+          logger.warning("split 보정의 유효 그룹이 2개 미만 — 무시 (job_id=%s)", message.job_id)
+          return [], [], set()
+        must = [pair for faces in groups_faces for pair in zip(faces, faces[1:])]
+        # 그룹 내부는 must-link로 한 컴포넌트이므로 그룹 쌍마다 대표 간 cannot-link 하나면 충분하다.
+        # 그룹을 가로지르는 기존 must-link는 이 대표 간 cannot-link와 충돌해 later-wins가 폐기한다.
+        cannot = [
+          (groups_faces[i][0], groups_faces[j][0])
+          for i in range(len(groups_faces))
+          for j in range(i + 1, len(groups_faces))
+        ]
+        return must, cannot, set()
+
+      case ReassignFeedback():
+        payload = message.reassign
+        moved = [
+          face_id
+          for face_id, photo_id, cluster_id in zip(stored.face_ids, stored.photo_ids, stored.cluster_ids)
+          if photo_id == payload.image_id and cluster_id == payload.from_cluster_id
+        ]
+        if not moved:
+          logger.warning(
+            "reassign 보정 대상 얼굴이 없음 — 무시 (image_id=%s, from=%s, job_id=%s)",
+            payload.image_id,
+            payload.from_cluster_id,
+            message.job_id,
+          )
+          return [], [], set()
+        moved_set = set(moved)
+        must: list[_FaceIdPair] = []
+        to_faces = faces_by_cluster.get(payload.to_cluster_id, [])
+        if to_faces:
+          must = [(face_id, to_faces[0]) for face_id in moved]
+        else:
+          logger.warning("reassign 목적지 클러스터가 비어 있음 — must-link 생략 (to=%s)", payload.to_cluster_id)
+        from_remaining = [
+          face_id for face_id in faces_by_cluster.get(payload.from_cluster_id, []) if face_id not in moved_set
+        ]
+        cannot = [(face_id, from_remaining[0]) for face_id in moved] if from_remaining else []
+        return must, cannot, moved_set
+
+    raise TypeError(f"처리할 수 없는 보정 타입입니다: {type(message).__name__}")
+
+  # ── delete_request ───────────────────────────────────────────────────────
+
+  def _handle_delete(self, request: DeleteRequest) -> ClassifyResult:
+    stored = self._store.load(request.event_id)
+    if stored is None:
+      # 저장된 적 없는 event의 삭제 — 지울 것이 없으므로 멱등 no-op 성공
+      return ClassifyResult(job_id=request.job_id, status="succeeded")
+
+    masked = stored.masked_by_photo_ids(request.image_ids)
+    # 삭제로 행이 전부 사라진 클러스터는 recluster의 previous_cluster_ids에 아예 등장하지 않아
+    # retired로 보고되지 않는다 — 여기서 직접 계산해 결과에 합류시킨다
+    survivors = {cluster_id for cluster_id in masked.cluster_ids if cluster_id is not None}
+    vanished = sorted({cluster_id for cluster_id in stored.cluster_ids if cluster_id is not None} - survivors)
+
+    snapshot = self._recluster_and_save(request.event_id, masked)
+    return self._assemble_result(request.job_id, snapshot, extra_retired=vanished)
+
+  # ── 공통 꼬리: 재군집 + .npz rewrite + 결과 조립 ─────────────────────────────
+
+  def _recluster_and_save(self, event_id: str, event: EventEmbeddings) -> _ClusterSnapshot:
+    """event 전체를 재군집·강등 판정하고 새 배정을 반영해 저장한다 — 이 저장이 유일한 쓰기이자 마지막 변이다.
+
+    저장 후 크래시(발행·삭제 전)로 메시지가 재전달돼도, photo_id 멱등 append + 결정적 재군집이
+    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조).
+    """
+    if not event.face_ids:
+      # 전부 삭제된(또는 애초에 빈) event — 재군집할 것이 없어도 빈 파일을 저장해 단일 진실을 유지한다
+      self._store.save(event_id, event)
+      return _ClusterSnapshot(
+        event=event, clusters=(), unmatched_indices=(), ambiguous_indices=(), retired_cluster_ids=()
+      )
+
+    row_of = event.row_index_of()
+    constraints = Constraints(
+      must_link=tuple((row_of[a], row_of[b]) for a, b in event.must_link_pairs),
+      cannot_link=tuple((row_of[a], row_of[b]) for a, b in event.cannot_link_pairs),
+    )
+    result = recluster(event.embeddings, event.cluster_ids, constraints, self._cluster_config, self._new_cluster_id)
+
+    # 단일 사진 클러스터 강등: 같은 사진에 같은 인물이 두 번 나올 수 없으므로, 한 장의 사진 안
+    # 얼굴들로만 구성된 군집은 우연히 닮은 타인들이다(단체 사진에서 재현) — 인물로 승격하지 않고
+    # 미매칭으로 되돌린다. 사용자 보정 당사자가 포함된 군집은 사람의 결정이므로 강등하지 않는다.
+    constrained_faces = {face_id for pair in event.must_link_pairs + event.cannot_link_pairs for face_id in pair}
+    kept: list[PersonCluster] = []
+    demoted_indices: list[int] = []
+    demoted_retired: list[str] = []
+    for cluster in result.clusters:
+      photos = {event.photo_ids[index] for index in cluster.member_indices}
+      protected = any(event.face_ids[index] in constrained_faces for index in cluster.member_indices)
+      if len(photos) >= 2 or protected:
+        kept.append(cluster)
+        continue
+      demoted_indices.extend(cluster.member_indices)
+      if not cluster.is_new:
+        # 기존에 앨범이 있던 id가 강등되면(예: 삭제로 사진 1장짜리가 된 경우) Spring이 앨범을 정리하게 은퇴 통보
+        demoted_retired.append(cluster.cluster_id)
+
+    new_cluster_ids: list[str | None] = [None] * len(event.face_ids)  # 노이즈·ambiguous·강등분은 미배정(None)
+    for cluster in kept:
+      for index in cluster.member_indices:
+        new_cluster_ids[index] = cluster.cluster_id
+    saved = event.with_cluster_ids(new_cluster_ids)
+    self._store.save(event_id, saved)
+    return _ClusterSnapshot(
+      event=saved,
+      clusters=tuple(kept),
+      unmatched_indices=tuple(sorted([*result.noise_indices, *demoted_indices])),
+      ambiguous_indices=result.ambiguous_indices,
+      retired_cluster_ids=tuple(dict.fromkeys([*result.retired_cluster_ids, *demoted_retired])),
+    )
+
+  def _assemble_result(
+    self,
+    job_id: str,
+    snapshot: _ClusterSnapshot,
+    *,
+    common_album: Sequence[str] = (),
+    failed_images: Sequence[FailedImage] = (),
+    extra_retired: Sequence[str] = (),
+  ) -> ClassifyResult:
+    """재군집 스냅샷(행 인덱스 세계)을 ClassifyResult(image_id 세계)로 번역한다.
+
+    clusters/uncertain/retired와 미매칭 단체 사진의 common은 event 전체 스냅샷이고,
+    얼굴 미검출 common과 failed_images는 이번 요청분만이다 — 미검출 사진은 .npz에 행이 없어
+    과거분을 복원할 수 없다 (의도된 비대칭).
+    """
+    event = snapshot.event
+    clusters: list[ResultCluster] = []
+    clustered_images: set[str] = set()
+    for person in snapshot.clusters:
+      # 한 사진에 같은 인물 얼굴이 여러 번 검출돼도 앨범에는 한 번 — 순서 보존 dedupe.
+      # 서로 다른 인물이 찍힌 사진은 여러 클러스터에 중복 등장할 수 있다 (N:M, feature-spec §6.2).
+      image_ids = list(dict.fromkeys(event.photo_ids[index] for index in person.member_indices))
+      clustered_images.update(image_ids)
+      clusters.append(
+        ResultCluster(
+          cluster_id=person.cluster_id,
+          is_new=person.is_new,
+          image_ids=image_ids,
+          representative_vector=[float(value) for value in person.centroid],
+        )
+      )
+
+    # 미매칭 사진 라우팅 (feature-spec §6.2·§7): 얼굴이 여러 개인데 아무도 인물에 매칭되지 않은
+    # 사진은 단체·배경 사진으로 보고 공용 앨범으로, 얼굴 1개(행인·미등록 1인)는 uncertain으로 보낸다.
+    faces_per_photo = Counter(event.photo_ids)
+    uncertain: list[UncertainImage] = []
+    group_common: list[str] = []
+    routed: set[str] = set()
+    # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
+    for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
+      for index in indices:
+        photo_id = event.photo_ids[index]
+        if photo_id in clustered_images or photo_id in routed:
+          continue  # 같은 사진의 다른 얼굴이 인물에 배정됐으면 인물 앨범이 우선한다
+        routed.add(photo_id)
+        if faces_per_photo[photo_id] >= 2:
+          group_common.append(photo_id)
+        else:
+          uncertain.append(UncertainImage(image_id=photo_id, reason=reason))
+
+    return ClassifyResult(
+      job_id=job_id,
+      status="partial" if failed_images else "succeeded",
+      clusters=clusters,
+      common_album=list(dict.fromkeys([*common_album, *group_common])),
+      uncertain=uncertain,
+      # TODO(CHMO-165): 눈감음/흔들림 품질 판정 파이프라인 미구현 — 항상 빈 리스트 (options 무시)
+      eyes_closed=[],
+      blurry=[],
+      failed_images=list(failed_images),
+      retired_cluster_ids=list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired])),
+    )
+
+
+if __name__ == "__main__":
+  # AWS·모델 없이 3종 핸들러의 전체 시나리오를 자가 검증한다: 페이크 저장소/이미지소스에
+  # "픽셀에 인물 번호를 인코딩한 합성 이미지 → 직교 단위벡터" 추출기를 조합한다.
+  # TODO(CHMO-165): pytest 도입 시 tests/test_handlers.py로 승격
+  import json
+  import math
+
+  from app.schemas.messages import parse_inbound_message
+  from app.storage.embedding_store import InMemoryEmbeddingStore
+  from app.storage.image_source import InMemoryImageSource
+  from app.storage.event_embeddings import EMBED_DIM
+
+  passed = 0
+
+  def check(name: str, condition: bool) -> None:
+    global passed
+    if not condition:
+      raise SystemExit(f"실패: {name}")
+    passed += 1
+    print(f"통과: {name}")
+
+  def person_vector(person: int, step: int) -> np.ndarray:
+    """인물별 평면 위의 단위벡터 — 같은 인물끼리 cos≥0.98, 다른 인물과는 작은 고유 유사도.
+
+    공유 축(마지막 차원)에 인물별로 다른 성분을 실어 교차 유사도가 전부 정확히 0이 되는
+    동률을 깬다 — 완전 동률은 HDBSCAN 트리를 퇴화시켜 실데이터에 없는 경로를 태운다.
+    """
+    theta = math.radians(5.0 * step)
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[2 * person] = math.cos(theta)
+    vector[2 * person + 1] = math.sin(theta)
+    vector[EMBED_DIM - 1] = 0.1 + 0.02 * person
+    return vector / np.linalg.norm(vector)
+
+  def fake_image(faces: list[tuple[int, int]]) -> np.ndarray:
+    """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지."""
+    image = np.zeros((2, 16, 3), dtype=np.uint8)
+    image[0, 0, 0] = len(faces)
+    for slot, (person, step) in enumerate(faces):
+      image[0, slot + 1, 0] = person
+      image[0, slot + 1, 1] = step
+    return image
+
+  def fake_extractor(image: np.ndarray) -> list[np.ndarray]:
+    count = int(image[0, 0, 0])
+    return [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
+
+  # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
+  # 미매칭 단체 사진(낯선 2인), 같은 사진 속 닮은 얼굴 쌍(단일 사진 클러스터 강등 대상)
+  image_source = InMemoryImageSource(
+    {
+      "img-a1.jpg": fake_image([(0, 0)]),
+      "img-a2.jpg": fake_image([(0, 1)]),
+      "img-a3.jpg": fake_image([(0, 2)]),
+      "img-b1.jpg": fake_image([(1, 0)]),
+      "img-b2.jpg": fake_image([(1, 1)]),
+      "img-none.jpg": fake_image([]),
+      # 단체 사진: 서로 조금 닮은 타인 2명 (유사도 ≈0.22 — test4.jpg의 낯선 얼굴 수준)
+      "img-group.jpg": fake_image([(7, 0), (7, 16)]),
+      "img-twins.jpg": fake_image([(6, 0), (6, 1)]),
+    }
+  )
+  store = InMemoryEmbeddingStore()
+
+  def counter(prefix: str) -> Callable[[], str]:
+    state = {"n": 0}
+
+    def next_id() -> str:
+      state["n"] += 1
+      return f"{prefix}-{state['n']}"
+
+    return next_id
+
+  handlers = JobHandlers(
+    store=store,
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("person"),
+    new_face_id=counter("face"),
+  )
+
+  def image_ids_of(result: ClassifyResult, *, containing: str) -> set[str]:
+    for cluster in result.clusters:
+      if containing in cluster.image_ids:
+        return set(cluster.image_ids)
+    return set()
+
+  classify_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c1",
+      "group_id": "group-1",
+      "event_id": "event-1",
+      "images": [
+        {"image_id": "img-a1", "s3_key": "img-a1.jpg"},
+        {"image_id": "img-a2", "s3_key": "img-a2.jpg"},
+        {"image_id": "img-a3", "s3_key": "img-a3.jpg"},
+        {"image_id": "img-b1", "s3_key": "img-b1.jpg"},
+        {"image_id": "img-b2", "s3_key": "img-b2.jpg"},
+        {"image_id": "img-none", "s3_key": "img-none.jpg"},
+        {"image_id": "img-broken", "s3_key": "img-broken.jpg"},
+        {"image_id": "img-group", "s3_key": "img-group.jpg"},
+        {"image_id": "img-twins", "s3_key": "img-twins.jpg"},
+      ],
+    }
+  )
+
+  # ① 최초 분류: 인물 2명 + 공용 앨범 1장 + 실패 1장 → partial
+  result = handlers.handle(parse_inbound_message(classify_body))
+  check(
+    "classify: 인물 2명, 신규 id",
+    len(result.clusters) == 2 and all(cluster.is_new for cluster in result.clusters),
+  )
+  check(
+    "classify: 클러스터 구성",
+    image_ids_of(result, containing="img-a1") == {"img-a1", "img-a2", "img-a3"}
+    and image_ids_of(result, containing="img-b1") == {"img-b1", "img-b2"},
+  )
+  check(
+    "classify: 공용 앨범(미검출+미매칭 단체)·실패·부분 성공",
+    set(result.common_album) == {"img-none", "img-group", "img-twins"}
+    and [failed.image_id for failed in result.failed_images] == ["img-broken"]
+    and result.status == "partial",
+  )
+  check(
+    "단일 사진 클러스터 강등: 같은 사진 속 닮은 쌍은 인물 승격 안 함, uncertain도 아님",
+    all("img-group" not in c.image_ids and "img-twins" not in c.image_ids for c in result.clusters)
+    and all(u.image_id not in {"img-group", "img-twins"} for u in result.uncertain),
+  )
+  twins_assignments = [
+    cid for pid, cid in zip(store.load("event-1").photo_ids, store.load("event-1").cluster_ids) if pid == "img-twins"
+  ]
+  check("강등 얼굴은 .npz에 미배정(None)으로 저장", twins_assignments == [None, None])
+  check(
+    "classify: 대표벡터는 512차원 단위벡터",
+    all(
+      len(cluster.representative_vector) == EMBED_DIM
+      and abs(float(np.linalg.norm(np.array(cluster.representative_vector))) - 1.0) < 1e-3
+      for cluster in result.clusters
+    ),
+  )
+  cluster_a_id = next(c.cluster_id for c in result.clusters if "img-a1" in c.image_ids)
+  cluster_b_id = next(c.cluster_id for c in result.clusters if "img-b1" in c.image_ids)
+  check("classify: .npz 저장 (행 9개 — 인물 5 + 단체 2 + 강등 쌍 2)", len(store.load("event-1").face_ids) == 9)
+
+  # ② 같은 job 재전달(재시도 모사): 저장된 사진은 스킵되고 결과는 동일해야 한다 (멱등)
+  retry = handlers.handle(parse_inbound_message(classify_body))
+  check(
+    "classify 재시도: 행 수 불변 + 동일 구성 + id 승계",
+    len(store.load("event-1").face_ids) == 9
+    and image_ids_of(retry, containing="img-a1") == {"img-a1", "img-a2", "img-a3"}
+    and {c.cluster_id for c in retry.clusters} == {cluster_a_id, cluster_b_id}
+    and not any(c.is_new for c in retry.clusters),
+  )
+
+  # ③ merge: B를 A로 병합 → 클러스터 1개, 한 id는 은퇴
+  merge_body = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f1",
+      "event_id": "event-1",
+      "action": "merge",
+      "merge": {"target_cluster_id": cluster_a_id, "source_cluster_ids": [cluster_b_id]},
+    }
+  )
+  merged = handlers.handle(parse_inbound_message(merge_body))
+  check(
+    "merge: 클러스터 1개로 병합, 나머지 id 은퇴",
+    len(merged.clusters) == 1
+    and set(merged.clusters[0].image_ids) == {"img-a1", "img-a2", "img-a3", "img-b1", "img-b2"}
+    and {merged.clusters[0].cluster_id, *merged.retired_cluster_ids} == {cluster_a_id, cluster_b_id},
+  )
+  check("merge: must-link 체인 저장 (4쌍)", len(store.load("event-1").must_link_pairs) == 4)
+  merged_id = merged.clusters[0].cluster_id
+
+  # ④ split: 병합을 다시 원래 두 그룹으로 분리 — later-wins가 그룹 간 옛 must-link를 폐기해야 한다
+  split_body = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f2",
+      "event_id": "event-1",
+      "action": "split",
+      "split": {"cluster_id": merged_id, "groups": [["img-a1", "img-a2", "img-a3"], ["img-b1", "img-b2"]]},
+    }
+  )
+  split_result = handlers.handle(parse_inbound_message(split_body))
+  check(
+    "split: 두 그룹으로 재분리 (한쪽은 신규 id)",
+    len(split_result.clusters) == 2
+    and image_ids_of(split_result, containing="img-a1") == {"img-a1", "img-a2", "img-a3"}
+    and image_ids_of(split_result, containing="img-b1") == {"img-b1", "img-b2"}
+    and sum(1 for cluster in split_result.clusters if cluster.is_new) == 1,
+  )
+  after_split = store.load("event-1")
+  face_of = dict(zip(after_split.photo_ids, after_split.face_ids))
+  check(
+    "split: later-wins — 그룹을 가로지르는 옛 must-link가 저장소에서 사라짐",
+    all(
+      {a, b} <= {face_of["img-a1"], face_of["img-a2"], face_of["img-a3"]}
+      or {a, b} <= {face_of["img-b1"], face_of["img-b2"]}
+      for a, b in after_split.must_link_pairs
+    )
+    and len(after_split.cannot_link_pairs) == 1,
+  )
+  cluster_a_id = next(c.cluster_id for c in split_result.clusters if "img-a1" in c.image_ids)
+  cluster_b_id = next(c.cluster_id for c in split_result.clusters if "img-b1" in c.image_ids)
+
+  # ⑤ reassign: img-a3를 A→B로 이동 — 기하(임베딩)상 A와 가깝지만 사용자 결정이 이겨야 한다
+  reassign_body = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f3",
+      "event_id": "event-1",
+      "action": "reassign",
+      "reassign": {"image_id": "img-a3", "from_cluster_id": cluster_a_id, "to_cluster_id": cluster_b_id},
+    }
+  )
+  reassigned = handlers.handle(parse_inbound_message(reassign_body))
+  check(
+    "reassign: 사용자 결정 강제 — a3는 a1과 분리되고 b1과 묶인다",
+    image_ids_of(reassigned, containing="img-a1").isdisjoint({"img-a3"})
+    and "img-a3" in image_ids_of(reassigned, containing="img-b1"),
+  )
+
+  # ⑥ delete: img-a3(제약 당사자)·img-b2 삭제 → b1 홀로 남아 노이즈, B id 은퇴, a3 제약 프루닝
+  delete_body = json.dumps(
+    {"type": "delete_request", "job_id": "job-d1", "event_id": "event-1", "image_ids": ["img-a3", "img-b2"]}
+  )
+  deleted = handlers.handle(parse_inbound_message(delete_body))
+  after_delete = store.load("event-1")
+  check(
+    "delete: 행 제거 + 댕글링 제약 프루닝",
+    set(after_delete.photo_ids) == {"img-a1", "img-a2", "img-b1", "img-group", "img-twins"}
+    and all(face_of["img-a3"] not in pair for pair in after_delete.must_link_pairs + after_delete.cannot_link_pairs),
+  )
+  check(
+    "delete: 홀로 남은 b1은 unmatched, B id 은퇴",
+    [u.image_id for u in deleted.uncertain if u.reason == "unmatched"] == ["img-b1"]
+    and cluster_b_id in deleted.retired_cluster_ids,
+  )
+
+  # ⑦ 전체 삭제 → 빈 .npz, 남은 인물 id 전부 은퇴 (recluster 없이 vanished 경로)
+  delete_all_body = json.dumps(
+    {
+      "type": "delete_request",
+      "job_id": "job-d2",
+      "event_id": "event-1",
+      "image_ids": ["img-a1", "img-a2", "img-b1", "img-group", "img-twins"],
+    }
+  )
+  emptied = handlers.handle(parse_inbound_message(delete_all_body))
+  check(
+    "전체 delete: 빈 event 저장 + 전 인물 은퇴",
+    emptied.status == "succeeded"
+    and emptied.clusters == []
+    and emptied.retired_cluster_ids == [cluster_a_id]
+    and store.load("event-1") == EventEmbeddings.empty(),
+  )
+
+  # ⑧ 경계: 저장된 적 없는 event의 feedback은 failed, delete는 멱등 성공
+  ghost_merge = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f9",
+      "event_id": "event-유령",
+      "action": "merge",
+      "merge": {"target_cluster_id": "person-x", "source_cluster_ids": ["person-y"]},
+    }
+  )
+  ghost_delete = json.dumps(
+    {"type": "delete_request", "job_id": "job-d9", "event_id": "event-유령", "image_ids": ["img-1"]}
+  )
+  check("유령 event feedback → failed", handlers.handle(parse_inbound_message(ghost_merge)).status == "failed")
+  check(
+    "유령 event delete → 멱등 succeeded", handlers.handle(parse_inbound_message(ghost_delete)).status == "succeeded"
+  )
+
+  print(f"\n스모크 검증 {passed}건 전부 통과")
