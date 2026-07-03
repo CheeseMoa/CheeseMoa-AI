@@ -34,7 +34,8 @@ app/
     cluster.py         # 전체 재군집 + cluster_id 재조정 (순수 로직)
     hdbscan_standalone.py  # HDBSCAN numpy 전용 이식본 (PoC 검증, cluster.py가 사용)
   schemas/             # Pydantic 메시지 스키마
-    messages.py        # ClassifyRequest, ClassifyResult, ClusterFeedback
+    messages.py        # ClassifyRequest·ClusterFeedback(merge/split/reassign)·DeleteRequest·ClassifyResult
+                       # + 인바운드 판별 유니온(parse_inbound_message, body `type` 필드)
 ```
 
 ## 레이어 의존 방향

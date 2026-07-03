@@ -73,7 +73,7 @@ s3://{bucket}/embeddings/{eventId}.npz
 ### 재군집 흐름 (분류 요청 수신)
 
 ```python
-# 1. 메시지에서 eventId, deletedPhotos 추출
+# 1. 메시지에서 event_id 추출 (하드 삭제 대상 image_ids는 별도 delete_request 메시지 — feature-spec §6.4)
 # 2. S3에서 {eventId}.npz 로드 (boto3) — 없으면 최초 군집
 # 3. 새 사진 임베딩 추출 후 append (photo_id 기준 멱등 — 재처리 시 중복 append 금지)
 # 4. 삭제 마스킹 적용 (아래 마스크 분리 참고)
@@ -158,4 +158,5 @@ Spring이 **삭제 요청을 FIFO 큐로 발행**하면(분류·보정과 동일
 ## 미해결 / 확인 필요
 
 - 하드 삭제 즉시성 요구 수준 재확인 (현재 "수일 내 허용" 가정, 생체정보라 보수적 검토 권장).
-- 삭제 메시지 네이밍 (feature-spec §10 #7 SQS 큐 네이밍 TBD와 함께).
+- ~~삭제 메시지 네이밍~~ → **해소(CHMO-167)**: body `type: "delete_request"`로 확정
+  ([feature-spec §6.4](../spec/feature-spec.md), `app/schemas/messages.py`). 큐 리소스 이름만 §10 #7에 잔존.
