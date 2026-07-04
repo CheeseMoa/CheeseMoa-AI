@@ -217,17 +217,19 @@ class JobHandlers:
         logger.warning("이미지 처리 실패 image_id=%s s3_key=%s", ref.image_id, ref.s3_key, exc_info=exc)
         failed_images.append(FailedImage(image_id=ref.image_id, reason=type(exc).__name__))
         continue
-      if not extracted.embeddings:
-        # 얼굴 미검출(단체/배경 사진) → 공용 앨범 (feature-spec §6.2 확정: uncertain이 아니다).
-        # .npz에는 행이 없으므로 재전달 시 재추출된다 — 결과가 같아 멱등이다.
-        common_album.append(ref.image_id)
-        continue
       # 품질 게이트 (feature-spec §6.1·§6.2·§7): 토글 ON이고 해당 사진이면 인물 앨범 대신 품질 앨범으로
       # 분리하고 재군집에서 제외한다(new_rows 미추가) → clusters/common/uncertain과 자동 상호배타.
-      # 흔들림 우선 — blur면 눈 상태 판정을 신뢰할 수 없으므로 blurry가 eyes_closed에 앞선다.
+      # 흔들림을 가장 먼저 본다: 얼굴 미검출이어도(완전 흔들려 검출 실패) extractor가 전체 이미지 흔들림을
+      # 반영하므로, common 분기보다 앞서야 흔들린 사진이 공용앨범이 아니라 흔들림 앨범으로 라우팅된다.
+      # 또한 blur면 눈 상태 판정을 신뢰할 수 없어 eyes_closed에도 앞선다.
       # 품질 앨범은 이번 요청분만이다 (.npz에 품질 컬럼 미저장 — 얼굴 미검출 common과 같은 request-scoped 비대칭).
       if request.options.exclude_blurry and extracted.blurry:
         blurry_images.append(ref.image_id)
+        continue
+      if not extracted.embeddings:
+        # 얼굴 미검출 + 흔들리지 않음(단체/배경 사진) → 공용 앨범 (feature-spec §6.2 확정: uncertain이 아니다).
+        # .npz에는 행이 없으므로 재전달 시 재추출된다 — 결과가 같아 멱등이다.
+        common_album.append(ref.image_id)
         continue
       if request.options.exclude_eyes_closed and extracted.eyes_closed:
         eyes_closed_images.append(ref.image_id)
@@ -577,6 +579,8 @@ if __name__ == "__main__":
       "img-q-ok2.jpg": fake_image([(2, 3)]),
       "img-q-eyes.jpg": fake_image([(2, 1)], eyes_closed=True),
       "img-q-blur.jpg": fake_image([(2, 2)], blurry=True),
+      # 흔들림 fallback(⑪)용 — 얼굴 미검출 + 흔들림 (완전 흔들려 검출 실패한 사진 모사)
+      "img-nf-blur.jpg": fake_image([], blurry=True),
     }
   )
   store = InMemoryEmbeddingStore()
@@ -869,6 +873,26 @@ if __name__ == "__main__":
     and len(quality_off.clusters) == 1
     and set(quality_off.clusters[0].image_ids) == {"img-q-ok1", "img-q-eyes", "img-q-blur"}
     and len(store.load("event-4").face_ids) == 3,
+  )
+
+  # ⑪ 흔들림 fallback: 얼굴 미검출 + 흔들림 → 공용앨범이 아니라 흔들림 앨범 (완전 흔들려 검출 실패한 사진 구제).
+  #    얼굴 미검출 + 선명(img-none)은 그대로 공용앨범. (전체 이미지 흔들림 측정은 extractor의 몫 — 핸들러 라우팅만 검증)
+  nofaceblur_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c5",
+      "group_id": "group-1",
+      "event_id": "event-5",
+      "images": [
+        {"image_id": "img-nf-blur", "s3_key": "img-nf-blur.jpg"},  # 얼굴X, 흔들림O → blurry
+        {"image_id": "img-nf-ok", "s3_key": "img-none.jpg"},  # 얼굴X, 흔들림X → common
+      ],
+    }
+  )
+  nfb = handlers.handle(parse_inbound_message(nofaceblur_body))
+  check(
+    "흔들림 fallback: 얼굴 미검출+흔들림 → blurry, 얼굴 미검출+선명 → common",
+    nfb.blurry == ["img-nf-blur"] and nfb.common_album == ["img-nf-ok"] and len(store.load("event-5").face_ids) == 0,
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

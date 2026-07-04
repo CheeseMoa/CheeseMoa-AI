@@ -42,6 +42,11 @@ class QualityConfig:
   # 흔들림: 얼굴 bbox crop의 Laplacian variance가 이 값 미만이면 흔들림. 절대 스케일이라 [0,1] 아님 —
   # 100.0은 임시 초기값이고, 선명/흔들림 샘플 분포를 보고 확정한다 (검증 2단계).
   blur_threshold: float = 100.0
+  # 얼굴 미검출 시 전체 이미지 Laplacian variance로 흔들림을 판정하는 fallback 임계값 (완전 흔들려
+  # 얼굴 검출조차 실패한 사진 구제). 얼굴 crop과 측정 스케일이 달라 별도 설정값이다 — 실측에서 완전
+  # 흔들린 전체 이미지는 variance ~1~7(선명 300+)로 폭락하나, 단순한 선명 장면(민무늬 벽 등)은 낮게
+  # 나올 수 있어 오탐 방지 차원에서 보수적으로 튜닝한다. 초기값은 blur_threshold와 동일(실측 보정 필요).
+  whole_image_blur_threshold: float = 100.0
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -52,6 +57,8 @@ class QualityConfig:
     # DetectorConfig/ClusterConfig와 같은 정책: 무의미한 값은 생성 시점에 거부한다.
     if self.blur_threshold <= 0.0:
       raise ValueError(f"blur_threshold는 양수여야 합니다. 받은 값: {self.blur_threshold}")
+    if self.whole_image_blur_threshold <= 0.0:
+      raise ValueError(f"whole_image_blur_threshold는 양수여야 합니다. 받은 값: {self.whole_image_blur_threshold}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:

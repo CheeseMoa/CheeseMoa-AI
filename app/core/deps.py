@@ -17,7 +17,7 @@ from app.messaging.publisher import ResultPublisher, SqsPublisher
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
 from app.pipeline.embed import FaceEmbedder
-from app.pipeline.quality import EyeStateClassifier, QualityConfig, judge_faces
+from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
 
@@ -56,6 +56,14 @@ def build_face_extractor(
       x, y, w, h = face.bbox
       face_pairs.append((aligned, image[y : y + h, x : x + w]))
     eyes_closed, blurry = judge_faces(face_pairs, eye_classifier, quality_config)
+
+    # 흔들림 fallback: 얼굴이 하나도 검출되지 않으면 전체 이미지 Laplacian variance로 흔들림을 판정한다.
+    # 완전 흔들린 사진은 얼굴 검출 자체가 실패해 얼굴 crop 기반 판정을 못 하는데(검출 실패 = 판정 불가),
+    # 이때 전체 이미지 variance가 폭락(선명 300+ → 흔들림 ~1)하므로 이를 신호로 쓴다.
+    # 한계: 앞사람만 모션블러이고 배경이 선명한 부분 블러는 전역 variance가 높게 유지돼 잡지 못한다
+    # (얼굴은 미검출, 전역은 선명 판정 → 사각지대). variance 방식의 근본 한계다.
+    if not detected:
+      blurry = blur_variance(image) < quality_config.whole_image_blur_threshold
 
     crops = [crop for crop in aligned_crops if crop is not None]
     embeddings = [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]
