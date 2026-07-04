@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
   # ── 클러스터링 임계값 (feature-spec §10 #3·#4 — 하드코딩 금지, 기본값은 PoC 레시피) ──
   cluster_min_cluster_size: int = 2
-  cluster_min_samples: int = 2
+  cluster_min_samples: int = 2  # PoC 검증값 유지 (ADR-009: 3은 소규모 이벤트 회귀로 기각)
   cluster_selection_epsilon: float = 0.15
   cluster_min_match_jaccard: float = 0.0
   cluster_merge_centroid_similarity: float = 0.7
