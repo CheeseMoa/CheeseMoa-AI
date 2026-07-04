@@ -45,9 +45,11 @@ class ClusterConfig:
   # 기본값은 0.0 — 겹침이 하나라도 있으면 승계 후보가 되고, 최강 겹침부터 배정된다.
   min_match_jaccard: float = 0.0
   # 파편 병합 임계 — centroid 코사인 유사도가 이 이상이면 같은 인물의 파편으로 보고 병합한다.
-  # 초기값 0.7은 face-test 실사진에서 동일 인물 파편 쌍(centroid 유사도 ~0.68)을 놓쳐 0.6으로 완화 (ADR-008).
-  # 실측 근거: 동일 인물 파편 centroid ≳0.6, 타인 파편 centroid 최대 0.167(20인물 180얼굴) — 마진 3배 이상.
-  merge_centroid_similarity: float = 0.6
+  # PoC 검증값 0.7 유지 (ADR-008): 0.6은 성인 단일 인물 파편(centroid ~0.68)을 더 구제하지만,
+  # 교차연령·아동 데이터에서 서로 다른 사람 centroid(실측 최대 0.635)가 같은 사람 파편(최소 0.597)과
+  # 겹쳐 오병합을 일으킨다 — 전역 임계로는 분리 불가. 소규모 단일 인물 앨범 생성은 병합이 아니라
+  # 연결 성분 부분 승격이 담당하므로, 병합은 오병합을 피해 보수적으로 둔다 (오병합보다 미병합, ADR-006).
+  merge_centroid_similarity: float = 0.7
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
   rescue_similarity: float = 0.6
@@ -375,13 +377,17 @@ def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, config: Clu
   구제했다 — 포즈 변화가 있는 실사진의 동일 인물 쌍 유사도는 0.46~0.70이라, 소규모 단일 인물
   이벤트가 전원 uncertain이 되어 인물 앨범이 생기지 않는 것이 face-test 검증에서 확인됐다 (ADR-008).
 
-  2단 구조로 판정한다: 쌍 유사도 ≥ blob_promote_similarity 간선으로 연결 성분을 만들고, 성분 내
-  모든 쌍 ≥ blob_promote_floor(완전 연결)이며 크기 ≥ min_cluster_size인 성분을 각각 승격한다.
+  2단 구조로 판정한다: 쌍 유사도 ≥ blob_promote_similarity 간선으로 연결 성분을 만들고, 각 성분에서
+  모든 쌍 ≥ blob_promote_floor(완전 연결)인 최대 부분집합(크기 ≥ min_cluster_size)을 승격한다.
   - floor는 닮은 중간자 체이닝(A~B, B~C인데 A·C는 남남)이 두 인물을 한 성분으로 잇는 오병합을
     차단한다 (타인 쌍 ≲0.3 < floor). 간선보다 낮은 floor는 비인접 약한 쌍에만 관용을 준다.
-  - 부분 승격이라 "단일 인물 + 낯선 행인" 이벤트에서 행인은 노이즈로 남는다 (전체 일괄 승격이면
-    행인까지 오병합되거나 전체가 기각된다). 조건 미달 성분은 통째로 기각한다 (오병합보다 미병합 —
-    ADR-006 원칙. 이탈자를 하나씩 제거하며 재검사하는 peel 구제는 실데이터 필요 확인 시 후속).
+  - 완전 연결이 깨지면 성분을 통째 버리지 않고, 연결이 가장 약한 멤버(성분 내 유사도 합 최소)를
+    하나씩 떼며 재검사한다(peel). 한 장의 극단적 포즈가 성분 전체를 무너뜨리던 문제(실사진 karina
+    5장에서 한 쌍이 0.394로 floor 미달 → 전원 uncertain)를 salvage한다. 승격되는 클러스터는 항상
+    완전 연결 ≥ floor를 만족하므로(peel 불변식) 타인 쌍(<floor)이 같은 앨범에 남는 일은 없다.
+  - 부분 승격이라 "단일 인물 + 낯선 행인" 이벤트에서 행인은 노이즈로 남고, peel로 떨어진 극단적
+    포즈 얼굴도 노이즈로 남는다(전체 일괄 승격이면 오병합되거나 전체가 기각된다). 떨어진 얼굴은
+    이후 rescue_similarity(노이즈 구제)가 신규 클러스터 centroid 기준으로 재편입을 시도한다.
   - 전원 노이즈 전제는 다인물 이벤트 순도의 방벽이므로 유지한다 — HDBSCAN이 클러스터를 만든
     이벤트의 잔여 노이즈는 rescue_similarity(노이즈 구제)의 몫이다.
   이후 must/cannot-link 강제는 승격된 라벨 위에서 정상 동작한다 (호출 순서: 승격 → 제약).
@@ -398,12 +404,16 @@ def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, config: Clu
     components.setdefault(uf.find(idx), []).append(idx)
   next_label = 0
   for members in sorted(components.values(), key=lambda group: group[0]):  # 최소 멤버 인덱스 순 — 라벨 결정성
-    if len(members) < config.min_cluster_size:
-      continue  # 단독 행인·짝 없는 얼굴은 노이즈 유지
-    if float(gram[np.ix_(members, members)].min()) < config.blob_promote_floor:
-      continue  # 완전 연결 위반 — 체이닝으로 섞인 성분은 통째 기각
-    labels[members] = next_label
-    next_label += 1
+    kept = members
+    while len(kept) >= config.min_cluster_size:
+      block = gram[np.ix_(kept, kept)]  # 대각(자기 유사도=1.0)은 floor를 항상 통과하므로 min=최소 쌍유사도
+      if float(block.min()) >= config.blob_promote_floor:
+        labels[kept] = next_label  # 완전 연결 부분집합 — 승격
+        next_label += 1
+        break
+      # 완전 연결 위반 — 연결이 가장 약한 멤버(유사도 합 최소, 동률은 최소 인덱스)를 떼고 재검사
+      drop = int(np.argmin(block.sum(axis=1)))
+      kept = kept[:drop] + kept[drop + 1 :]
 
 
 def _merge_fragments(
@@ -890,11 +900,33 @@ if __name__ == "__main__":
     len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1),
   )
 
-  # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C 0.3이 floor(0.4) 미만이면 통째 기각
+  # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C가 0.3(floor 미만)이라
+  # 두 남남(A·C)은 절대 같은 앨범에 남지 않는다. peel이 유사도 합 최소인 A를 떼고 나머지만 승격.
   chained = spread_vectors((0.548, 0.913, 0.548), axis(0), 10)  # 쌍: 0.500, 0.500, 0.300
   labels = np.full(3, _NOISE, dtype=np.int64)
   _promote_single_blob(labels, chained, ClusterConfig())
-  check("(f) 닮은 중간자 체이닝 성분은 완전 연결 floor가 통째 기각", bool((labels == _NOISE).all()))
+  check(
+    "(f) 체이닝 남남(A~C 0.3)은 같은 앨범 불가 — peel이 A를 떼고 B·C만 승격",
+    labels[0] == _NOISE and labels[1] == labels[2] != _NOISE,
+  )
+
+  def planar(degrees: Sequence[float], ax0: int, ax1: int) -> np.ndarray:
+    """평면 위 각도로 배치한 단위벡터 — 쌍 유사도 = cos(각도차). peel 테스트용 비(非)곱 구조."""
+    vectors = np.zeros((len(degrees), EMBED_DIM), dtype=np.float64)
+    for row, deg in enumerate(degrees):
+      t = math.radians(deg)
+      vectors[row] = math.cos(t) * axis(ax0) + math.sin(t) * axis(ax1)
+    return vectors.astype(np.float32)
+
+  # (h) peel 구제 — 한 극단적 포즈(78°)가 floor를 깨는 성분: 통째 기각 대신 그 한 장만 떼고 핵심 3장 승격
+  # (실사진 karina 5장에서 한 쌍 0.394가 성분 전체를 무너뜨리던 문제의 합성 재현). 직접 호출로 peel만 격리.
+  poses = planar((0.0, 25.0, 50.0, 78.0), 0, 1)  # 0~2는 서로 ≥0.64, 3은 0과 0.21로 floor 미달
+  labels = np.full(4, _NOISE, dtype=np.int64)
+  _promote_single_blob(labels, poses, ClusterConfig())
+  check(
+    "(h) peel — 극단 포즈 1장만 노이즈로 떼고 핵심 3장은 한 앨범으로 승격",
+    labels.tolist() == [0, 0, 0, _NOISE],
+  )
 
   # (g) 설정 불변식 — 잘못된 임계 조합은 생성 시점에 거부
   check(

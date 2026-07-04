@@ -40,7 +40,7 @@ class Settings(BaseSettings):
   cluster_min_samples: int = 2
   cluster_selection_epsilon: float = 0.15
   cluster_min_match_jaccard: float = 0.0
-  cluster_merge_centroid_similarity: float = 0.6
+  cluster_merge_centroid_similarity: float = 0.7
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05

@@ -85,8 +85,8 @@ event다([ADR 007](../decisions/007-embedding-storage-s3.md)). 전략 상세:
      HDBSCAN이 클러스터를 하나도 못 만든 경우(소규모 단일 인물 이벤트 등 분할 지점이 없는 event),
      쌍 유사도 ≥ 간선 임계(기본 0.45)로 연결 성분을 만들어 내부 완전 연결 ≥ floor(기본 0.4)인
      성분만 각각 클러스터로 승격 — 행인·타 성분은 노이즈 유지, 체이닝 오병합은 floor가 차단
-  2. **파편 병합** — centroid 코사인 유사도가 동일 인물 수준(기본 0.6, 실데이터 재조정
-     [ADR 008](../decisions/008-blob-promotion-connected-components.md)) 이상인 클러스터끼리 병합.
+  2. **파편 병합** — centroid 코사인 유사도가 동일 인물 수준(기본 0.7, PoC값 유지 — 교차연령
+     오병합 회피, [ADR 008](../decisions/008-blob-promotion-connected-components.md)) 이상인 클러스터끼리 병합.
      **완전 연결(complete linkage)**: 병합될 모든 구성 쌍이 임계 이상이어야 하며(전이 체인으로 타인이
      융합되는 것 차단), cannot-link로 연결된 클러스터 쌍은 병합하지 않는다(사용자 분리 결정 보존)
   3. **노이즈 구제** — 최근접 centroid 유사도가 기본 0.6 이상인 노이즈 얼굴을 그 클러스터에 편입.
