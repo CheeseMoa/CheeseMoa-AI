@@ -44,6 +44,8 @@ class Settings(BaseSettings):
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
+  cluster_blob_promote_similarity: float = 0.45
+  cluster_blob_promote_floor: float = 0.4
 
   log_level: str = "INFO"
 
@@ -64,4 +66,6 @@ class Settings(BaseSettings):
       rescue_similarity=self.cluster_rescue_similarity,
       min_membership_similarity=self.cluster_min_membership_similarity,
       min_membership_margin=self.cluster_min_membership_margin,
+      blob_promote_similarity=self.cluster_blob_promote_similarity,
+      blob_promote_floor=self.cluster_blob_promote_floor,
     )

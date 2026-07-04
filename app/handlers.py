@@ -491,6 +491,20 @@ if __name__ == "__main__":
     vector[EMBED_DIM - 1] = 0.1 + 0.02 * person
     return vector / np.linalg.norm(vector)
 
+  SPREAD_COSINES = (0.82, 0.79, 0.76, 0.74, 0.72)
+
+  def spread_person_vector(person: int, step: int) -> np.ndarray:
+    """포즈 변화 실사진 대역(동일 인물 쌍 유사도 0.46~0.70)을 모사하는 단위벡터 — 쌍 유사도 = c_i·c_j.
+
+    person_vector(같은 인물 cos≥0.98)와 달리 어느 쌍도 완전 연결 0.7에 못 미쳐, HDBSCAN이 클러스터
+    0개를 내는 소규모 단일 인물 이벤트 퇴화를 재현한다 — 연결 성분 부분 승격(ADR-008)만이 앨범을 만든다.
+    """
+    c = SPREAD_COSINES[step % len(SPREAD_COSINES)]
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[200 + person] = c  # 인물 공유 축 — person_vector의 축 대역과 겹치지 않음
+    vector[300 + 8 * (person - 20) + step] = math.sqrt(1.0 - c * c)  # 사진별 고유 직교 축
+    return vector
+
   def fake_image(faces: list[tuple[int, int]]) -> np.ndarray:
     """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지."""
     image = np.zeros((2, 16, 3), dtype=np.uint8)
@@ -502,7 +516,11 @@ if __name__ == "__main__":
 
   def fake_extractor(image: np.ndarray) -> list[np.ndarray]:
     count = int(image[0, 0, 0])
-    return [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
+    vectors: list[np.ndarray] = []
+    for slot in range(count):
+      person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
+      vectors.append(spread_person_vector(person, step) if person >= 20 else person_vector(person, step))
+    return vectors
 
   # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
   # 미매칭 단체 사진(낯선 2인), 같은 사진 속 닮은 얼굴 쌍(단일 사진 클러스터 강등 대상)
@@ -517,6 +535,8 @@ if __name__ == "__main__":
       # 단체 사진: 서로 조금 닮은 타인 2명 (유사도 ≈0.22 — test4.jpg의 낯선 얼굴 수준)
       "img-group.jpg": fake_image([(7, 0), (7, 16)]),
       "img-twins.jpg": fake_image([(6, 0), (6, 1)]),
+      # 소규모 단일 인물 이벤트(⑨, event-2)용 — 인물 20은 실측 대역(spread_person_vector) 얼굴
+      **{f"img-s{k}.jpg": fake_image([(20, k)]) for k in range(5)},
     }
   )
   store = InMemoryEmbeddingStore()
@@ -732,6 +752,27 @@ if __name__ == "__main__":
   check("유령 event feedback → failed", handlers.handle(parse_inbound_message(ghost_merge)).status == "failed")
   check(
     "유령 event delete → 멱등 succeeded", handlers.handle(parse_inbound_message(ghost_delete)).status == "succeeded"
+  )
+
+  # ⑨ 소규모 단일 인물 이벤트(실측 유사도 대역): 구 전체 일괄 승격(완전 연결 0.7)이면 전원
+  # uncertain(unmatched)이 되어 앨범이 안 생기던 케이스 — 연결 성분 부분 승격(ADR-008)의 종단 회귀 고정
+  single_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c2",
+      "group_id": "group-1",
+      "event_id": "event-2",
+      "images": [{"image_id": f"img-s{k}", "s3_key": f"img-s{k}.jpg"} for k in range(5)],
+    }
+  )
+  single = handlers.handle(parse_inbound_message(single_body))
+  check(
+    "단일 인물 5장(쌍 유사도 0.53~0.65): 인물 앨범 1개에 전원 소속, uncertain 없음",
+    len(single.clusters) == 1
+    and set(single.clusters[0].image_ids) == {f"img-s{k}" for k in range(5)}
+    and single.uncertain == []
+    and single.common_album == []
+    and single.status == "succeeded",
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
