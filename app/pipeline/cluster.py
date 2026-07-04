@@ -38,6 +38,9 @@ class ClusterConfig:
   """
 
   min_cluster_size: int = 2
+  # PoC 검증값 2 유지. ARI 스윕(ADR-009)에서 3이 교차연령(child) ARI를 올렸으나, 자가검증 (e)가 잡아냈듯
+  # n=2 소규모 이벤트에서 blob 승격이 `n >= max(mcs, min_samples)` 게이트 뒤라 실행되지 않아 2장 인물
+  # 앨범이 미형성되는 회귀가 있어 기각했다 (안전한 채택엔 승격을 min_samples 게이트에서 분리하는 코드 수정 필요).
   min_samples: int = 2
   cluster_selection_epsilon: float = 0.15
   # 기존 cluster_id 승계에 필요한 최소 Jaccard (TBD feature-spec §10 #4). 대량 업로드 시
