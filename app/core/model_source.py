@@ -19,6 +19,16 @@ AURAFACE_REPO_ID = "fal/AuraFace-v1"
 AURAFACE_MODEL_FILENAME = "glintr100.onnx"
 AURAFACE_MODEL_PATH_ENV = "AURAFACE_MODEL_PATH"
 
+# 눈감음 판정 CNN(open-closed-eye-0001). YuNet/AuraFace와 달리 Hugging Face Hub에 상업용 라이선스로
+# 존재하지 않는다 — Apache-2.0 ONNX는 OpenVINO Open Model Zoo 스토리지 직접 URL에만 있다
+# (HF 미러는 cc-by-nc-sa 비상업이라 제외). 그래서 HybridModelSource(HF)가 아니라 UrlModelSource로 받는다.
+EYE_MODEL_URL = (
+  "https://storage.openvinotoolkit.org/repositories/open_model_zoo/public/2022.1/"
+  "open-closed-eye-0001/open_closed_eye.onnx"
+)
+EYE_MODEL_FILENAME = "open_closed_eye.onnx"
+EYE_MODEL_PATH_ENV = "EYE_MODEL_PATH"
+
 
 @runtime_checkable
 class ModelSource(Protocol):
@@ -61,6 +71,60 @@ class HuggingFaceModelSource:
     return hf_hub_download(repo_id=self._repo_id, filename=self._filename)
 
 
+class UrlModelSource:
+  """직접 URL에서 내려받아 로컬 캐시에 저장해 재사용하는 모델 파일 (Hub에 없는 모델용).
+
+  HuggingFaceModelSource가 hf_hub_download에 위임하는 캐싱을, HF에 없는 모델(open-closed-eye-0001)에
+  대해 직접 구현한다. 최초 1회만 다운로드하고 이후엔 캐시 히트로 즉시 반환한다.
+  """
+
+  def __init__(self, url: str, filename: str, cache_dir: str | None = None) -> None:
+    self._url = url
+    self._filename = filename
+    # 기본 캐시 위치는 사용자 홈의 ~/.cache/cheesemoa (Windows에서도 expanduser로 해석된다).
+    # CHEESEMOA_CACHE_DIR로 오버라이드 가능 — 컨테이너/CI에서 캐시 볼륨을 지정하기 위함.
+    self._cache_dir = cache_dir or os.path.join(
+      os.getenv("CHEESEMOA_CACHE_DIR") or os.path.expanduser("~/.cache/cheesemoa"), "models"
+    )
+
+  def resolve(self) -> str:
+    # 지연 import: 실제 다운로드 경로를 탈 때만 필요하다 (로컬 오버라이드·캐시 히트 시엔 불필요).
+    import shutil
+    import ssl
+    import tempfile
+    import urllib.request
+
+    target = os.path.join(self._cache_dir, self._filename)
+    if os.path.isfile(target):
+      return target  # 캐시 히트 — 재다운로드 없음
+
+    # huggingface_hub(requests)와 동일하게 certifi CA 번들을 쓴다 — OS 스토어에 없는 공개 CA도 검증되도록.
+    # certifi가 없으면 urllib 기본 컨텍스트로 폴백한다 (선택적 의존성).
+    try:
+      import certifi
+
+      context: ssl.SSLContext | None = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+      context = None
+
+    os.makedirs(self._cache_dir, exist_ok=True)
+    # 부분 다운로드가 캐시로 남지 않도록 임시파일에 받은 뒤 원자적 rename으로 확정한다.
+    # os.fdopen을 바깥 with로 두어, 안쪽 urlopen이 예외를 던져도 fd가 확실히 닫히게 한다
+    # (Windows에서 열린 fd가 남으면 아래 os.remove가 PermissionError로 실패한다).
+    fd, tmp_path = tempfile.mkstemp(dir=self._cache_dir, suffix=".part")
+    try:
+      with os.fdopen(fd, "wb") as tmp_file:
+        with urllib.request.urlopen(self._url, timeout=60, context=context) as response:
+          shutil.copyfileobj(response, tmp_file)
+      os.replace(tmp_path, target)  # 같은 디렉터리 내 rename이라 원자적
+    except BaseException:
+      # 실패 시 임시파일 흔적을 남기지 않는다 (다음 시도가 깨끗한 상태에서 재다운로드하도록)
+      if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+      raise
+    return target
+
+
 class HybridModelSource:
   """로컬 오버라이드가 있으면 우선 사용하고, 없으면 Hub에서 다운로드한다."""
 
@@ -83,3 +147,14 @@ def default_yunet_source() -> ModelSource:
 def default_auraface_source() -> ModelSource:
   """AuraFace 임베더가 모델 파일을 얻을 때 사용하는 기본 소스."""
   return HybridModelSource(os.getenv(AURAFACE_MODEL_PATH_ENV), AURAFACE_REPO_ID, AURAFACE_MODEL_FILENAME)
+
+
+def default_eye_source() -> ModelSource:
+  """눈감음 판정 CNN(open-closed-eye-0001)이 모델 파일을 얻을 때 사용하는 기본 소스.
+
+  default_yunet/auraface와 동형(로컬 오버라이드 우선)이지만, Hub 대신 UrlModelSource로 URL 다운로드한다.
+  """
+  local_path = os.getenv(EYE_MODEL_PATH_ENV)
+  if local_path:
+    return LocalModelSource(local_path)
+  return UrlModelSource(EYE_MODEL_URL, EYE_MODEL_FILENAME)

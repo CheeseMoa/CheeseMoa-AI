@@ -3,7 +3,7 @@
 군집의 진실은 event 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집이다 (ADR-003, 재군집 단위=event는 ADR-007).
 이 모듈은 저장소(S3 event .npz)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
 
-  ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 균질 blob은 단일 클러스터로 승격
+  ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 퇴화는 연결 성분 부분 승격으로 교정 (ADR-008)
   ② 사용자 보정(must-link/cannot-link) 후처리 강제 — 재군집이 사람 결정을 뒤집지 않게
   ③ 파편 병합 — centroid 유사도가 동일 인물 수준인 클러스터 병합 (완전 연결, 단일 인물 파편화 교정, ADR 005)
   ④ 노이즈 구제 — 최근접 centroid 유사도가 충분한 노이즈 얼굴을 클러스터에 편입
@@ -38,6 +38,9 @@ class ClusterConfig:
   """
 
   min_cluster_size: int = 2
+  # PoC 검증값 2 유지. ARI 스윕(ADR-009)에서 3이 교차연령(child) ARI를 올렸으나, 자가검증 (e)가 잡아냈듯
+  # n=2 소규모 이벤트에서 blob 승격이 `n >= max(mcs, min_samples)` 게이트 뒤라 실행되지 않아 2장 인물
+  # 앨범이 미형성되는 회귀가 있어 기각했다 (안전한 채택엔 승격을 min_samples 게이트에서 분리하는 코드 수정 필요).
   min_samples: int = 2
   cluster_selection_epsilon: float = 0.15
   # 기존 cluster_id 승계에 필요한 최소 Jaccard (TBD feature-spec §10 #4). 대량 업로드 시
@@ -45,7 +48,10 @@ class ClusterConfig:
   # 기본값은 0.0 — 겹침이 하나라도 있으면 승계 후보가 되고, 최강 겹침부터 배정된다.
   min_match_jaccard: float = 0.0
   # 파편 병합 임계 — centroid 코사인 유사도가 이 이상이면 같은 인물의 파편으로 보고 병합한다.
-  # AuraFace에서 동일 인물 ≳0.7 / 타인 ≲0.3으로 간격이 넓어 0.7이 안전한 초기값 (TBD #4에서 실데이터 재조정).
+  # PoC 검증값 0.7 유지 (ADR-008): 0.6은 성인 단일 인물 파편(centroid ~0.68)을 더 구제하지만,
+  # 교차연령·아동 데이터에서 서로 다른 사람 centroid(실측 최대 0.635)가 같은 사람 파편(최소 0.597)과
+  # 겹쳐 오병합을 일으킨다 — 전역 임계로는 분리 불가. 소규모 단일 인물 앨범 생성은 병합이 아니라
+  # 연결 성분 부분 승격이 담당하므로, 병합은 오병합을 피해 보수적으로 둔다 (오병합보다 미병합, ADR-006).
   merge_centroid_similarity: float = 0.7
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
@@ -54,6 +60,14 @@ class ClusterConfig:
   # 자기 centroid 절대 유사도 바닥, 그리고 2위 클러스터와의 유사도 마진.
   min_membership_similarity: float = 0.4
   min_membership_margin: float = 0.05
+  # 균질 blob 부분 승격 간선 임계 — HDBSCAN이 클러스터 0개를 낸 전원 노이즈에서, 쌍 유사도가 이 이상인
+  # 얼굴끼리 간선으로 이어 연결 성분을 만든다 (ADR-008). 실측 동일 인물 쌍 하한(0.46, 포즈 변화 실사진)
+  # 직하이면서 타인 상한(≲0.3) 대비 넉넉한 마진 (TBD #4에서 실데이터 재조정).
+  blob_promote_similarity: float = 0.45
+  # 승격 성분의 완전 연결 바닥 — 성분 내 모든 쌍이 이 이상이어야 승격한다. 닮은 중간자가 두 인물을
+  # 한 성분으로 잇는 체이닝 오병합 차단 (타인 상한 대비 +0.1 마진). 간선 임계 이하·저신뢰 바닥 이상이어야
+  # 한다 (__post_init__ 불변식).
+  blob_promote_floor: float = 0.4
 
   def __post_init__(self) -> None:
     # 이식한 HDBSCAN이 min_cluster_size < 2에서 raise하므로 생성 시점에 같은 계약을 강제한다
@@ -69,6 +83,8 @@ class ClusterConfig:
       "rescue_similarity",
       "min_membership_similarity",
       "min_membership_margin",
+      "blob_promote_similarity",
+      "blob_promote_floor",
     ):
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
@@ -84,6 +100,20 @@ class ClusterConfig:
       raise ValueError(
         "rescue_similarity는 min_membership_similarity 이상이어야 합니다. "
         f"받은 값: rescue={self.rescue_similarity}, floor={self.min_membership_similarity}"
+      )
+    if self.blob_promote_floor > self.blob_promote_similarity:
+      # 간선(≥ promote)으로 이어진 쌍이 floor를 자동 충족해야 성분 완전 연결 검사의 의미가 성립한다
+      raise ValueError(
+        "blob_promote_floor는 blob_promote_similarity 이하여야 합니다. "
+        f"받은 값: floor={self.blob_promote_floor}, promote={self.blob_promote_similarity}"
+      )
+    if self.blob_promote_floor < self.min_membership_similarity:
+      # 승격 성분 멤버의 LOO 유사도는 성분 쌍 유사도 평균 이상(‖타멤버 합‖ ≤ n-1)이라 이 순서가 지켜지면
+      # 승격된 멤버가 같은 실행의 저신뢰 축출(절대 바닥)에서 곧바로 노이즈로 재강등되지 않는다
+      # (rescue_similarity 불변식과 같은 계열의 churn 차단).
+      raise ValueError(
+        "blob_promote_floor는 min_membership_similarity 이상이어야 합니다. "
+        f"받은 값: blob_floor={self.blob_promote_floor}, membership_floor={self.min_membership_similarity}"
       )
 
 
@@ -337,21 +367,56 @@ def _cluster_groups(labels: np.ndarray) -> list[tuple[int, list[int]]]:
   return sorted(groups.items(), key=lambda item: item[1][0])
 
 
-def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, threshold: float) -> None:
-  """HDBSCAN이 클러스터를 하나도 못 만들었을 때, 전체가 동일 인물 수준의 밀집이면 단일 클러스터로 승격한다.
+def _promote_single_blob(labels: np.ndarray, embeddings: np.ndarray, config: ClusterConfig) -> None:
+  """HDBSCAN이 클러스터를 하나도 못 만들었을 때, 동일 인물 수준으로 닮은 연결 성분만 골라 승격한다.
 
   allow_single_cluster=False에서 event 전체가 사실상 단일 군집이면 두 갈래로 깨진다: 파편화되거나
   (파편 병합이 교정), 분할 지점이 아예 없으면 클러스터 0개(전원 노이즈)가 된다 — 후자는 병합·구제가
-  손댈 클러스터가 없어 인물 앨범이 아예 생기지 않는 것이 리뷰에서 재현됐다(동일 사진 버스트 등).
-  모든 쌍별 유사도가 threshold 이상일 때만(완전 연결 기준) 전체를 라벨 0 하나로 승격한다 — 낯선
-  두 얼굴(유사도 ~0)은 승격되지 않고, 이후 must/cannot-link 강제는 이 라벨 위에서 정상 동작한다.
+  손댈 클러스터가 없어 인물 앨범이 아예 생기지 않는다. allow_single_cluster=True는 해법이 아니다 —
+  루트 소속 판정이 epsilon(0.15, 유사도 0.85 이내)을 요구해 실사진 분산에서 오히려 전원 노이즈가
+  되는 것이 실험으로 확인됐다 (ADR-005).
+
+  이전 구현(전 쌍별 유사도 ≥ merge_centroid_similarity(0.7)일 때 전체 일괄 승격)은 근중복 버스트만
+  구제했다 — 포즈 변화가 있는 실사진의 동일 인물 쌍 유사도는 0.46~0.70이라, 소규모 단일 인물
+  이벤트가 전원 uncertain이 되어 인물 앨범이 생기지 않는 것이 face-test 검증에서 확인됐다 (ADR-008).
+
+  2단 구조로 판정한다: 쌍 유사도 ≥ blob_promote_similarity 간선으로 연결 성분을 만들고, 각 성분에서
+  모든 쌍 ≥ blob_promote_floor(완전 연결)인 최대 부분집합(크기 ≥ min_cluster_size)을 승격한다.
+  - floor는 닮은 중간자 체이닝(A~B, B~C인데 A·C는 남남)이 두 인물을 한 성분으로 잇는 오병합을
+    차단한다 (타인 쌍 ≲0.3 < floor). 간선보다 낮은 floor는 비인접 약한 쌍에만 관용을 준다.
+  - 완전 연결이 깨지면 성분을 통째 버리지 않고, 연결이 가장 약한 멤버(성분 내 유사도 합 최소)를
+    하나씩 떼며 재검사한다(peel). 한 장의 극단적 포즈가 성분 전체를 무너뜨리던 문제(실사진 karina
+    5장에서 한 쌍이 0.394로 floor 미달 → 전원 uncertain)를 salvage한다. 승격되는 클러스터는 항상
+    완전 연결 ≥ floor를 만족하므로(peel 불변식) 타인 쌍(<floor)이 같은 앨범에 남는 일은 없다.
+  - 부분 승격이라 "단일 인물 + 낯선 행인" 이벤트에서 행인은 노이즈로 남고, peel로 떨어진 극단적
+    포즈 얼굴도 노이즈로 남는다(전체 일괄 승격이면 오병합되거나 전체가 기각된다). 떨어진 얼굴은
+    이후 rescue_similarity(노이즈 구제)가 신규 클러스터 centroid 기준으로 재편입을 시도한다.
+  - 전원 노이즈 전제는 다인물 이벤트 순도의 방벽이므로 유지한다 — HDBSCAN이 클러스터를 만든
+    이벤트의 잔여 노이즈는 rescue_similarity(노이즈 구제)의 몫이다.
+  이후 must/cannot-link 강제는 승격된 라벨 위에서 정상 동작한다 (호출 순서: 승격 → 제약).
   """
   if labels.size == 0 or (labels != _NOISE).any():
     return
   # 전원 노이즈일 때만 계산 — 실사용에서 이 경로는 소규모 blob이고, N² 행렬은 HDBSCAN이 이미 만든 규모다
   gram = embeddings @ embeddings.T
-  if float(gram.min()) >= threshold:
-    labels[:] = 0
+  uf = _UnionFind(labels.size)
+  for i, j in zip(*np.nonzero(np.triu(gram >= config.blob_promote_similarity, k=1))):
+    uf.union(int(i), int(j))
+  components: dict[int, list[int]] = {}
+  for idx in range(labels.size):
+    components.setdefault(uf.find(idx), []).append(idx)
+  next_label = 0
+  for members in sorted(components.values(), key=lambda group: group[0]):  # 최소 멤버 인덱스 순 — 라벨 결정성
+    kept = members
+    while len(kept) >= config.min_cluster_size:
+      block = gram[np.ix_(kept, kept)]  # 대각(자기 유사도=1.0)은 floor를 항상 통과하므로 min=최소 쌍유사도
+      if float(block.min()) >= config.blob_promote_floor:
+        labels[kept] = next_label  # 완전 연결 부분집합 — 승격
+        next_label += 1
+        break
+      # 완전 연결 위반 — 연결이 가장 약한 멤버(유사도 합 최소, 동률은 최소 인덱스)를 떼고 재검사
+      drop = int(np.argmin(block.sum(axis=1)))
+      kept = kept[:drop] + kept[drop + 1 :]
 
 
 def _merge_fragments(
@@ -619,7 +684,7 @@ def recluster(
     ).fit_predict(emb)
     labels = np.asarray(labels, dtype=np.int64)
     # 균질 blob 퇴화(클러스터 0개) 교정 — 제약 강제 전에 승격해야 cannot-link가 승격된 라벨을 분리할 수 있다
-    _promote_single_blob(labels, emb, resolved_config.merge_centroid_similarity)
+    _promote_single_blob(labels, emb, resolved_config)
   else:
     labels = np.full(n, _NOISE, dtype=np.int64)
 
@@ -669,54 +734,211 @@ def recluster(
 
 
 if __name__ == "__main__":
-  # SQS/S3 없이 파이프라인 파리티를 확인: 로컬 이미지들에서 검출→정렬→임베딩→재군집을
-  # 실행해 인물 클러스터 구성을 출력한다 (최초 군집 시나리오 — previous_cluster_ids 전부 None).
   import sys
-  import time
 
-  # detect/embed는 onnxruntime·huggingface_hub 임포트 체인을 끌고 오므로 CLI 확인 블록에서만 지연 import한다
-  import cv2
+  if sys.argv[1:]:
+    # 이미지 CLI 모드 — SQS/S3 없이 파이프라인 파리티를 확인: 로컬 이미지들에서 검출→정렬→임베딩→재군집을
+    # 실행해 인물 클러스터 구성을 출력한다 (최초 군집 시나리오 — previous_cluster_ids 전부 None).
+    import time
 
-  from app.pipeline.align import align_face
-  from app.pipeline.detect import FaceDetector
-  from app.pipeline.embed import FaceEmbedder
+    # detect/embed는 onnxruntime·huggingface_hub 임포트 체인을 끌고 오므로 CLI 확인 블록에서만 지연 import한다
+    import cv2
 
-  detector = FaceDetector()
-  embedder = FaceEmbedder()
-  face_names: list[str] = []
-  face_embeddings: list[np.ndarray] = []
-  for path in sys.argv[1:]:
-    image = cv2.imread(path)
-    if image is None:
-      print(f"{path}: 건너뜀 (이미지를 읽을 수 없음)")
-      continue
-    detected = detector.detect(image)
-    crops = [(i, align_face(image, face.landmarks)) for i, face in enumerate(detected)]
-    valid = [(i, crop) for i, crop in crops if crop is not None]
-    for (face_i, _), embedding in zip(valid, embedder.embed_batch([crop for _, crop in valid])):
-      if embedding is None:
+    from app.pipeline.align import align_face
+    from app.pipeline.detect import FaceDetector
+    from app.pipeline.embed import FaceEmbedder
+
+    detector = FaceDetector()
+    embedder = FaceEmbedder()
+    face_names: list[str] = []
+    face_embeddings: list[np.ndarray] = []
+    for path in sys.argv[1:]:
+      image = cv2.imread(path)
+      if image is None:
+        print(f"{path}: 건너뜀 (이미지를 읽을 수 없음)")
         continue
-      face_names.append(f"{path}#face{face_i}")
-      face_embeddings.append(embedding)
-    print(f"{path}: {len(detected)} face(s), 임베딩 {len(face_embeddings)}개 누적")
+      detected = detector.detect(image)
+      crops = [(i, align_face(image, face.landmarks)) for i, face in enumerate(detected)]
+      valid = [(i, crop) for i, crop in crops if crop is not None]
+      for (face_i, _), embedding in zip(valid, embedder.embed_batch([crop for _, crop in valid])):
+        if embedding is None:
+          continue
+        face_names.append(f"{path}#face{face_i}")
+        face_embeddings.append(embedding)
+      print(f"{path}: {len(detected)} face(s), 임베딩 {len(face_embeddings)}개 누적")
 
-  if not face_embeddings:
-    print("클러스터링할 얼굴이 없습니다.")
+    if not face_embeddings:
+      print("클러스터링할 얼굴이 없습니다.")
+      sys.exit(0)
+
+    start = time.perf_counter()
+    result = recluster(np.stack(face_embeddings), [None] * len(face_embeddings))
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    print(
+      f"\n{len(face_embeddings)}개 얼굴 → 클러스터 {len(result.clusters)}개, "
+      f"노이즈 {len(result.noise_indices)}개, 저신뢰 {len(result.ambiguous_indices)}개 in {elapsed_ms:.1f} ms"
+    )
+    for cluster in result.clusters:
+      print(f"  [{cluster.cluster_id}] is_new={cluster.is_new}, 멤버 {len(cluster.member_indices)}명")
+      for idx in cluster.member_indices:
+        print(f"    {face_names[idx]}")
+    for idx in result.noise_indices:
+      print(f"  노이즈: {face_names[idx]}")
+    for idx in result.ambiguous_indices:
+      print(f"  저신뢰(ambiguous): {face_names[idx]}")
     sys.exit(0)
 
-  start = time.perf_counter()
-  result = recluster(np.stack(face_embeddings), [None] * len(face_embeddings))
-  elapsed_ms = (time.perf_counter() - start) * 1000.0
+  # 인자 없음: 모델·이미지 없이 합성 임베딩으로 연결 성분 부분 승격(ADR-008)을 자가 검증한다.
+  # 쌍 유사도를 닫힌형식으로 제어한 벡터로 "소규모 단일 인물 이벤트 전원 uncertain" 퇴화와
+  # 그 교정을 결정적으로 재현한다 (실측 대역: 동일 인물 쌍 0.46~0.70, 타인 ≲0.3).
+  # TODO(CHMO-165): pytest 도입 시 tests/test_cluster.py로 승격
+  import math
 
-  print(
-    f"\n{len(face_embeddings)}개 얼굴 → 클러스터 {len(result.clusters)}개, "
-    f"노이즈 {len(result.noise_indices)}개, 저신뢰 {len(result.ambiguous_indices)}개 in {elapsed_ms:.1f} ms"
+  passed = 0
+
+  def check(name: str, condition: bool) -> None:
+    global passed
+    if not condition:
+      raise SystemExit(f"실패: {name}")
+    passed += 1
+    print(f"통과: {name}")
+
+  def axis(i: int) -> np.ndarray:
+    vector = np.zeros(EMBED_DIM, dtype=np.float64)
+    vector[i] = 1.0
+    return vector
+
+  def spread_vectors(cosines: Sequence[float], base: np.ndarray, spread_axis0: int) -> np.ndarray:
+    """멤버 i = c_i·base + √(1-c_i²)·(고유 직교 축) — 쌍 유사도가 정확히 c_i·c_j·(base_i·base_j)인 단위벡터.
+
+    base 성분의 곱 구조라 MST가 star형이 되어 HDBSCAN condensed tree에 진짜 분할 지점이 없다 —
+    실사진 소규모 단일 인물 이벤트의 "클러스터 0개" 퇴화를 임계값까지 통제하며 재현한다.
+    """
+    vectors = np.zeros((len(cosines), EMBED_DIM), dtype=np.float64)
+    for row, c in enumerate(cosines):
+      vectors[row] = c * base
+      vectors[row, spread_axis0 + row] = math.sqrt(1.0 - c * c)
+    return vectors.astype(np.float32)
+
+  def hdbscan_labels(vectors: np.ndarray) -> np.ndarray:
+    config = ClusterConfig()
+    return np.asarray(
+      HDBSCAN(
+        min_cluster_size=config.min_cluster_size,
+        min_samples=config.min_samples,
+        metric="cosine",
+        cluster_selection_epsilon=config.cluster_selection_epsilon,
+      ).fit_predict(vectors),
+      dtype=np.int64,
+    )
+
+  def raises_value_error(factory: Callable[[], object]) -> bool:
+    try:
+      factory()
+    except ValueError:
+      return True
+    return False
+
+  # (a) 실측 대역 단일 인물 5장 — 쌍 유사도 0.533~0.648 (전부 구 임계 0.7 미만)
+  real_band = spread_vectors((0.82, 0.79, 0.76, 0.74, 0.72), axis(0), 10)
+  check(
+    "(a) 전제: 실측 대역 5장은 HDBSCAN 클러스터 0개(전원 노이즈) 퇴화를 밟는다",
+    bool((hdbscan_labels(real_band) == _NOISE).all()),
   )
-  for cluster in result.clusters:
-    print(f"  [{cluster.cluster_id}] is_new={cluster.is_new}, 멤버 {len(cluster.member_indices)}명")
-    for idx in cluster.member_indices:
-      print(f"    {face_names[idx]}")
-  for idx in result.noise_indices:
-    print(f"  노이즈: {face_names[idx]}")
-  for idx in result.ambiguous_indices:
-    print(f"  저신뢰(ambiguous): {face_names[idx]}")
+  result = recluster(real_band, [None] * 5)
+  check(
+    "(a) 실측 대역 단일 인물 5장 → 클러스터 1개에 전원 소속 (앨범 미생성 버그 교정)",
+    len(result.clusters) == 1
+    and result.clusters[0].member_indices == (0, 1, 2, 3, 4)
+    and result.noise_indices == ()
+    and result.ambiguous_indices == (),
+  )
+
+  # (b) 단일 인물 4장 + 낯선 행인 1장 — 교차 유사도 ≈0.13~0.15 (부분 승격: 행인만 노이즈 유지)
+  person = spread_vectors((0.82, 0.79, 0.76, 0.73), axis(0), 10)
+  stranger_base = 0.2 * axis(0) + math.sqrt(1.0 - 0.2**2) * axis(1)
+  stranger = spread_vectors((0.9,), stranger_base, 20)
+  mixed = np.vstack([person, stranger])
+  check("(b) 전제: 인물 4장 + 행인도 HDBSCAN 전원 노이즈", bool((hdbscan_labels(mixed) == _NOISE).all()))
+  result = recluster(mixed, [None] * 5)
+  check(
+    "(b) 인물 4장만 승격, 행인은 노이즈 유지 (전체 일괄 승격이면 불가능한 결과)",
+    len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1, 2, 3) and result.noise_indices == (4,),
+  )
+
+  # (c) 두 인물이 전원 노이즈로 시작 — 교차 ≈0.26~0.32: 성분 2개가 각각 승격, 섞임 없음.
+  # recluster e2e로는 재현 불가(두 밀집은 HDBSCAN이 정상 분할)라 헬퍼를 직접 검증한다.
+  second_base = 0.4 * axis(0) + math.sqrt(1.0 - 0.4**2) * axis(1)
+  two_people = np.vstack(
+    [spread_vectors((0.9, 0.85, 0.8), axis(0), 10), spread_vectors((0.9, 0.85, 0.8), second_base, 20)]
+  )
+  labels = np.full(6, _NOISE, dtype=np.int64)
+  _promote_single_blob(labels, two_people, ClusterConfig())
+  check(
+    "(c) 두 인물 성분 각각 승격 — 교차 ~0.3은 간선이 없어 섞이지 않음",
+    labels.tolist() == [0, 0, 0, 1, 1, 1],
+  )
+
+  # (d) 근중복 버스트(쌍 ≥0.985) — 구 0.7 완전 연결 fast-path가 구제하던 케이스의 동작 보존
+  theta = [math.radians(5.0 * k) for k in range(3)]
+  burst = np.stack([math.cos(t) * axis(0) + math.sin(t) * axis(1) for t in theta]).astype(np.float32)
+  check("(d) 전제: 근중복 버스트도 HDBSCAN 전원 노이즈", bool((hdbscan_labels(burst) == _NOISE).all()))
+  result = recluster(burst, [None] * 3)
+  check(
+    "(d) 근중복 버스트 3장 → 클러스터 1개 (기존 승격 동작 회귀 없음)",
+    len(result.clusters) == 1 and result.noise_indices == (),
+  )
+
+  # (e) 낯선 2인(유사도 0.1) → 승격 없음 / 동일 인물 2장(유사도 0.6) → 승격 (구제 범위 확대)
+  strangers = np.vstack(
+    [spread_vectors((1.0,), axis(0), 10), spread_vectors((1.0,), 0.1 * axis(0) + math.sqrt(0.99) * axis(1), 20)]
+  )
+  result = recluster(strangers, [None] * 2)
+  check("(e) 낯선 2인은 승격되지 않음 (기존 가드 유지)", result.clusters == () and result.noise_indices == (0, 1))
+  pair = spread_vectors((0.8, 0.75), axis(0), 10)  # 쌍 유사도 0.6
+  result = recluster(pair, [None] * 2)
+  check(
+    "(e) 동일 인물 2장(0.6)은 승격 — 신규 구제 범위",
+    len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1),
+  )
+
+  # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C가 0.3(floor 미만)이라
+  # 두 남남(A·C)은 절대 같은 앨범에 남지 않는다. peel이 유사도 합 최소인 A를 떼고 나머지만 승격.
+  chained = spread_vectors((0.548, 0.913, 0.548), axis(0), 10)  # 쌍: 0.500, 0.500, 0.300
+  labels = np.full(3, _NOISE, dtype=np.int64)
+  _promote_single_blob(labels, chained, ClusterConfig())
+  check(
+    "(f) 체이닝 남남(A~C 0.3)은 같은 앨범 불가 — peel이 A를 떼고 B·C만 승격",
+    labels[0] == _NOISE and labels[1] == labels[2] != _NOISE,
+  )
+
+  def planar(degrees: Sequence[float], ax0: int, ax1: int) -> np.ndarray:
+    """평면 위 각도로 배치한 단위벡터 — 쌍 유사도 = cos(각도차). peel 테스트용 비(非)곱 구조."""
+    vectors = np.zeros((len(degrees), EMBED_DIM), dtype=np.float64)
+    for row, deg in enumerate(degrees):
+      t = math.radians(deg)
+      vectors[row] = math.cos(t) * axis(ax0) + math.sin(t) * axis(ax1)
+    return vectors.astype(np.float32)
+
+  # (h) peel 구제 — 한 극단적 포즈(78°)가 floor를 깨는 성분: 통째 기각 대신 그 한 장만 떼고 핵심 3장 승격
+  # (실사진 karina 5장에서 한 쌍 0.394가 성분 전체를 무너뜨리던 문제의 합성 재현). 직접 호출로 peel만 격리.
+  poses = planar((0.0, 25.0, 50.0, 78.0), 0, 1)  # 0~2는 서로 ≥0.64, 3은 0과 0.21로 floor 미달
+  labels = np.full(4, _NOISE, dtype=np.int64)
+  _promote_single_blob(labels, poses, ClusterConfig())
+  check(
+    "(h) peel — 극단 포즈 1장만 노이즈로 떼고 핵심 3장은 한 앨범으로 승격",
+    labels.tolist() == [0, 0, 0, _NOISE],
+  )
+
+  # (g) 설정 불변식 — 잘못된 임계 조합은 생성 시점에 거부
+  check(
+    "(g) floor > promote 조합 거부",
+    raises_value_error(lambda: ClusterConfig(blob_promote_floor=0.5, blob_promote_similarity=0.45)),
+  )
+  check(
+    "(g) floor < min_membership_similarity 조합 거부 (승격 즉시 재강등 churn 차단)",
+    raises_value_error(lambda: ClusterConfig(blob_promote_floor=0.3)),
+  )
+
+  print(f"\n합성 자가 검증 {passed}건 전부 통과")
