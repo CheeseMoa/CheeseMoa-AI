@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
+  from app.pipeline.quality import QualityConfig
 
 
 class Settings(BaseSettings):
@@ -47,6 +48,11 @@ class Settings(BaseSettings):
   cluster_blob_promote_similarity: float = 0.45
   cluster_blob_promote_floor: float = 0.4
 
+  # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
+  quality_blur_threshold: float = 100.0
+  quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
+  quality_eye_box_px: int = 24
+
   log_level: str = "INFO"
 
   def to_cluster_config(self) -> "ClusterConfig":
@@ -68,4 +74,17 @@ class Settings(BaseSettings):
       min_membership_margin=self.cluster_min_membership_margin,
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
+    )
+
+  def to_quality_config(self) -> "QualityConfig":
+    """설정값을 품질 게이트의 QualityConfig로 변환한다 (값 검증은 QualityConfig.__post_init__이 수행).
+
+    to_cluster_config와 같은 이유로 pipeline 임포트를 지연시킨다 (core→pipeline 역의존 회피).
+    """
+    from app.pipeline.quality import QualityConfig
+
+    return QualityConfig(
+      blur_threshold=self.quality_blur_threshold,
+      eye_closed_confidence=self.quality_eye_closed_confidence,
+      eye_box_px=self.quality_eye_box_px,
     )

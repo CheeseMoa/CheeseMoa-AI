@@ -18,6 +18,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import numpy as np
 
@@ -39,10 +40,22 @@ from app.storage.image_source import ImageSource
 
 logger = logging.getLogger(__name__)
 
-# 디코딩된 BGR 이미지 → 그 이미지에서 추출한 얼굴별 L2 정규화 (512,) float32 임베딩 목록.
-# 빈 목록 = 얼굴 미검출(또는 전부 퇴화) → common_album 라우팅 (feature-spec §6.2).
-# detect→align→embed 합성은 core.deps.build_face_extractor가 만든다.
-FaceExtractor = Callable[[np.ndarray], list[np.ndarray]]
+
+class ExtractedFaces(NamedTuple):
+  """한 이미지에서 추출한 결과 — 얼굴 임베딩 + 이미지 단위 품질 원시 판정.
+
+  품질 플래그는 토글 적용 전의 지각(perception) 결과다: 토글(exclude_eyes_closed/blurry)을
+  반영해 실제 라우팅을 정하는 정책은 핸들러의 몫 (관심사 분리).
+  """
+
+  embeddings: list[np.ndarray]  # 얼굴별 L2 정규화 (512,) float32. 빈 목록 = 얼굴 미검출/전부 퇴화
+  eyes_closed: bool = False  # 얼굴 1개라도 양눈 감김 (quality.judge_faces 규칙)
+  blurry: bool = False  # 얼굴 1개라도 Laplacian variance < 임계
+
+
+# 디코딩된 BGR 이미지 → ExtractedFaces. embeddings 빈 목록이면 common_album 라우팅 (feature-spec §6.2).
+# detect→align→embed + 품질 판정 합성은 core.deps.build_face_extractor가 만든다.
+FaceExtractor = Callable[[np.ndarray], ExtractedFaces]
 
 InboundParsed = ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | DeleteRequest
 
@@ -189,6 +202,8 @@ class JobHandlers:
     known_photo_ids = set(stored.photo_ids)
 
     common_album: list[str] = []
+    eyes_closed_images: list[str] = []
+    blurry_images: list[str] = []
     failed_images: list[FailedImage] = []
     new_rows: list[tuple[str, str, np.ndarray]] = []
     for ref in request.images:
@@ -196,23 +211,39 @@ class JobHandlers:
         continue  # 재전달/중복 요청 멱등: 이미 임베딩된 사진은 건너뛴다 (ADR-007 재군집 흐름 3단계)
       try:
         image = self._images.fetch(ref.s3_key)
-        face_embeddings = self._extract_faces(image)
+        extracted = self._extract_faces(image)
       except Exception as exc:
         # 이미지 단위 격리 (feature-spec §9) — 한 장의 실패가 작업 전체를 죽이지 않는다
         logger.warning("이미지 처리 실패 image_id=%s s3_key=%s", ref.image_id, ref.s3_key, exc_info=exc)
         failed_images.append(FailedImage(image_id=ref.image_id, reason=type(exc).__name__))
         continue
-      if not face_embeddings:
+      if not extracted.embeddings:
         # 얼굴 미검출(단체/배경 사진) → 공용 앨범 (feature-spec §6.2 확정: uncertain이 아니다).
         # .npz에는 행이 없으므로 재전달 시 재추출된다 — 결과가 같아 멱등이다.
         common_album.append(ref.image_id)
         continue
-      new_rows.extend((self._new_face_id(), ref.image_id, embedding) for embedding in face_embeddings)
+      # 품질 게이트 (feature-spec §6.1·§6.2·§7): 토글 ON이고 해당 사진이면 인물 앨범 대신 품질 앨범으로
+      # 분리하고 재군집에서 제외한다(new_rows 미추가) → clusters/common/uncertain과 자동 상호배타.
+      # 흔들림 우선 — blur면 눈 상태 판정을 신뢰할 수 없으므로 blurry가 eyes_closed에 앞선다.
+      # 품질 앨범은 이번 요청분만이다 (.npz에 품질 컬럼 미저장 — 얼굴 미검출 common과 같은 request-scoped 비대칭).
+      if request.options.exclude_blurry and extracted.blurry:
+        blurry_images.append(ref.image_id)
+        continue
+      if request.options.exclude_eyes_closed and extracted.eyes_closed:
+        eyes_closed_images.append(ref.image_id)
+        continue
+      new_rows.extend((self._new_face_id(), ref.image_id, embedding) for embedding in extracted.embeddings)
 
     event = stored.append_faces(new_rows)
     snapshot = self._recluster_and_save(request.event_id, event)
-    # TODO(CHMO-165): request.options(눈감음/흔들림 제외 토글)는 품질 판정 파이프라인 미구현으로 아직 무시된다
-    return self._assemble_result(request.job_id, snapshot, common_album=common_album, failed_images=failed_images)
+    return self._assemble_result(
+      request.job_id,
+      snapshot,
+      common_album=common_album,
+      failed_images=failed_images,
+      eyes_closed=eyes_closed_images,
+      blurry=blurry_images,
+    )
 
   # ── cluster_feedback (merge / split / reassign) ──────────────────────────
 
@@ -401,6 +432,8 @@ class JobHandlers:
     common_album: Sequence[str] = (),
     failed_images: Sequence[FailedImage] = (),
     extra_retired: Sequence[str] = (),
+    eyes_closed: Sequence[str] = (),
+    blurry: Sequence[str] = (),
   ) -> ClassifyResult:
     """재군집 스냅샷(행 인덱스 세계)을 ClassifyResult(image_id 세계)로 번역한다.
 
@@ -449,9 +482,9 @@ class JobHandlers:
       clusters=clusters,
       common_album=list(dict.fromkeys([*common_album, *group_common])),
       uncertain=uncertain,
-      # TODO(CHMO-165): 눈감음/흔들림 품질 판정 파이프라인 미구현 — 항상 빈 리스트 (options 무시)
-      eyes_closed=[],
-      blurry=[],
+      # 품질 게이트로 분리된 사진들 (이번 요청분). 재군집에서 제외됐으므로 clusters/common/uncertain과 겹치지 않는다.
+      eyes_closed=list(dict.fromkeys(eyes_closed)),
+      blurry=list(dict.fromkeys(blurry)),
       failed_images=list(failed_images),
       retired_cluster_ids=list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired])),
     )
@@ -505,22 +538,24 @@ if __name__ == "__main__":
     vector[300 + 8 * (person - 20) + step] = math.sqrt(1.0 - c * c)  # 사진별 고유 직교 축
     return vector
 
-  def fake_image(faces: list[tuple[int, int]]) -> np.ndarray:
-    """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지."""
+  def fake_image(faces: list[tuple[int, int]], *, eyes_closed: bool = False, blurry: bool = False) -> np.ndarray:
+    """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지. 품질 플래그는 행 1에 인코딩한다."""
     image = np.zeros((2, 16, 3), dtype=np.uint8)
     image[0, 0, 0] = len(faces)
+    image[1, 0, 0] = int(eyes_closed)  # fake_extractor가 ExtractedFaces 품질 판정으로 되읽는다
+    image[1, 0, 1] = int(blurry)
     for slot, (person, step) in enumerate(faces):
       image[0, slot + 1, 0] = person
       image[0, slot + 1, 1] = step
     return image
 
-  def fake_extractor(image: np.ndarray) -> list[np.ndarray]:
+  def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
     vectors: list[np.ndarray] = []
     for slot in range(count):
       person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
       vectors.append(spread_person_vector(person, step) if person >= 20 else person_vector(person, step))
-    return vectors
+    return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]))
 
   # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
   # 미매칭 단체 사진(낯선 2인), 같은 사진 속 닮은 얼굴 쌍(단일 사진 클러스터 강등 대상)
@@ -537,6 +572,11 @@ if __name__ == "__main__":
       "img-twins.jpg": fake_image([(6, 0), (6, 1)]),
       # 소규모 단일 인물 이벤트(⑨, event-2)용 — 인물 20은 실측 대역(spread_person_vector) 얼굴
       **{f"img-s{k}.jpg": fake_image([(20, k)]) for k in range(5)},
+      # 품질 게이트(⑩)용 — 같은 인물 2(C)의 정상 2장 + 눈감음 1장 + 흔들림 1장
+      "img-q-ok1.jpg": fake_image([(2, 0)]),
+      "img-q-ok2.jpg": fake_image([(2, 3)]),
+      "img-q-eyes.jpg": fake_image([(2, 1)], eyes_closed=True),
+      "img-q-blur.jpg": fake_image([(2, 2)], blurry=True),
     }
   )
   store = InMemoryEmbeddingStore()
@@ -773,6 +813,62 @@ if __name__ == "__main__":
     and single.uncertain == []
     and single.common_album == []
     and single.status == "succeeded",
+  )
+
+  # ⑩ 품질 게이트: 눈감음/흔들림 사진을 인물 앨범 대신 품질 앨범으로 분리 (토글 ON), OFF면 분리 안 함
+  quality_on_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c3",
+      "group_id": "group-1",
+      "event_id": "event-3",
+      "images": [
+        {"image_id": "img-q-ok1", "s3_key": "img-q-ok1.jpg"},
+        {"image_id": "img-q-ok2", "s3_key": "img-q-ok2.jpg"},
+        {"image_id": "img-q-eyes", "s3_key": "img-q-eyes.jpg"},
+        {"image_id": "img-q-blur", "s3_key": "img-q-blur.jpg"},
+      ],
+    }
+  )
+  quality_on = handlers.handle(parse_inbound_message(quality_on_body))
+  routed_elsewhere = set(quality_on.common_album) | {u.image_id for u in quality_on.uncertain}
+  for cluster in quality_on.clusters:
+    routed_elsewhere |= set(cluster.image_ids)
+  check(
+    "품질 ON: 눈감음/흔들림 분리, 정상 2장만 인물 군집",
+    quality_on.eyes_closed == ["img-q-eyes"]
+    and quality_on.blurry == ["img-q-blur"]
+    and len(quality_on.clusters) == 1
+    and set(quality_on.clusters[0].image_ids) == {"img-q-ok1", "img-q-ok2"},
+  )
+  check(
+    "품질 ON: 분리된 사진은 인물/공용/uncertain 어디에도 없음(상호배타) + .npz엔 정상 2행만",
+    routed_elsewhere.isdisjoint({"img-q-eyes", "img-q-blur"}) and len(store.load("event-3").face_ids) == 2,
+  )
+
+  # 같은 3종을 토글 OFF로 — 품질 분리 없이 전원 인물 군집에 남는다 (event-4로 격리)
+  quality_off_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c4",
+      "group_id": "group-1",
+      "event_id": "event-4",
+      "options": {"exclude_eyes_closed": False, "exclude_blurry": False},
+      "images": [
+        {"image_id": "img-q-ok1", "s3_key": "img-q-ok1.jpg"},
+        {"image_id": "img-q-eyes", "s3_key": "img-q-eyes.jpg"},
+        {"image_id": "img-q-blur", "s3_key": "img-q-blur.jpg"},
+      ],
+    }
+  )
+  quality_off = handlers.handle(parse_inbound_message(quality_off_body))
+  check(
+    "품질 OFF: 분리 안 함 — 눈감음/흔들림도 인물 군집에 포함",
+    quality_off.eyes_closed == []
+    and quality_off.blurry == []
+    and len(quality_off.clusters) == 1
+    and set(quality_off.clusters[0].image_ids) == {"img-q-ok1", "img-q-eyes", "img-q-blur"}
+    and len(store.load("event-4").face_ids) == 3,
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

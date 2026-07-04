@@ -11,12 +11,13 @@ from dataclasses import dataclass
 import boto3
 
 from app.core.config import Settings
-from app.handlers import FaceExtractor, JobHandlers
+from app.handlers import ExtractedFaces, FaceExtractor, JobHandlers
 from app.messaging.consumer import MessageConsumer, SqsConsumer
 from app.messaging.publisher import ResultPublisher, SqsPublisher
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
 from app.pipeline.embed import FaceEmbedder
+from app.pipeline.quality import EyeStateClassifier, QualityConfig, judge_faces
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
 
@@ -33,17 +34,32 @@ class WorkerDeps:
   settings: Settings
 
 
-def build_face_extractor(detector: FaceDetector, embedder: FaceEmbedder) -> FaceExtractor:
-  """detect → align → embed를 합성해 handlers가 요구하는 FaceExtractor를 만든다.
+def build_face_extractor(
+  detector: FaceDetector,
+  embedder: FaceEmbedder,
+  eye_classifier: EyeStateClassifier,
+  quality_config: QualityConfig,
+) -> FaceExtractor:
+  """detect → align → embed에 품질 판정(눈감음/흔들림)을 합성해 handlers의 FaceExtractor를 만든다.
 
-  퇴화 얼굴(정렬 실패·비유한 임베딩)은 각 단계가 None으로 걸러내는 계약이라 여기서 제거한다.
+  퇴화 얼굴(정렬 실패·비유한 임베딩)은 각 단계가 None으로 걸러내는 계약이라 임베딩에서 제거한다.
+  품질 판정은 정렬 crop(눈감음)과 원본 bbox crop(흔들림)을 쓰며, 정렬 crop은 임베딩용과 공유해 중복 정렬이 없다.
   단일 스레드 워커 전제: FaceDetector는 스레드 안전하지 않지만 동시 호출이 없어 무해하다.
   """
 
   def extract_faces(image):
     detected = detector.detect(image)
-    crops = [crop for crop in (align_face(image, face.landmarks) for face in detected) if crop is not None]
-    return [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]
+    aligned_crops = [align_face(image, face.landmarks) for face in detected]
+    # 얼굴별 (정렬 crop|None, 원본 bbox crop) 쌍 — judge_faces가 눈감음(정렬)·흔들림(bbox)을 판정한다
+    face_pairs = []
+    for face, aligned in zip(detected, aligned_crops):
+      x, y, w, h = face.bbox
+      face_pairs.append((aligned, image[y : y + h, x : x + w]))
+    eyes_closed, blurry = judge_faces(face_pairs, eye_classifier, quality_config)
+
+    crops = [crop for crop in aligned_crops if crop is not None]
+    embeddings = [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]
+    return ExtractedFaces(embeddings, eyes_closed, blurry)
 
   return extract_faces
 
@@ -57,15 +73,16 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   sqs_client = boto3.client("sqs", region_name=settings.aws_region)
   s3_client = boto3.client("s3", region_name=settings.aws_region)
 
-  logger.info("AI 모델 로딩 중 (YuNet + AuraFace) — 최초 실행은 다운로드로 오래 걸릴 수 있습니다")
+  logger.info("AI 모델 로딩 중 (YuNet + AuraFace + 눈감음 CNN) — 최초 실행은 다운로드로 오래 걸릴 수 있습니다")
   detector = FaceDetector()
   embedder = FaceEmbedder()
+  eye_classifier = EyeStateClassifier()
   logger.info("AI 모델 로딩 완료")
 
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=S3ImageSource(s3_client, settings.images_bucket),
-    extract_faces=build_face_extractor(detector, embedder),
+    extract_faces=build_face_extractor(detector, embedder, eye_classifier, settings.to_quality_config()),
     cluster_config=settings.to_cluster_config(),
   )
   return WorkerDeps(

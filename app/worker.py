@@ -166,7 +166,7 @@ def _run_smoke() -> None:
 
   import numpy as np
 
-  from app.handlers import JobHandlers
+  from app.handlers import ExtractedFaces, JobHandlers
   from app.messaging.consumer import InMemoryConsumer
   from app.messaging.publisher import InMemoryPublisher
   from app.storage.embedding_store import InMemoryEmbeddingStore
@@ -198,9 +198,10 @@ def _run_smoke() -> None:
       image[0, slot + 1, 1] = step
     return image
 
-  def fake_extractor(image: np.ndarray) -> list[np.ndarray]:
+  def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
-    return [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
+    vectors = [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
+    return ExtractedFaces(vectors)  # 품질 플래그는 이 스모크 범위 밖 — 기본 False
 
   store = InMemoryEmbeddingStore()
   # "event-폭발"의 .npz를 손상시켜 두면 해당 classify가 StoreCorruptionError로 작업 전체 실패한다
