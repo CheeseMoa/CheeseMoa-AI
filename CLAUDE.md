@@ -179,6 +179,9 @@ pip install pre-commit
 pre-commit install
 ```
 
+로컬 Docker + 실 AWS(SQS/S3) end-to-end 테스트(AWS SSO 프로필 설정·세션 만료 대응 포함)는
+[docs/guides/local-docker-e2e-testing.md](docs/guides/local-docker-e2e-testing.md) 참고.
+
 ---
 
 ## 코드 컨벤션
