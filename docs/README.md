@@ -25,3 +25,8 @@
 
 - [code-style.md](./conventions/code-style.md) — Python 워커 코드 컨벤션
 - [project-structure.md](./conventions/project-structure.md) — 폴더 구조와 책임
+
+## guides — 실행 가이드
+
+- [local-docker-e2e-testing.md](./guides/local-docker-e2e-testing.md) — 로컬 Docker + 실 AWS(SQS/S3)
+  end-to-end 테스트 절차 (AWS SSO 프로필 설정·세션 만료 대응 포함)

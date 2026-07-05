@@ -29,6 +29,13 @@ Id = Annotated[str, Field(min_length=1)]
 # NaN/inf는 JSON 직렬화 시 null 또는 비표준 토큰이 되어 Spring 파싱을 조용히 깨뜨린다 (recluster의 비유한값 거부와 동일 철학).
 FiniteFloat = Annotated[float, Field(allow_inf_nan=False)]
 
+# "분류가 어려워요"(uncertain) 앨범의 예약 id. 인물 앨범과 달리 uncertain 얼굴은 아무 cluster_id에도
+# 속하지 않아(.npz엔 None) 이대로면 reassign의 대상(from_cluster_id)이 될 수 없다. 그래서 uncertain
+# 사진을 하나의 가상 앨범으로 묶어 이 예약 id를 부여한다 — 사용자가 이 사진을 인물 앨범으로 옮기면
+# Spring이 reassign(from_cluster_id=이 값)으로 되돌려주고, 워커가 해당 사진의 미매칭 얼굴을 매칭한다.
+# .npz에는 저장하지 않는 결과-계약 전용 값이라(uuid가 아닌 예약 리터럴), 실제 cluster_id와 충돌하지 않는다.
+UNCERTAIN_ALBUM_ID = "__uncertain__"
+
 
 class _MessageBase(BaseModel):
   # frozen: 파이프라인 도메인 모델(frozen dataclass)과 동일한 불변 계약 — 워커가 처리 중 메시지를 변형하지 못한다.
@@ -216,10 +223,14 @@ class UncertainImage(_MessageBase):
   reason 매핑 (ReclusterResult 기준): ambiguous = 두 인물 사이 저신뢰(ambiguous_indices),
   unmatched = 얼굴은 검출됐으나 어느 인물과도 매칭되지 않음(noise_indices, 예: 행인).
   얼굴 미검출(인물 없는) 사진은 uncertain이 아니라 common_album으로 간다 (feature-spec §6.2).
+
+  album_id: 이 사진이 속한 uncertain 앨범의 예약 id(UNCERTAIN_ALBUM_ID). 사용자가 이 사진을 인물
+  앨범으로 옮길 때 Spring이 reassign의 from_cluster_id로 그대로 되돌려주면 워커가 편입 처리한다.
   """
 
   image_id: Id
   reason: Literal["ambiguous", "unmatched"]  # TBD #2: back·duplicate 추가 합의 시 Literal 확장
+  album_id: Id = UNCERTAIN_ALBUM_ID  # reassign의 from_cluster_id로 되돌려줄 출처 앨범 id (예약 리터럴)
 
 
 class FailedImage(_MessageBase):
@@ -351,6 +362,11 @@ if __name__ == "__main__":
     retired_cluster_ids=["person-C"],
   )
   check("classify-result 직렬화 라운드트립", ClassifyResult.model_validate_json(result.model_dump_json()) == result)
+  check(
+    "uncertain 항목은 예약 앨범 id 기본 부여 (reassign 출처)",
+    all(uncertain.album_id == UNCERTAIN_ALBUM_ID for uncertain in result.uncertain)
+    and '"album_id":"__uncertain__"' in result.model_dump_json().replace(" ", ""),
+  )
   check("failed 결과 최소 구성", ClassifyResult(job_id="job-9", status="failed").clusters == [])
 
   invalid_cases = [

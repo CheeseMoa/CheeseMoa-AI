@@ -1,0 +1,18 @@
+# 빌드 컨텍스트에서 제외 — 이미지 크기·빌드 속도·비밀 유출 방지
+.env
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.git/
+.gitignore
+.pytest_cache/
+.ruff_cache/
+scripts/
+docs/
+healthcare_api.py
+*.log
+.vscode/
+.idea/

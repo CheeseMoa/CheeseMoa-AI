@@ -20,7 +20,10 @@ if TYPE_CHECKING:
 
 class Settings(BaseSettings):
   # frozen: 메시지 스키마·파이프라인 config와 동일한 불변 계약 — 실행 중 설정 변형을 막는다
-  model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", frozen=True)
+  # extra="ignore": dotenv 소스는 .env 파일의 "모든" 키를 입력으로 넘기므로, boto3가 직접 읽는
+  #   AWS 자격증명(AWS_ACCESS_KEY_ID 등)처럼 Settings 필드가 아닌 키가 .env에 함께 있어도 거부하지
+  #   않게 한다 (이게 없으면 .env에 자격증명을 둔 로컬/컨테이너 기동이 extra_forbidden으로 실패한다).
+  model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", frozen=True, extra="ignore")
 
   # ── AWS 주소 (미정 — 확정 시 .env/배포 환경변수에 실값 주입) ──────────────────
   inbound_queue_url: str  # 단일 FIFO 인바운드 큐 (classify/feedback/delete, messageGroupId=event_id)
