@@ -79,6 +79,16 @@
 }
 ```
 
+> **uncertain 사진을 인물 앨범으로 편입**: `reassign`의 `from_cluster_id`에 인물 `cluster_id` 대신 예약 id
+> **`"__uncertain__"`**(결과의 `uncertain[].album_id` 값)을 넣으면, "분류가 어려워요"에 있던 사진을 인물 앨범으로
+> 옮긴다. uncertain 얼굴은 실 `cluster_id`가 없어(`.npz`엔 `None`) 일반 reassign 대상이 못 되므로, 이 가상 앨범을
+> 출처로 인정한다. 워커는 해당 사진의 미매칭 얼굴을 `to_cluster_id`와 must-link해 재군집이 이 결정을 유지하게 한다.
+>
+> ```jsonc
+> { ..., "action": "reassign",
+>   "reassign": { "image_id": "img-6", "from_cluster_id": "__uncertain__", "to_cluster_id": "person-A" } }
+> ```
+
 ## ③ 하드 삭제 — `delete_request` (Spring → AI)
 
 사진 하드 삭제 요청. 삭제 메시지 자체가 트리거라 재업로드를 기다리지 않는다 — 워커(이벤트 `.npz`의
@@ -112,8 +122,9 @@
   ],
   "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경·얼굴 미검출) — 뷰어 노출
   "uncertain": [                                  // "분류가 어려워요" — 뷰어 비노출
-    { "image_id": "img-5", "reason": "ambiguous" },  // 두 인물 사이 저신뢰
-    { "image_id": "img-6", "reason": "unmatched" }   // 얼굴은 있으나 어느 인물과도 매칭 안 됨 (예: 행인)
+    // album_id: 이 사진을 인물 앨범으로 옮길 때 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id
+    { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__" },  // 두 인물 사이 저신뢰
+    { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__" }   // 얼굴은 있으나 인물 미매칭 (예: 행인)
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
   "blurry": ["img-4"],                            // exclude_blurry=ON일 때만 — 뷰어 비노출

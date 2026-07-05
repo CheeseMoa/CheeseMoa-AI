@@ -24,6 +24,7 @@ import numpy as np
 
 from app.pipeline.cluster import ClusterConfig, Constraints, PersonCluster, recluster
 from app.schemas.messages import (
+  UNCERTAIN_ALBUM_ID,
   ClassifyRequest,
   ClassifyResult,
   DeleteRequest,
@@ -327,10 +328,15 @@ class JobHandlers:
 
       case ReassignFeedback():
         payload = message.reassign
+        # from_cluster_id가 예약 uncertain 앨범 id면 "미매칭(cluster_id=None) 얼굴"을 대상으로 삼는다.
+        # uncertain 얼굴은 실 cluster_id가 없어(.npz엔 None) 일반 reassign(cluster_id 일치)으로는 옮길 수
+        # 없기 때문 — 이 가상 앨범을 출처로 인정해 인물 앨범 편입을 가능하게 한다 (feature-spec §6.2·§6.3).
+        from_uncertain = payload.from_cluster_id == UNCERTAIN_ALBUM_ID
         moved = [
           face_id
           for face_id, photo_id, cluster_id in zip(stored.face_ids, stored.photo_ids, stored.cluster_ids)
-          if photo_id == payload.image_id and cluster_id == payload.from_cluster_id
+          if photo_id == payload.image_id
+          and (cluster_id is None if from_uncertain else cluster_id == payload.from_cluster_id)
         ]
         if not moved:
           logger.warning(
@@ -581,6 +587,8 @@ if __name__ == "__main__":
       "img-q-blur.jpg": fake_image([(2, 2)], blurry=True),
       # 흔들림 fallback(⑪)용 — 얼굴 미검출 + 흔들림 (완전 흔들려 검출 실패한 사진 모사)
       "img-nf-blur.jpg": fake_image([], blurry=True),
+      # uncertain 편입(⑫)용 — 낯선 1인(인물 8) 단일 얼굴 → uncertain(unmatched)
+      "img-stranger.jpg": fake_image([(8, 0)]),
     }
   )
   store = InMemoryEmbeddingStore()
@@ -893,6 +901,56 @@ if __name__ == "__main__":
   check(
     "흔들림 fallback: 얼굴 미검출+흔들림 → blurry, 얼굴 미검출+선명 → common",
     nfb.blurry == ["img-nf-blur"] and nfb.common_album == ["img-nf-ok"] and len(store.load("event-5").face_ids) == 0,
+  )
+
+  # ⑫ uncertain 사진의 인물 앨범 편입: 예약 앨범 id(UNCERTAIN_ALBUM_ID)를 from_cluster_id로 하는 reassign으로
+  #    미매칭(cluster_id=None) 얼굴을 must-link 편입한다 (feature-spec §6.2·§6.3 — 계약 확장)
+  uncertain_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c6",
+      "group_id": "group-1",
+      "event_id": "event-6",
+      "images": [
+        {"image_id": "img-u1", "s3_key": "img-a1.jpg"},  # 인물 0
+        {"image_id": "img-u2", "s3_key": "img-a2.jpg"},  # 인물 0 (같은 사람) → 인물 앨범 형성
+        {"image_id": "img-stranger", "s3_key": "img-stranger.jpg"},  # 낯선 1인 → uncertain(unmatched)
+      ],
+    }
+  )
+  uncertain_result = handlers.handle(parse_inbound_message(uncertain_body))
+  check(
+    "uncertain 편입 전: stranger는 uncertain(unmatched) + 예약 앨범 id 부여",
+    len(uncertain_result.clusters) == 1
+    and any(
+      u.image_id == "img-stranger" and u.reason == "unmatched" and u.album_id == UNCERTAIN_ALBUM_ID
+      for u in uncertain_result.uncertain
+    ),
+  )
+  cluster_u_id = next(c.cluster_id for c in uncertain_result.clusters if "img-u1" in c.image_ids)
+  reassign_uncertain_body = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f6",
+      "event_id": "event-6",
+      "action": "reassign",
+      "reassign": {
+        "image_id": "img-stranger",
+        "from_cluster_id": UNCERTAIN_ALBUM_ID,  # 예약 앨범 id — uncertain 얼굴을 출처로 인정
+        "to_cluster_id": cluster_u_id,
+      },
+    }
+  )
+  joined = handlers.handle(parse_inbound_message(reassign_uncertain_body))
+  check(
+    "uncertain 편입: 예약 앨범 id reassign으로 stranger가 인물 앨범에 편입 + uncertain에서 제거",
+    "img-stranger" in image_ids_of(joined, containing="img-u1")
+    and all(u.image_id != "img-stranger" for u in joined.uncertain),
+  )
+  after_join = store.load("event-6")
+  check(
+    "uncertain 편입: stranger가 .npz에 인물 앨범으로 배정 저장 (must-link 지속)",
+    dict(zip(after_join.photo_ids, after_join.cluster_ids))["img-stranger"] == cluster_u_id,
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
