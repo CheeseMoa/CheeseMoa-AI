@@ -8,8 +8,8 @@ FIFO 큐(messageGroupId=event_id, ADR-007)로 수신하므로 body의 `type` 필
 wire 필드명은 snake_case 그대로다(Spring이 SNAKE_CASE 직렬화 전략을 설정하는 것이 계약).
 별칭(alias) 기계를 두지 않아 Python 필드명 = wire 필드명이 항상 성립한다.
 
-보정 메시지의 merge/split/reassign → must-link/cannot-link 제약 변환, image_id ↔ face_id ↔
-행 인덱스 번역은 워커의 책임이다 (cluster.Constraints 독스트링 참고). 이 모듈은 순수 wire
+보정 메시지의 merge/split/reassign/confirm_distinct → must-link/cannot-link 제약 변환, image_id ↔
+face_id ↔ 행 인덱스 번역은 워커의 책임이다 (cluster.Constraints 독스트링 참고). 이 모듈은 순수 wire
 계약만 안다 — pipeline·numpy에 의존하지 않는다.
 """
 
@@ -139,6 +139,25 @@ class ReassignPayload(_MessageBase):
     return self
 
 
+class ConfirmDistinctPayload(_MessageBase):
+  """기존 인물 클러스터 여러 개를 서로 다른 사람으로 확정 — 워커가 대표 얼굴 전 쌍 cannot-link로 변환한다.
+
+  merge의 반대 방향 선언이다: merge가 여러 클러스터를 하나로 묶는다면, 이 액션은 여러 클러스터가
+  앞으로도 하나로 재군집되지 않도록 고정한다. must-link는 "같이 있어야 한다"만 강제할 뿐 "떨어져
+  있어야 한다"는 강제하지 못해, 두 확정 앨범 사이로 유사도가 애매한 신규 사진(다리 사진)이 들어오면
+  전체 재군집이 둘을 하나로 오병합할 수 있다 — 이 액션은 그 경로를 cannot-link로 막는다.
+  """
+
+  cluster_ids: list[Id] = Field(min_length=2)
+
+  @model_validator(mode="after")
+  def _reject_duplicate_clusters(self) -> "ConfirmDistinctPayload":
+    duplicated = sorted(cluster_id for cluster_id, count in Counter(self.cluster_ids).items() if count > 1)
+    if duplicated:
+      raise ValueError(f"cluster_ids에 중복이 있을 수 없습니다. 중복 id: {duplicated}")
+    return self
+
+
 class _FeedbackBase(_MessageBase):
   type: Literal["cluster_feedback"] = "cluster_feedback"
   job_id: Id
@@ -150,6 +169,7 @@ class MergeFeedback(_FeedbackBase):
   merge: MergePayload
   split: None = None
   reassign: None = None
+  confirm_distinct: None = None
 
 
 class SplitFeedback(_FeedbackBase):
@@ -157,6 +177,7 @@ class SplitFeedback(_FeedbackBase):
   split: SplitPayload
   merge: None = None
   reassign: None = None
+  confirm_distinct: None = None
 
 
 class ReassignFeedback(_FeedbackBase):
@@ -164,9 +185,20 @@ class ReassignFeedback(_FeedbackBase):
   reassign: ReassignPayload
   merge: None = None
   split: None = None
+  confirm_distinct: None = None
 
 
-ClusterFeedback = Annotated[MergeFeedback | SplitFeedback | ReassignFeedback, Field(discriminator="action")]
+class ConfirmDistinctFeedback(_FeedbackBase):
+  action: Literal["confirm_distinct"] = "confirm_distinct"
+  confirm_distinct: ConfirmDistinctPayload
+  merge: None = None
+  split: None = None
+  reassign: None = None
+
+
+ClusterFeedback = Annotated[
+  MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback, Field(discriminator="action")
+]
 
 
 # ── 인바운드 ③ 하드 삭제 (delete_request) ──────────────────────────────────────
@@ -187,14 +219,14 @@ class DeleteRequest(_MessageBase):
 # ── 인바운드 판별 유니온 + 파서 ─────────────────────────────────────────────────
 
 InboundMessage = Annotated[ClassifyRequest | ClusterFeedback | DeleteRequest, Field(discriminator="type")]
-_INBOUND_ADAPTER: TypeAdapter[ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | DeleteRequest] = (
-  TypeAdapter(InboundMessage)  # 검증기 빌드 비용이 있어 모듈 로드 시 1회만 생성한다
-)
+_INBOUND_ADAPTER: TypeAdapter[
+  ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback | DeleteRequest
+] = TypeAdapter(InboundMessage)  # 검증기 빌드 비용이 있어 모듈 로드 시 1회만 생성한다
 
 
 def parse_inbound_message(
   body: str | bytes,
-) -> ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | DeleteRequest:
+) -> ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback | DeleteRequest:
   """SQS 메시지 body(JSON)를 `type` 필드로 판별해 해당 스키마로 파싱한다.
 
   계약 위반(미지 type·필드 누락·형식 오류)은 pydantic.ValidationError로 전파한다 —
@@ -336,6 +368,20 @@ if __name__ == "__main__":
   message = parse_inbound_message(json.dumps(reassign_body))
   check("reassign 보정 파싱", isinstance(message, ReassignFeedback) and message.reassign.to_cluster_id == "person-B")
 
+  confirm_distinct_body = {
+    "type": "cluster_feedback",
+    "job_id": "job-4b",
+    "event_id": "event-1",
+    "action": "confirm_distinct",
+    "confirm_distinct": {"cluster_ids": ["person-A", "person-B", "person-C"]},
+  }
+  message = parse_inbound_message(json.dumps(confirm_distinct_body))
+  check(
+    "confirm_distinct 보정 파싱",
+    isinstance(message, ConfirmDistinctFeedback)
+    and message.confirm_distinct.cluster_ids == ["person-A", "person-B", "person-C"],
+  )
+
   delete_body = {"type": "delete_request", "job_id": "job-5", "event_id": "event-1", "image_ids": ["img-1", "img-1"]}
   message = parse_inbound_message(json.dumps(delete_body))
   check("delete_request 파싱 (중복 id 허용)", isinstance(message, DeleteRequest) and len(message.image_ids) == 2)
@@ -396,6 +442,18 @@ if __name__ == "__main__":
     (
       "reassign 이동 전후 동일",
       {**reassign_body, "reassign": {"image_id": "img-7", "from_cluster_id": "person-A", "to_cluster_id": "person-A"}},
+    ),
+    (
+      "confirm_distinct에 merge payload 채움",
+      {**confirm_distinct_body, "merge": {"target_cluster_id": "person-A", "source_cluster_ids": ["person-B"]}},
+    ),
+    (
+      "confirm_distinct 클러스터 1개",
+      {**confirm_distinct_body, "confirm_distinct": {"cluster_ids": ["person-A"]}},
+    ),
+    (
+      "confirm_distinct 중복 cluster_id",
+      {**confirm_distinct_body, "confirm_distinct": {"cluster_ids": ["person-A", "person-A"]}},
     ),
     ("빈 image_ids 삭제", {**delete_body, "image_ids": []}),
   ]

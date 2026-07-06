@@ -39,7 +39,7 @@
 - 최초/증분 구분 플래그는 없다 — 워커는 항상 `event_id`의 전체 임베딩(기존+신규)을 재군집한다.
 - `images` 안의 `image_id` 중복은 거부된다 (event `.npz` 멱등 append 보호).
 
-## ② 사용자 보정 — `cluster_feedback` (Spring → AI, action 3종)
+## ② 사용자 보정 — `cluster_feedback` (Spring → AI, action 4종)
 
 사용자가 앱에서 인물을 병합·분리하거나 사진을 옮기면 발행한다. 워커는 must-link/cannot-link
 제약으로 저장해 이후 재군집이 사람의 결정을 뒤집지 않게 한다.
@@ -88,6 +88,24 @@
 > { ..., "action": "reassign",
 >   "reassign": { "image_id": "img-6", "from_cluster_id": "__uncertain__", "to_cluster_id": "person-A" } }
 > ```
+
+```jsonc
+// action="confirm_distinct": 이미 분리된 인물 앨범 여러 개를 서로 다른 사람으로 확정 (2개 이상, 계약 확장)
+{
+  "type": "cluster_feedback",
+  "job_id": "9d0e1f2a-3b4c-4d5e-8f60-000000000004",
+  "event_id": "b8e2f014-6c3d-4a9b-8e57-2d1f0a9c6b34",
+  "action": "confirm_distinct",
+  "confirm_distinct": { "cluster_ids": ["person-A", "person-B"] }
+}
+```
+
+> **왜 필요한가**: merge의 반대 방향 선언이다. must-link는 "같이 있어야 한다"만 강제할 뿐 "떨어져 있어야
+> 한다"는 강제하지 못한다 — 그래서 사용자가 서로 다른 사람으로 검토·확정한 두 인물 앨범 사이로 유사도가
+> 애매한 신규 사진(다리 사진)이 들어오면, 다음 전체 재군집이 둘을 하나로 오병합할 위험이 있다.
+> `confirm_distinct`는 `cluster_ids`의 대표 얼굴 전 쌍에 cannot-link를 걸어 이후 어떤 재군집에서도 이
+> 클러스터들이 합쳐지지 않게 고정한다(대표 한 쌍만으로 충분 — cannot-link 강제가 나머지 멤버를 최근접
+> 앵커로 재배정한다). `cluster_ids` 중 이미 사라진 id는 경고 후 무시, 유효 id가 2개 미만이면 전체 무시.
 
 ## ③ 하드 삭제 — `delete_request` (Spring → AI)
 
