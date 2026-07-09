@@ -113,12 +113,26 @@ CheeseMoa-AI/
 
 ## 개발 환경 세팅
 
+macOS / Linux:
 ```bash
-# 가상환경 활성화 (Windows)
-.venv\Scripts\activate
+# 가상환경 생성 & 활성화
+python3 -m venv .venv
+source .venv/bin/activate
 
 # 환경변수 준비 — .env.example을 .env로 복사해 실값 주입 (큐 URL·버킷명 확정 전까지는 placeholder)
+cp .env.example .env
+```
+
+Windows (PowerShell):
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
 copy .env.example .env
+```
+
+이후는 플랫폼 공통:
+```sh
+pip install -r requirements.txt
 
 # 워커 실행 (SQS consumer — 모델 적재 + SQS/S3 레디니스 통과 후 폴링 시작)
 python -m app.worker
@@ -131,7 +145,15 @@ pip install pre-commit
 pre-commit install
 ```
 
-로컬 Docker + 실 AWS(SQS/S3) end-to-end 테스트(AWS SSO 프로필 설정·세션 만료 대응 포함)는
+`python -m app.worker`는 실 AWS에 붙으므로 자격증명이 필요하다. 로컬은 AWS SSO 프로필을 쓴다
+(`.env`에 액세스 키를 넣지 않는다):
+```sh
+aws sso login --profile cheesemoa   # 세션 만료 시에도 이 한 줄
+export AWS_PROFILE=cheesemoa        # PowerShell: $env:AWS_PROFILE = "cheesemoa"
+```
+
+AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`), SSO 프로필 최초
+등록, 로컬 Docker + 실 AWS(SQS/S3) end-to-end 테스트 절차는
 [docs/guides/local-docker-e2e-testing.md](docs/guides/local-docker-e2e-testing.md) 참고.
 
 ---
