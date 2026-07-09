@@ -27,6 +27,7 @@ from app.schemas.messages import (
   UNCERTAIN_ALBUM_ID,
   ClassifyRequest,
   ClassifyResult,
+  ConfirmDistinctFeedback,
   DeleteRequest,
   FailedImage,
   MergeFeedback,
@@ -58,7 +59,9 @@ class ExtractedFaces(NamedTuple):
 # detect→align→embed + 품질 판정 합성은 core.deps.build_face_extractor가 만든다.
 FaceExtractor = Callable[[np.ndarray], ExtractedFaces]
 
-InboundParsed = ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | DeleteRequest
+InboundParsed = (
+  ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback | DeleteRequest
+)
 
 _FaceIdPair = tuple[str, str]
 
@@ -190,7 +193,7 @@ class JobHandlers:
     match message:
       case ClassifyRequest():
         return self._handle_classify(message)
-      case MergeFeedback() | SplitFeedback() | ReassignFeedback():
+      case MergeFeedback() | SplitFeedback() | ReassignFeedback() | ConfirmDistinctFeedback():
         return self._handle_feedback(message)
       case DeleteRequest():
         return self._handle_delete(message)
@@ -250,7 +253,9 @@ class JobHandlers:
 
   # ── cluster_feedback (merge / split / reassign) ──────────────────────────
 
-  def _handle_feedback(self, message: MergeFeedback | SplitFeedback | ReassignFeedback) -> ClassifyResult:
+  def _handle_feedback(
+    self, message: MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback
+  ) -> ClassifyResult:
     stored = self._store.load(message.event_id)
     if stored is None:
       # 보정 대상 event가 저장된 적 없음 — 재시도가 파일을 만들어주지 않는 결정적 이상이므로
@@ -271,7 +276,9 @@ class JobHandlers:
     return self._assemble_result(message.job_id, snapshot)
 
   def _translate_feedback(
-    self, message: MergeFeedback | SplitFeedback | ReassignFeedback, stored: EventEmbeddings
+    self,
+    message: MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback,
+    stored: EventEmbeddings,
   ) -> tuple[list[_FaceIdPair], list[_FaceIdPair], set[str]]:
     """보정 메시지(image_id·cluster_id 기준)를 face_id 제약 쌍으로 번역한다.
 
@@ -358,6 +365,30 @@ class JobHandlers:
         ]
         cannot = [(face_id, from_remaining[0]) for face_id in moved] if from_remaining else []
         return must, cannot, moved_set
+
+      case ConfirmDistinctFeedback():
+        # merge의 반대 방향: 이미 분리된 클러스터 여러 개를 "서로 다른 사람"으로 확정한다.
+        # must-link는 응집만 강제할 뿐 이격은 강제하지 못해, 두 확정 앨범 사이로 유사도가 애매한
+        # 신규 사진(다리 사진)이 들어오면 전체 재군집이 둘을 하나로 오병합할 수 있다 — 대표 얼굴
+        # 전 쌍(클리크)에 cannot-link를 걸어 향후 어떤 재군집에서도 이 둘이 합쳐지지 않게 한다.
+        # 대표 하나만으로 충분한 이유는 _enforce_cannot_link가 위반 라벨을 쪼갠 뒤 제약 없는
+        # 나머지 멤버를 최근접 앵커로 재배정하기 때문 — split의 그룹 간 cannot-link와 동일 패턴.
+        payload = message.confirm_distinct
+        stale = [cluster_id for cluster_id in payload.cluster_ids if cluster_id not in faces_by_cluster]
+        if stale:
+          logger.warning("confirm_distinct 보정의 stale cluster_id 무시: %s (job_id=%s)", stale, message.job_id)
+        representatives = [
+          faces_by_cluster[cluster_id][0] for cluster_id in payload.cluster_ids if cluster_id in faces_by_cluster
+        ]
+        if len(representatives) < 2:
+          logger.warning("confirm_distinct 보정으로 분리할 클러스터가 2개 미만 — 무시 (job_id=%s)", message.job_id)
+          return [], [], set()
+        cannot = [
+          (representatives[i], representatives[j])
+          for i in range(len(representatives))
+          for j in range(i + 1, len(representatives))
+        ]
+        return [], cannot, set()
 
     raise TypeError(f"처리할 수 없는 보정 타입입니다: {type(message).__name__}")
 
@@ -546,6 +577,21 @@ if __name__ == "__main__":
     vector[300 + 8 * (person - 20) + step] = math.sqrt(1.0 - c * c)  # 사진별 고유 직교 축
     return vector
 
+  # confirm_distinct(⑬) 전용 — 같은 2D 부분공간에서 각도로 인물 간 유사도를 정밀 제어한다.
+  # 인물 40·41은 0°·50°(cos≈0.64 — 확실히 다른 사람)에 두고, 다리 사진(가상 인물 42)은 정확히
+  # 이등분각(25°, 각 대표와 cos≈0.906)에 둔다 — 실측(bridge_experiment) 검증 결과 이 기하에서는
+  # confirm_distinct 없이 다리 사진을 추가하면 두 인물이 실제로 하나의 클러스터로 오병합된다.
+  _CONFIRM_DISTINCT_ANGLES = {40: 0.0, 41: 50.0}
+  _CONFIRM_DISTINCT_BRIDGE_ANGLE = 25.0
+
+  def confirm_distinct_vector(person: int, step: int) -> np.ndarray:
+    angle = _CONFIRM_DISTINCT_BRIDGE_ANGLE if person == 42 else _CONFIRM_DISTINCT_ANGLES[person]
+    theta = math.radians(angle + 0.5 * step)  # step으로 살짝 jitter — 완전 동률 방지
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[400] = math.cos(theta)
+    vector[401] = math.sin(theta)
+    return vector
+
   def fake_image(faces: list[tuple[int, int]], *, eyes_closed: bool = False, blurry: bool = False) -> np.ndarray:
     """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지. 품질 플래그는 행 1에 인코딩한다."""
     image = np.zeros((2, 16, 3), dtype=np.uint8)
@@ -562,7 +608,12 @@ if __name__ == "__main__":
     vectors: list[np.ndarray] = []
     for slot in range(count):
       person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
-      vectors.append(spread_person_vector(person, step) if person >= 20 else person_vector(person, step))
+      if person >= 40:
+        vectors.append(confirm_distinct_vector(person, step))
+      elif person >= 20:
+        vectors.append(spread_person_vector(person, step))
+      else:
+        vectors.append(person_vector(person, step))
     return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]))
 
   # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
@@ -589,6 +640,12 @@ if __name__ == "__main__":
       "img-nf-blur.jpg": fake_image([], blurry=True),
       # uncertain 편입(⑫)용 — 낯선 1인(인물 8) 단일 얼굴 → uncertain(unmatched)
       "img-stranger.jpg": fake_image([(8, 0)]),
+      # confirm_distinct(⑬)용 — 확정 인물 40·41 + 둘 사이 다리 사진(인물 42)
+      "img-cd-40-1.jpg": fake_image([(40, 0)]),
+      "img-cd-40-2.jpg": fake_image([(40, 1)]),
+      "img-cd-41-1.jpg": fake_image([(41, 0)]),
+      "img-cd-41-2.jpg": fake_image([(41, 1)]),
+      "img-cd-bridge.jpg": fake_image([(42, 0)]),
     }
   )
   store = InMemoryEmbeddingStore()
@@ -951,6 +1008,66 @@ if __name__ == "__main__":
   check(
     "uncertain 편입: stranger가 .npz에 인물 앨범으로 배정 저장 (must-link 지속)",
     dict(zip(after_join.photo_ids, after_join.cluster_ids))["img-stranger"] == cluster_u_id,
+  )
+
+  # ⑬ confirm_distinct: 확정된 두 인물 앨범 사이 다리(bridge) 사진의 오병합을 cannot-link로 차단.
+  #    must-link(각 앨범 내부 응집)만으로는 이 시나리오를 못 막는다 — 인물 40·41은 확실히 다른
+  #    사람(cos≈0.64)이지만 다리 사진(인물 42, 두 대표와 cos≈0.906)이 들어오면 confirm_distinct
+  #    없이는 전체 재군집이 둘을 하나로 오병합한다(실측 확인). confirm_distinct로 대표 얼굴 간
+  #    cannot-link를 걸어두면 이후 다리 사진이 추가돼도 두 앨범이 분리 유지된다.
+  confirm_setup_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c7",
+      "group_id": "group-1",
+      "event_id": "event-7",
+      "images": [
+        {"image_id": "img-cd-40-1", "s3_key": "img-cd-40-1.jpg"},
+        {"image_id": "img-cd-40-2", "s3_key": "img-cd-40-2.jpg"},
+        {"image_id": "img-cd-41-1", "s3_key": "img-cd-41-1.jpg"},
+        {"image_id": "img-cd-41-2", "s3_key": "img-cd-41-2.jpg"},
+      ],
+    }
+  )
+  confirm_setup = handlers.handle(parse_inbound_message(confirm_setup_body))
+  check(
+    "confirm_distinct 사전조건: 두 인물이 별개 앨범으로 형성됨",
+    len(confirm_setup.clusters) == 2,
+  )
+  cluster_40_id = next(c.cluster_id for c in confirm_setup.clusters if "img-cd-40-1" in c.image_ids)
+  cluster_41_id = next(c.cluster_id for c in confirm_setup.clusters if "img-cd-41-1" in c.image_ids)
+
+  confirm_distinct_body = json.dumps(
+    {
+      "type": "cluster_feedback",
+      "job_id": "job-f7",
+      "event_id": "event-7",
+      "action": "confirm_distinct",
+      "confirm_distinct": {"cluster_ids": [cluster_40_id, cluster_41_id]},
+    }
+  )
+  handlers.handle(parse_inbound_message(confirm_distinct_body))
+  after_confirm = store.load("event-7")
+  check(
+    "confirm_distinct: 대표 얼굴 간 cannot-link 1쌍 저장",
+    len(after_confirm.cannot_link_pairs) == 1,
+  )
+
+  bridge_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c8",
+      "group_id": "group-1",
+      "event_id": "event-7",
+      "images": [{"image_id": "img-cd-bridge", "s3_key": "img-cd-bridge.jpg"}],
+    }
+  )
+  bridged = handlers.handle(parse_inbound_message(bridge_body))
+  check(
+    "confirm_distinct: 다리 사진 추가 후에도 두 앨범이 분리 유지 (오병합 없음)",
+    len(bridged.clusters) == 2
+    and {cluster_40_id, cluster_41_id} == {c.cluster_id for c in bridged.clusters}
+    and bridged.retired_cluster_ids == [],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

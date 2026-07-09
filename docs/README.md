@@ -20,6 +20,28 @@
 - [005-hdbscan-standalone-port.md](./decisions/005-hdbscan-standalone-port.md) — HDBSCAN을 PoC numpy 이식본으로 쓰는 결정
 - [006-postprocessing-accuracy-hardening.md](./decisions/006-postprocessing-accuracy-hardening.md) — 재군집 후처리 정확도 보강 설계 (코드리뷰 반영 선택 기록)
 - [007-embedding-storage-s3.md](./decisions/007-embedding-storage-s3.md) — 임베딩 저장소를 S3 blob(event 단위 `.npz`)으로 결정 (pgvector 대체·재군집 격리 단위 event)
+- [008-blob-promotion-connected-components.md](./decisions/008-blob-promotion-connected-components.md) — 연결 성분 부분 승격 + peel 재설계 (소규모 단일 인물 이벤트 앨범 미생성 개선)
+- [009-clustering-parameter-tuning.md](./decisions/009-clustering-parameter-tuning.md) — 클러스터링 파라미터 ARI 스윕 (현행 값 유지 확정)
+
+## reviews — 코드 리뷰 기록
+
+- [2026-07-09-face-detection-review.md](./reviews/2026-07-09-face-detection-review.md) — 얼굴 감지
+  경로 리뷰 (유지보수성·운영 관점, 발견 7건 + 오탐 방지 기록)
+- [2026-07-09-face-alignment-review.md](./reviews/2026-07-09-face-alignment-review.md) — 랜드마크
+  추출·정렬 경로 리뷰 (감지 리뷰와 상보 — 랜드마크 순서 암묵 계약, `_ensure_bgr` 중복 근거 무효 등
+  정렬 고유 발견 6건 + 오탐 방지 기록)
+- [2026-07-09-face-embedding-review.md](./reviews/2026-07-09-face-embedding-review.md) — 정렬 크롭
+  → 임베딩 경로 리뷰 (임베딩 고유 발견 — `.npz` 모델 provenance 미기록으로 인한 임베딩 공간 혼합
+  리스크, ORT 스레드 하드코딩 등 4건 + 오탐 방지 기록)
+- [2026-07-09-clustering-review.md](./reviews/2026-07-09-clustering-review.md) — 재군집·클러스터링
+  경로 리뷰 (클러스터링 고유 발견 — O(N²) 재군집의 이벤트 규모 가드 부재, 재군집 요약 로그 부재
+  등 6건 + 오탐 방지 기록)
+- [2026-07-09-user-feedback-review.md](./reviews/2026-07-09-user-feedback-review.md) — 사용자
+  보정(앨범 수동 수정) 경로 리뷰 (동작 개요 포함 — 보정 내구성의 앵커 얼굴 의존, 스테일 보정의
+  succeeded 보고 등 4건 + later-wins 알고리즘 검증 기록)
+- [2026-07-09-sqs-s3-review.md](./reviews/2026-07-09-sqs-s3-review.md) — SQS 메시징·S3 접근 경로
+  리뷰 (발행 실패가 오류 정책 밖이라 256KB 초과 결과가 무통보 DLQ로 가는 버그, IAM
+  `s3:ListBucket` 함정 등 6건 + 오탐 방지 기록)
 
 ## conventions — 개발 규칙
 
@@ -30,3 +52,6 @@
 
 - [local-docker-e2e-testing.md](./guides/local-docker-e2e-testing.md) — 로컬 Docker + 실 AWS(SQS/S3)
   end-to-end 테스트 절차 (AWS SSO 프로필 설정·세션 만료 대응 포함)
+- [worker-scaling-and-performance.md](./guides/worker-scaling-and-performance.md) — 워커 동시성 모델과
+  성능 실측 (프로세스·스레드 층위, 메모리/시간 병목 분리, 워커 수·인스턴스 사이징 판단 기준,
+  개선 우선순위 — 클러스터링 리뷰의 O(N²) 추정치 실측 정정 포함)

@@ -14,15 +14,26 @@
 
 ## 1. 사전 준비 — AWS CLI v2 설치 (팀원별 1회)
 
+Windows:
 ```powershell
 winget install -e --id Amazon.AWSCLI --silent --accept-package-agreements --accept-source-agreements
 ```
 
+macOS (Homebrew):
+```bash
+brew install awscli
+```
+
 설치 후 **새 터미널**을 열어야 `aws` 명령이 PATH에 잡힌다 (설치 전에 열어둔 터미널은 안 됨).
+`aws --version`이 `aws-cli/2.x`를 출력하면 성공 — v1이 잡히면 v2가 아니므로 PATH를 확인한다.
 
 ## 2. AWS SSO 프로필 등록 (팀원별 1회)
 
-```powershell
+`aws configure sso`로 대화형 등록을 하거나(2-a), 프로필 파일을 직접 써도 된다(2-b). 결과는 같다.
+
+### 2-a. 대화형 등록
+
+```bash
 aws configure sso
 ```
 
@@ -37,19 +48,43 @@ aws configure sso
 | CLI default output format | `json` |
 | CLI profile name | **`cheesemoa`** (아래 모든 명령이 이 이름을 전제로 함) |
 
-확인:
-```powershell
+### 2-b. 프로필 파일 직접 작성 (프롬프트 건너뛰기)
+
+값이 이미 다 정해져 있으므로 `~/.aws/config`(Windows: `%USERPROFILE%\.aws\config`)에 아래를
+붙여넣는 편이 빠르다. 세션명이 없는 legacy 형식이라 "알려진 이슈"의 `RegisterClient` 함정도
+자동으로 피한다.
+
+```ini
+[profile cheesemoa]
+sso_start_url = https://d-9b675698c6.awsapps.com/start
+sso_region = ap-northeast-2
+sso_account_id = 889918307386
+sso_role_name = myisb_IsbUsersPS
+region = ap-northeast-2
+output = json
+```
+
+`sso_role_name`은 **각자 부여받은 역할 이름**이다. 위 값은 예시이므로, 다르면 3번 로그인 후
+`aws sts get-caller-identity`가 실패한다 — 그때 이 줄만 고치면 된다. 로그인 자체는 세션 단위라
+역할이 틀려도 성공하므로, 실패 메시지를 보고 고치는 순서로 진행해도 무방하다. 부여된 역할 이름은
+SSO 포털(위 start URL) 계정 화면에서 확인할 수 있다.
+
+작성 후 3번으로 바로 넘어간다.
+
+### 확인
+
+```bash
 aws sts get-caller-identity --profile cheesemoa
 ```
 계정 ID·역할 ARN이 출력되면 성공.
 
-## 3. SSO 세션이 만료되면? (핵심)
+## 3. SSO 로그인 / 세션이 만료되면? (핵심)
 
 증상: 워커 컨테이너가 레디니스 단계에서 자격증명 오류로 죽거나, `aws sts get-caller-identity
 --profile cheesemoa`가 만료 에러를 낸다.
 
-**해결: 딱 한 줄이면 된다.**
-```powershell
+**해결: 딱 한 줄이면 된다.** (PowerShell·bash 동일)
+```bash
 aws sso login --profile cheesemoa
 ```
 브라우저가 열리고 로그인하면 끝. `.env`도, 프로필 설정도 다시 만질 필요 없다 — 컨테이너를
@@ -70,6 +105,8 @@ docker build -t cheesemoa-worker .
 ```
 
 **워커 실행** (터미널 1 — 로그를 보기 위해 포그라운드 권장):
+
+PowerShell:
 ```powershell
 docker run --rm `
   -v "$PWD\.env:/app/.env:ro" `
@@ -80,7 +117,19 @@ docker run --rm `
   cheesemoa-worker
 ```
 
-- `~/.aws` 마운트로 SSO 캐시를 컨테이너에 전달 (자격증명 자동 갱신).
+bash (macOS/Linux/git-bash):
+```bash
+docker run --rm \
+  -v "$PWD/.env:/app/.env:ro" \
+  -v "$HOME/.aws:/root/.aws:ro" \
+  -e AWS_PROFILE=cheesemoa \
+  -v "$HOME/.cache:/root/.cache" \
+  -e HF_HUB_OFFLINE=1 \
+  cheesemoa-worker
+```
+
+- `~/.aws` 마운트로 SSO 캐시를 컨테이너에 전달 (자격증명 자동 갱신). 이 마운트가 없으면 컨테이너
+  안에서 `AWS_PROFILE=cheesemoa`를 찾지 못해 `ProfileNotFound`로 죽는다.
 - `~/.cache` 마운트 + `HF_HUB_OFFLINE=1`로 호스트에 이미 받아둔 모델(YuNet·AuraFace·눈감음 CNN)을
   재사용 — 회사 TLS 프록시 때문에 컨테이너 안에서 직접 다운로드가 막힐 수 있어 이 방식을 쓴다.
   호스트에 모델이 없으면 먼저 `python -m app.worker`를 로컬(venv)에서 한 번 실행해 캐시를 채워둔다.
@@ -163,14 +212,28 @@ if __name__ == "__main__":
 $env:AWS_PROFILE = "cheesemoa"
 python scripts/send_classify.py karina1.jpg karina2.jpg karina3.jpg karina4.jpg karina5.jpg
 ```
+
+bash (macOS/Linux):
+```bash
+export AWS_PROFILE=cheesemoa
+python scripts/send_classify.py karina1.jpg karina2.jpg karina3.jpg karina4.jpg karina5.jpg
+```
 인자 없이 실행하면 버킷의 기본 테스트 이미지(`karina1~5.jpg`)로 발송한다.
 
 ## 7. 결과 큐 확인
 
+PowerShell:
 ```powershell
 aws sqs receive-message `
   --queue-url "https://sqs.ap-northeast-2.amazonaws.com/889918307386/CheeseMoa-cluster-response.fifo" `
-  --max-number-of-messages 10
+  --max-number-of-messages 10 --profile cheesemoa
+```
+
+bash (macOS/Linux):
+```bash
+aws sqs receive-message \
+  --queue-url "https://sqs.ap-northeast-2.amazonaws.com/889918307386/CheeseMoa-cluster-response.fifo" \
+  --max-number-of-messages 10 --profile cheesemoa
 ```
 `--queue-url`은 `.env`의 `RESULT_QUEUE_URL`과 동일한 값. `Body`가 이스케이프된 JSON 문자열이라
 필요하면 `| ConvertFrom-Json` 또는 파이썬 `json.loads`로 펼쳐서 본다.
