@@ -52,3 +52,6 @@
 
 - [local-docker-e2e-testing.md](./guides/local-docker-e2e-testing.md) — 로컬 Docker + 실 AWS(SQS/S3)
   end-to-end 테스트 절차 (AWS SSO 프로필 설정·세션 만료 대응 포함)
+- [worker-scaling-and-performance.md](./guides/worker-scaling-and-performance.md) — 워커 동시성 모델과
+  성능 실측 (프로세스·스레드 층위, 메모리/시간 병목 분리, 워커 수·인스턴스 사이징 판단 기준,
+  개선 우선순위 — 클러스터링 리뷰의 O(N²) 추정치 실측 정정 포함)
