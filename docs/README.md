@@ -42,6 +42,10 @@
 - [2026-07-09-sqs-s3-review.md](./reviews/2026-07-09-sqs-s3-review.md) — SQS 메시징·S3 접근 경로
   리뷰 (발행 실패가 오류 정책 밖이라 256KB 초과 결과가 무통보 DLQ로 가는 버그, IAM
   `s3:ListBucket` 함정 등 6건 + 오탐 방지 기록)
+- [2026-07-10-reassign-mustlink-tiebreak.md](./reviews/2026-07-10-reassign-mustlink-tiebreak.md) —
+  결함 재현 기록: reassign의 must-link 1대1 동률이 목적지 대표를 출처로 끌고 가 목적지 앨범을
+  쪼개고 신규 id를 발급한다 (합성 임베딩 재현·원인 특정·수정 후보 검증 + **재현의 한계** 명시,
+  사용자 보정 리뷰의 "문제 없음" 판단 2건 정정)
 
 ## conventions — 개발 규칙
 
