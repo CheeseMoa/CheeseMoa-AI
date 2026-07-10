@@ -215,21 +215,39 @@ def _must_link_components(n: int, constraints: Constraints) -> tuple[list[int], 
   return comp_of, components
 
 
-def _enforce_must_link(labels: np.ndarray, components: dict[int, list[int]], next_label: int) -> int:
+def _enforce_must_link(
+  labels: np.ndarray,
+  components: dict[int, list[int]],
+  next_label: int,
+  cannot_link: tuple[tuple[int, int], ...] = (),
+) -> int:
   """must-link 컴포넌트 전원을 같은 라벨로 강제한다 (labels 제자리 수정).
 
   대상 라벨은 컴포넌트 내 비노이즈 다수결(동률 시 작은 라벨). 전원 노이즈면 새 라벨을 발급한다
   — 사용자가 같은 인물이라고 확정한 그룹은 밀도와 무관하게 클러스터로 승격한다.
   반환: 다음 합성 라벨 번호.
+
+  후보에서 cannot-link가 금지한 라벨(컴포넌트 멤버의 cannot-link 상대가 현재 가진 라벨)은 제외한다.
+  reassign의 컴포넌트는 {이동 얼굴, 목적지 대표} 2명뿐이라 다수결이 항상 1:1 동률인데, "작은 라벨"이
+  HDBSCAN 내부 번호라는 우연으로 출처 라벨을 고르면 목적지 대표가 자기 클러스터에서 끌려나온다 —
+  뒤이은 _enforce_cannot_link는 그 쌍만 통째로 떼어낼 수 있어 목적지 앨범이 쪼개지고 신규 id가
+  발급된다 (docs/reviews/2026-07-10-reassign-mustlink-tiebreak.md 재현). 이동 방향은 쌍에 없지만
+  cannot-link("출처에 있으면 안 됨")에 보존되어 있으므로, 금지 라벨 제외가 그 방향을 복원한다 —
+  rescue/blob floor 불변식과 같은 계열의 "다음 단계가 곧바로 되돌릴 선택 금지"다.
   """
+  partners = _cannot_link_partners(cannot_link)
   for root in sorted(components):  # 루트 순서 고정 — 새 라벨 발급 순서의 결정성
     members = components[root]
     if len(members) < 2:
       continue
+    forbidden = {
+      int(labels[partner]) for idx in members for partner in partners.get(idx, ()) if labels[partner] != _NOISE
+    }
     member_labels = labels[members]
     non_noise = member_labels[member_labels != _NOISE]
-    if non_noise.size:
-      values, counts = np.unique(non_noise, return_counts=True)  # unique는 오름차순 → argmax 동률 시 작은 라벨
+    allowed = non_noise[~np.isin(non_noise, list(forbidden))] if forbidden else non_noise
+    if allowed.size:
+      values, counts = np.unique(allowed, return_counts=True)  # unique는 오름차순 → argmax 동률 시 작은 라벨
       target = int(values[np.argmax(counts)])
     else:
       target = next_label
@@ -690,7 +708,7 @@ def recluster(
 
   # 사용자 보정 강제 — must-link(병합)를 먼저 적용해야 cannot-link(분리)가 최종 상태에서 위반을 본다
   next_label = int(labels.max()) + 1 if n else 0
-  next_label = _enforce_must_link(labels, components, next_label)
+  next_label = _enforce_must_link(labels, components, next_label, resolved_constraints.cannot_link)
   _enforce_cannot_link(labels, comp_of, components, resolved_constraints.cannot_link, emb, next_label)
 
   # 파편 병합 → 노이즈 구제 → 저신뢰 분리 (순서 중요: 병합된 centroid 기준으로 구제하고,
@@ -929,6 +947,35 @@ if __name__ == "__main__":
   check(
     "(h) peel — 극단 포즈 1장만 노이즈로 떼고 핵심 3장은 한 앨범으로 승격",
     labels.tolist() == [0, 0, 0, _NOISE],
+  )
+
+  # (i) reassign 동률 회귀 — must-link {이동 얼굴, 목적지 대표}의 1:1 동률에서 cannot-link 금지 라벨(출처)을
+  # 후보에서 제외해야 목적지 대표가 출처로 끌려나와 목적지 앨범이 쪼개지지 않는다
+  # (docs/reviews/2026-07-10-reassign-mustlink-tiebreak.md — f1은 B 사람인데 A에 더 닮은 오분류 사진의 이동).
+  # spread_vectors는 곱 구조라 이 기하(f1↔A > f1↔B, A·B 상호 0.3)를 못 만들어 목표 Gram을 고유분해한다.
+  reassign_gram = np.eye(5)
+  for j in (1, 2):
+    reassign_gram[0, j] = reassign_gram[j, 0] = 0.55  # f1 ↔ A 사람 (오분류의 원인)
+  for j in (3, 4):
+    reassign_gram[0, j] = reassign_gram[j, 0] = 0.45  # f1 ↔ B 사람 (진짜 소속)
+  reassign_gram[1, 2] = reassign_gram[2, 1] = 0.65
+  reassign_gram[3, 4] = reassign_gram[4, 3] = 0.65
+  for i in (1, 2):
+    for j in (3, 4):
+      reassign_gram[i, j] = reassign_gram[j, i] = 0.30
+  eigvals, eigvecs = np.linalg.eigh(reassign_gram)
+  reassign_emb = np.zeros((5, EMBED_DIM))
+  reassign_emb[:, :5] = eigvecs @ np.diag(np.sqrt(np.clip(eigvals, 0.0, None)))
+  reassign_emb = (reassign_emb / np.linalg.norm(reassign_emb, axis=1, keepdims=True)).astype(np.float32)
+  result = recluster(
+    reassign_emb,
+    ["a", "a", "a", "b", "b"],
+    constraints=Constraints(must_link=((0, 3),), cannot_link=((0, 1),)),
+  )
+  albums = {c.cluster_id: c.member_indices for c in result.clusters}
+  check(
+    "(i) reassign 동률 — 이동 얼굴이 목적지 편입 + 목적지 멤버 유지·id 승계 + 신규 앨범 없음",
+    albums.get("b") == (0, 3, 4) and albums.get("a") == (1, 2) and not any(c.is_new for c in result.clusters),
   )
 
   # (g) 설정 불변식 — 잘못된 임계 조합은 생성 시점에 거부
