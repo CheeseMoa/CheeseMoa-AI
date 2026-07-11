@@ -190,19 +190,31 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
   `app/handlers.py`(4종 액션 핸들러 + 보정 제약 later-wins 조정), `app/core/config.py`(Settings),
   `app/core/deps.py`(프로덕션 조립 + 레디니스), `app/messaging/`(SQS 수신·발행 + 페이크),
   `app/storage/`(event .npz 코덱·저장소·이미지 소스 + 페이크) — [ADR 007](docs/decisions/007-embedding-storage-s3.md)
-- 미정: SQS 큐 URL·S3 버킷명 (feature-spec §10 #7) — `.env` 필수 항목이며 값 확정 시 주입만 하면 됨
+- 배포 완료 (2026-07-11): EC2에 Docker 컨테이너로 상시 실행 중 — 큐 URL·버킷명 확정 주입, 모델
+  프리베이크(콜드스타트 해소), ECR `cheesemoa-ai`. 상세: [docs/guides/ec2-deployment.md](docs/guides/ec2-deployment.md)
 - `app/main.py`: 비어있음 (엔트리포인트는 `app/worker.py`)
 - `healthcare_api.py`: FastAPI 학습용 샘플 코드 (실제 프로젝트 코드 아님)
 
 ### 다음 구현 목표
-1. 확정된 큐 URL·버킷명 주입 + 실 AWS 환경 통합 검증 (visibility timeout·redrive policy를 `.env.example` 메모대로 설정).
-   배포 미완 항목: Dockerfile·모델 프리베이크(콜드스타트)·CloudWatch·IAM 자격증명·Spring 실계약 통합검증
+0. **[P0] 실 데이터 오염 대응** ([docs/backlog/2026-07-11-followups.md](docs/backlog/2026-07-11-followups.md)) —
+   동일 사진 재업로드가 만든 중복 임베딩이 앨범을 쌍 단위로 쪼갬 + `delete_request` 미도달 유령 행
+   (원인·재현: [reviews/2026-07-11-duplicate-embedding-split.md](docs/reviews/2026-07-11-duplicate-embedding-split.md))
+1. 배포 후속 — 남은 항목: CloudWatch 로그·지표 연동, Spring 실계약 통합검증, 큐의 visibility timeout·
+   redrive policy를 `.env.example` 메모대로 설정. **인스턴스 분리 검토**: 현재 워커가 Spring과 t4g.small
+   (2코어·RAM 1846MB)을 공유하는데, t4g는 버스터블이라 실트래픽으로 추론이 지속되면 CPU 크레딧 소진 →
+   Spring API까지 함께 스로틀된다 ([ec2-deployment.md](docs/guides/ec2-deployment.md) §리스크)
 2. pytest 도입 — 각 모듈 `__main__` 스모크를 tests/로 승격 (`# TODO(CHMO-165)` 표시 지점)
 3. (후속) 품질 게이트 개선 — 웃음 예외용 표정 CNN, 눈/흔들림 임계 라벨셋 튜닝(현재 라벨 부재), 부분 블러 대응
 4. Spring과 `confirm_distinct` 트리거 정책 합의 — 즉시 발행(안전) vs 공유 시점 일괄 발행(발행 전 새
-   업로드가 끼면 그 사이 재군집은 보호 공백)
+   업로드가 끼면 그 사이 재군집은 보호 공백). 단, 상태 기반 계약 개편
+   ([docs/backlog/state-based-feedback-contract.md](docs/backlog/state-based-feedback-contract.md))
+   채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **EC2 배포 + ORT 스레드 정합** (2026-07-11) — Docker 이미지(arm64, 모델 프리베이크)를 ECR `cheesemoa-ai`로
+  올려 EC2에서 상시 실행. 배포 직후 임베딩이 로컬 대비 45배 느렸는데, 원인은 CPU 크레딧 스로틀링이 아니라
+  ORT 스레드 오버서브스크립션(2코어 호스트에 기본값 8스레드)이었다 — 코어 수 정합으로 **6배 개선**
+  (2860ms/장 → 476ms/장). 실측: [worker-scaling-and-performance.md §7](docs/guides/worker-scaling-and-performance.md)
 - **confirm_distinct — 확정 앨범 간 오병합 방지 (계약 확장)** (2026-07-06) — must-link는 응집만 강제하고
   이격은 못해 다리 사진이 확정된 두 앨범을 오병합할 위험을 `cluster_feedback`의 4번째 action
   `confirm_distinct`(`cluster_ids` 대표 얼굴 전 쌍 cannot-link)로 방지. 실측 오병합 기하로 `handlers.py`

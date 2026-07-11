@@ -6,6 +6,9 @@
 
 - [pipeline-overview.md](./architecture/pipeline-overview.md) — AI 파이프라인 전체 흐름과 각 단계 설명
 - [system-overview.md](./architecture/system-overview.md) — 전체 시스템 구조와 Spring 백엔드 연동
+- [user-feedback-constraints.md](./architecture/user-feedback-constraints.md) — 사용자 보정(앨범 수동
+  수정)이 must-link/cannot-link 제약으로 반영되는 과정 (액션 4종의 제약 번역, later-wins 조정, 재군집
+  강제 순서, ID 승계·은퇴, 알려진 한계)
 
 ## spec — 기능 명세
 
@@ -46,6 +49,19 @@
   결함 재현 기록: reassign의 must-link 1대1 동률이 목적지 대표를 출처로 끌고 가 목적지 앨범을
   쪼개고 신규 id를 발급한다 (합성 임베딩 재현·원인 특정·수정 후보 검증 + **재현의 한계** 명시,
   사용자 보정 리뷰의 "문제 없음" 판단 2건 정정)
+- [2026-07-11-duplicate-embedding-split.md](./reviews/2026-07-11-duplicate-embedding-split.md) —
+  결함 기록(**수정 미착수**): 동일 사진이 다른 image_id로 재업로드돼 생긴 유사도 1.00 임베딩 쌍을
+  HDBSCAN이 인물 군집 대신 선택해 앨범이 쌍 단위로 쪼개진다 (실 event 8 · S3 ETag로 재업로드 확정 ·
+  재현 절차 포함). 부수 발견: `delete_request` 미도달로 인한 유령 행
+
+## backlog — 예정 작업
+
+- [2026-07-11-followups.md](./backlog/2026-07-11-followups.md) — 후속 작업 목록 (P0 데이터 오염 ·
+  P1 저장소/배포 보강 · P2 계약 개편 + **검토 후 유지 결정** 기록: 로컬 디스크 저장소 기각,
+  FastAPI 복원 불필요)
+- [state-based-feedback-contract.md](./backlog/state-based-feedback-contract.md) — 제안(ADR-010 후보):
+  사용자 보정을 액션 4종이 아니라 **검토완료 앨범의 멤버십 선언**으로 받는 계약 개편 (later-wins
+  조정 로직 제거 · 단일 진실을 Spring으로 · 선결 조건은 "검토완료"의 의미에 대한 제품 합의)
 
 ## conventions — 개발 규칙
 
@@ -54,6 +70,9 @@
 
 ## guides — 실행 가이드
 
+- [ec2-deployment.md](./guides/ec2-deployment.md) — EC2 배포 (ECR + Docker). arm64 빌드·모델 프리베이크·
+  IAM·SSM 운영 명령. 함정 3가지(아키텍처 불일치, `.env`의 `AWS_PROFILE`, SCP로 인한 롤 분리 불가)와
+  미해결 리스크(Spring과 호스트 공유 → CPU 크레딧 스로틀)
 - [local-docker-e2e-testing.md](./guides/local-docker-e2e-testing.md) — 로컬 Docker + 실 AWS(SQS/S3)
   end-to-end 테스트 절차 (AWS SSO 프로필 설정·세션 만료 대응 포함)
 - [worker-scaling-and-performance.md](./guides/worker-scaling-and-performance.md) — 워커 동시성 모델과
