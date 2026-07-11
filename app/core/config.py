@@ -39,6 +39,12 @@ class Settings(BaseSettings):
   # DLQ로 넘어가기 직전에 status="failed" 결과를 발행하는 기준이다 (worker._process).
   sqs_max_receive_count: int = Field(default=3, ge=1)
 
+  # ── 추론 스레드 ────────────────────────────────────────────────────────────
+  # onnxruntime intra/inter op 스레드. 0 = 가용 코어 수 자동 감지(권장).
+  # 코어 수보다 크게 잡으면 오버서브스크립션으로 급격히 느려진다 — 2코어(t4g.small) 실측에서
+  # 8스레드는 2스레드 대비 임베딩이 6배 느렸다(2860ms/장 vs 476ms/장).
+  ort_num_threads: int = Field(default=0, ge=0)
+
   # ── 클러스터링 임계값 (feature-spec §10 #3·#4 — 하드코딩 금지, 기본값은 PoC 레시피) ──
   cluster_min_cluster_size: int = 2
   cluster_min_samples: int = 2  # PoC 검증값 유지 (ADR-009: 3은 소규모 이벤트 회귀로 기각)

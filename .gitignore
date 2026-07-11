@@ -35,3 +35,7 @@ Thumbs.db
 
 # 로컬 검증 스크립트 디렉토리 (커밋 제외)
 scripts/
+
+# 로컬 테스트 이미지 (커밋 제외) — 실제 디렉토리는 image/images/ 라 둘 다 막는다
+image/
+images/

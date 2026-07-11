@@ -6,6 +6,7 @@ handlers·messaging·storage는 전부 Protocol/콜러블 주입으로 설계되
 """
 
 import logging
+import os
 from dataclasses import dataclass
 
 import boto3
@@ -16,7 +17,7 @@ from app.messaging.consumer import MessageConsumer, SqsConsumer
 from app.messaging.publisher import ResultPublisher, SqsPublisher
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
-from app.pipeline.embed import FaceEmbedder
+from app.pipeline.embed import EmbedConfig, FaceEmbedder
 from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
@@ -72,6 +73,18 @@ def build_face_extractor(
   return extract_faces
 
 
+def _available_cores() -> int:
+  """이 프로세스가 실제로 쓸 수 있는 코어 수.
+
+  `os.cpu_count()`는 CPU 어피니티/cpuset을 무시하므로 리눅스에서는 `sched_getaffinity`를 우선한다
+  (컨테이너에 코어를 제한해 띄운 경우 cpu_count는 호스트 전체를 세어 과다 산정한다).
+  """
+  try:
+    return len(os.sched_getaffinity(0))  # 리눅스 전용
+  except AttributeError:
+    return os.cpu_count() or 1
+
+
 def build_worker_deps(settings: Settings) -> WorkerDeps:
   """실제 AWS 클라이언트·모델로 워커 부품을 조립한다.
 
@@ -81,11 +94,17 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   sqs_client = boto3.client("sqs", region_name=settings.aws_region)
   s3_client = boto3.client("s3", region_name=settings.aws_region)
 
+  # 스레드 수를 코어 수에 맞춘다. EmbedConfig의 기본값 8은 PoC 배포 타깃(8vCPU) 기준이라,
+  # 코어가 그보다 적은 호스트에서 그대로 쓰면 오버서브스크립션으로 급격히 느려진다
+  # (t4g.small 2코어 실측: 8스레드 2860ms/장 vs 2스레드 476ms/장 — 6배).
+  cores = _available_cores()
+  threads = settings.ort_num_threads or cores
+
   logger.info("AI 모델 로딩 중 (YuNet + AuraFace + 눈감음 CNN) — 최초 실행은 다운로드로 오래 걸릴 수 있습니다")
   detector = FaceDetector()
-  embedder = FaceEmbedder()
+  embedder = FaceEmbedder(EmbedConfig(intra_op_num_threads=threads, inter_op_num_threads=threads))
   eye_classifier = EyeStateClassifier()
-  logger.info("AI 모델 로딩 완료")
+  logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d)", threads, cores)
 
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
