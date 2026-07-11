@@ -192,6 +192,9 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
   `app/storage/`(event .npz 코덱·저장소·이미지 소스 + 페이크) — [ADR 007](docs/decisions/007-embedding-storage-s3.md)
 - 배포 완료 (2026-07-11): EC2에 Docker 컨테이너로 상시 실행 중 — 큐 URL·버킷명 확정 주입, 모델
   프리베이크(콜드스타트 해소), ECR `cheesemoa-ai`. 상세: [docs/guides/ec2-deployment.md](docs/guides/ec2-deployment.md)
+- 자동 배포 (2026-07-11): main 푸시(=PR 머지) 시 GitHub Actions가 arm64 빌드 → 오프라인 스모크 →
+  ECR 푸시 → SSM으로 EC2 컨테이너 교체 → 기동 로그 검증까지 수행 (`.github/workflows/deploy.yml`,
+  OIDC 롤 `cheesemoa-github-actions-ai` — [ec2-deployment.md §5](docs/guides/ec2-deployment.md))
 - `app/main.py`: 비어있음 (엔트리포인트는 `app/worker.py`)
 - `healthcare_api.py`: FastAPI 학습용 샘플 코드 (실제 프로젝트 코드 아님)
 

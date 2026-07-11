@@ -1,0 +1,118 @@
+# main 푸시(=PR 머지) 시 자동 배포: arm64 빌드 → 오프라인 스모크 → ECR 푸시 → SSM으로 EC2 컨테이너 교체.
+# 상세와 IAM 구성: docs/guides/ec2-deployment.md §5
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'image/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write # OIDC로 cheesemoa-github-actions-ai 롤 어슘
+  contents: read
+
+# 배포는 직렬화 — 진행 중인 배포를 끊지 않고 뒤에 줄 세운다
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-northeast-2
+  ECR_REGISTRY: 889918307386.dkr.ecr.ap-northeast-2.amazonaws.com
+  ECR_REPO: cheesemoa-ai
+  INSTANCE_ID: i-09037b55ec32ab0ea
+
+jobs:
+  build-and-deploy:
+    # EC2가 t4g(Graviton·arm64)라 arm64 러너에서 네이티브 빌드해야 한다.
+    # 기본 러너(amd64)에서 빌드하면 EC2에서 exec format error로 죽는다.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::889918307386:role/cheesemoa-github-actions-ai
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v3
+
+      # pip 의존성·모델 프리베이크(~264MB) 레이어를 GHA 캐시에 보관해 재빌드를 단축한다
+      - name: Build image (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPO }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 네트워크를 끊고 실행 — 모델 프리베이크가 살아있는지 + 전체 배선(인메모리 페이크 e2e)을 푸시 전에 검증
+      - name: Smoke test (offline)
+        run: docker run --rm --network none "$ECR_REGISTRY/$ECR_REPO:$GITHUB_SHA" python -m app.worker --smoke
+
+      - name: Push to ECR
+        run: |
+          docker tag "$ECR_REGISTRY/$ECR_REPO:$GITHUB_SHA" "$ECR_REGISTRY/$ECR_REPO:latest"
+          docker push "$ECR_REGISTRY/$ECR_REPO:$GITHUB_SHA"
+          docker push "$ECR_REGISTRY/$ECR_REPO:latest"
+
+      - name: Deploy on EC2 (SSM)
+        run: |
+          # EC2에서 실행할 스크립트 — ec2-deployment.md §2와 동일한 기동 파라미터를 유지할 것
+          read -r -d '' SCRIPT <<'EOF' || true
+          set -euo pipefail
+          ECR=889918307386.dkr.ecr.ap-northeast-2.amazonaws.com
+          TAG=__TAG__
+          aws ecr get-login-password --region ap-northeast-2 | docker login --username AWS --password-stdin "$ECR"
+          docker pull "$ECR/cheesemoa-ai:$TAG"
+          # SIGTERM → 처리 중 메시지 완주 후 종료. 완주 못 해도 SQS가 메시지를 돌려주므로 유실 없음
+          docker stop -t 120 cheesemoa-ai 2>/dev/null || true
+          docker rm cheesemoa-ai 2>/dev/null || true
+          docker run -d --name cheesemoa-ai --restart unless-stopped \
+            --memory=900m --memory-swap=1400m \
+            --log-opt max-size=10m --log-opt max-file=3 \
+            --env-file /home/ec2-user/cheesemoa-ai/.env \
+            "$ECR/cheesemoa-ai:$TAG"
+          # 레디니스(모델 적재 + SQS/S3 연결) 통과 후 폴링 시작 로그가 떠야 배포 성공
+          for i in $(seq 1 12); do
+            sleep 5
+            if docker logs cheesemoa-ai 2>&1 | grep -q "SQS 폴링 시작"; then
+              echo "deploy ok: $TAG"
+              docker image prune -f >/dev/null
+              exit 0
+            fi
+          done
+          echo "워커가 60초 안에 폴링을 시작하지 못했다:"
+          docker logs cheesemoa-ai 2>&1 | tail -50
+          exit 1
+          EOF
+          SCRIPT=${SCRIPT//__TAG__/$GITHUB_SHA}
+
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy cheesemoa-ai ${GITHUB_SHA:0:7}" \
+            --parameters "$(jq -n --arg s "$SCRIPT" '{commands: [$s], executionTimeout: ["600"]}')" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $CMD_ID"
+
+          STATUS=Pending
+          for i in $(seq 1 120); do
+            sleep 5
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo Pending)
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+          done
+
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$INSTANCE_ID" \
+            --query '{Status: Status, Stdout: StandardOutputContent, Stderr: StandardErrorContent}' --output json
+          [ "$STATUS" = "Success" ]

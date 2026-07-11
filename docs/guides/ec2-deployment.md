@@ -113,7 +113,30 @@ docker inspect cheesemoa-ai --format '{{.RestartCount}} {{.State.OOMKilled}}'   
 docker restart cheesemoa-ai                     # 재기동 (SIGTERM → 처리 중 메시지 완주 후 종료)
 ```
 
-재배포는 `docker pull` 후 `docker rm -f` + `docker run`(2번 절)을 다시 하면 된다.
+재배포는 main에 머지하면 자동이다(5번 절). 수동으로 하려면 `docker pull` 후 `docker rm -f` +
+`docker run`(2번 절)을 다시 하면 된다.
+
+## 5. 자동 배포 (GitHub Actions)
+
+main에 push(=PR 머지)하면 [.github/workflows/deploy.yml](../../.github/workflows/deploy.yml)이
+자동으로 배포한다. `docs/**`·`**.md`·`image/**`만 바뀐 푸시는 건너뛴다. 수동 트리거는 GitHub
+Actions 탭의 `workflow_dispatch`.
+
+파이프라인: **arm64 네이티브 빌드**(`ubuntu-24.04-arm` 러너 — 함정 1 참고) → **오프라인 스모크**
+(`--network none`에서 `--smoke`, 프리베이크·배선 검증) → **ECR 푸시**(`:latest` + `:커밋sha`) →
+**SSM `AWS-RunShellScript`**로 EC2에서 pull + 컨테이너 교체(2번 절과 동일 파라미터, 커밋 sha 태그로
+기동) → **`SQS 폴링 시작` 로그 확인**까지 통과해야 성공. 교체 시 `docker stop -t 120`으로 SIGTERM을
+보내 처리 중 메시지를 완주시킨다(완주 못 해도 SQS가 돌려준다).
+
+자격증명은 GitHub OIDC다 — 시크릿에 액세스 키를 넣지 않는다. 전용 롤
+`cheesemoa-github-actions-ai`(인라인 정책 `cheesemoa-ai-deploy`)가 `repo:CheeseMoa/CheeseMoa-AI:*`를
+신뢰하고, ECR `cheesemoa-ai` 푸시와 이 인스턴스로의 `ssm:SendCommand`만 허용한다. 조직 SCP가
+`sts:AssumeRole`을 막지만 OIDC의 `sts:AssumeRoleWithWebIdentity`는 막지 않는다 — BE 리포의
+`cheesemoa-github-actions` 롤로 이미 검증된 패턴이다.
+
+배포가 실패하면(스모크·기동 로그 검증 실패) 워크플로가 빨간불이 되고 SSM 실행 로그가 잡 출력에
+찍힌다. 기동 검증 실패 시점에는 이전 컨테이너가 이미 내려간 상태이므로, 2번 절 수동 절차로 이전
+태그(`aws ecr describe-images`로 확인)를 기동해 롤백한다.
 
 ## 리스크 (미해결)
 
