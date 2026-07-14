@@ -35,6 +35,7 @@ class SqsPublisher:
     if body_bytes > _SQS_BODY_LIMIT_BYTES:
       # TODO(CHMO-165): 초과가 실제로 관측되면 payload-on-S3 포인터 패턴으로 전환
       logger.warning("결과 메시지가 SQS 상한을 초과합니다. job_id=%s, %d bytes", result.job_id, body_bytes)
+    logger.info("결과 발행 job_id=%s %d bytes body=%s", result.job_id, body_bytes, body)
     kwargs = {"QueueUrl": self._queue_url, "MessageBody": body}
     if self._queue_url.endswith(".fifo"):
       # 결과 큐 유형은 미정 — FIFO로 확정될 경우를 대비한 분기. 그룹/중복제거 키는 job_id:
