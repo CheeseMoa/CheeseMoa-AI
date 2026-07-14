@@ -58,8 +58,9 @@ class Settings(BaseSettings):
   cluster_blob_promote_floor: float = 0.4
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
-  quality_blur_threshold: float = 100.0
-  quality_whole_image_blur_threshold: float = 100.0  # 얼굴 미검출 시 전체 이미지 흔들림 fallback (별도 보정)
+  quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
+  quality_min_blur_face_px: int = 64  # 이보다 작은 얼굴은 blur 판정 제외 (variance 신뢰 불가)
+  quality_whole_image_blur_threshold: float = 100.0  # 판정 자격 얼굴 없을 때 전체 이미지 fallback (별도 보정)
   quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
   quality_eye_box_px: int = 24
 
@@ -95,6 +96,7 @@ class Settings(BaseSettings):
 
     return QualityConfig(
       blur_threshold=self.quality_blur_threshold,
+      min_blur_face_px=self.quality_min_blur_face_px,
       whole_image_blur_threshold=self.quality_whole_image_blur_threshold,
       eye_closed_confidence=self.quality_eye_closed_confidence,
       eye_box_px=self.quality_eye_box_px,
