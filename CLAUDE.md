@@ -202,7 +202,8 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
 0. **[P0] 실 데이터 오염 대응** ([docs/backlog/2026-07-11-followups.md](docs/backlog/2026-07-11-followups.md)) —
    동일 사진 재업로드가 만든 중복 임베딩이 앨범을 쌍 단위로 쪼갬 + `delete_request` 미도달 유령 행
    (원인·재현: [reviews/2026-07-11-duplicate-embedding-split.md](docs/reviews/2026-07-11-duplicate-embedding-split.md))
-1. 배포 후속 — 남은 항목: CloudWatch 로그·지표 연동, Spring 실계약 통합검증, 큐의 visibility timeout·
+1. 배포 후속 — 남은 항목: CloudWatch 지표 연동(로그는 완료 — 2026-07-14, awslogs 드라이버로
+   `/cheesemoa/ai-worker` 직송, [cloudwatch-logging.md](docs/guides/cloudwatch-logging.md)), Spring 실계약 통합검증, 큐의 visibility timeout·
    redrive policy를 `.env.example` 메모대로 설정. **인스턴스 분리 검토**: 현재 워커가 Spring과 t4g.small
    (2코어·RAM 1846MB)을 공유하는데, t4g는 버스터블이라 실트래픽으로 추론이 지속되면 CPU 크레딧 소진 →
    Spring API까지 함께 스로틀된다 ([ec2-deployment.md](docs/guides/ec2-deployment.md) §리스크)

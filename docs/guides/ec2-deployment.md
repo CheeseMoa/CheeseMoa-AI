@@ -70,12 +70,23 @@ docker pull $ECR/cheesemoa-ai:latest
 docker rm -f cheesemoa-ai 2>/dev/null || true
 docker run -d --name cheesemoa-ai --restart unless-stopped \
   --memory=900m --memory-swap=1400m \
-  --log-opt max-size=10m --log-opt max-file=3 \
+  --log-driver=awslogs \
+  --log-opt awslogs-region=ap-northeast-2 \
+  --log-opt awslogs-group=/cheesemoa/ai-worker \
+  --log-opt awslogs-stream=cheesemoa-ai \
+  --log-opt cache-max-size=10m --log-opt cache-max-file=3 \
   --env-file /home/ec2-user/cheesemoa-ai/.env \
   $ECR/cheesemoa-ai:latest
 
 docker logs -f cheesemoa-ai
 ```
+
+**로그는 CloudWatch로 직송된다** (2026-07-14 적용, 상세: [cloudwatch-logging.md](cloudwatch-logging.md)).
+`awslogs` 드라이버가 stdout/stderr를 로그 그룹
+`/cheesemoa/ai-worker`(보존 30일)의 스트림 `cheesemoa-ai`로 보낸다. Docker 20.10+의 dual logging이
+로컬 캐시(`cache-max-*`)를 유지하므로 호스트에서 `docker logs`도 여전히 동작한다. 이 권한
+(`cheesemoa-cloudwatch-logs` 인라인 정책, §3)이 없으면 **컨테이너 기동 자체가 실패**하니, 롤을
+건드렸다면 여기부터 의심할 것.
 
 정상 기동 로그:
 
@@ -104,10 +115,21 @@ SQS 폴링 시작
 - 두 버킷: `ListBucket` — 레디니스의 `head_bucket`이 이 권한을 요구한다
 - ECR pull (인스턴스 롤엔 `AmazonEC2ContainerRegistryReadOnly`도 이미 있음)
 
+CloudWatch Logs 쓰기는 별도 인라인 정책 `cheesemoa-cloudwatch-logs`에 있다 — Spring(`/cheesemoa/app`)과
+워커(`/cheesemoa/ai-worker`) 두 로그 그룹에 `logs:CreateLogStream`·`logs:PutLogEvents`만 허용.
+
 ## 4. 운영
 
+로그는 CloudWatch 콘솔(로그 그룹 `/cheesemoa/ai-worker`) 또는 로컬 CLI로 본다 — EC2 접속 불필요:
+
 ```bash
-docker logs --tail 50 cheesemoa-ai              # 로그
+aws logs tail /cheesemoa/ai-worker --follow --profile cheesemoa --region ap-northeast-2
+```
+
+EC2 호스트 안에서는 기존 명령 그대로:
+
+```bash
+docker logs --tail 50 cheesemoa-ai              # 로그 (dual logging 로컬 캐시)
 docker stats --no-stream cheesemoa-ai           # 메모리·CPU
 docker inspect cheesemoa-ai --format '{{.RestartCount}} {{.State.OOMKilled}}'   # 재시작·OOM 여부
 docker restart cheesemoa-ai                     # 재기동 (SIGTERM → 처리 중 메시지 완주 후 종료)

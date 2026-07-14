@@ -75,9 +75,15 @@ jobs:
           # SIGTERM → 처리 중 메시지 완주 후 종료. 완주 못 해도 SQS가 메시지를 돌려주므로 유실 없음
           docker stop -t 120 cheesemoa-ai 2>/dev/null || true
           docker rm cheesemoa-ai 2>/dev/null || true
+          # awslogs 드라이버로 CloudWatch(/cheesemoa/ai-worker) 직송. cache-*는 dual logging
+          # 로컬 캐시 상한 — 이 캐시 덕에 아래 docker logs 기동 검증이 그대로 동작한다
           docker run -d --name cheesemoa-ai --restart unless-stopped \
             --memory=900m --memory-swap=1400m \
-            --log-opt max-size=10m --log-opt max-file=3 \
+            --log-driver=awslogs \
+            --log-opt awslogs-region=ap-northeast-2 \
+            --log-opt awslogs-group=/cheesemoa/ai-worker \
+            --log-opt awslogs-stream=cheesemoa-ai \
+            --log-opt cache-max-size=10m --log-opt cache-max-file=3 \
             --env-file /home/ec2-user/cheesemoa-ai/.env \
             "$ECR/cheesemoa-ai:$TAG"
           # 레디니스(모델 적재 + SQS/S3 연결) 통과 후 폴링 시작 로그가 떠야 배포 성공
