@@ -40,8 +40,12 @@ AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Lapla
 PoC 이식본(라벨 완전 일치 검증, 의존성 제거). 파라미터(ARI 스윕 재확인, [ADR 009](docs/decisions/009-clustering-parameter-tuning.md)):
 `min_cluster_size=2, min_samples=2, metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적
 후처리로 정확도 보강: 연결 성분 부분 승격([ADR 008](docs/decisions/008-blob-promotion-connected-components.md))
-→ 보정 제약 강제 → 파편 병합(완전 연결) → 노이즈 구제(전역 유사도 내림차순) → 저신뢰 `ambiguous` 분리
-(leave-one-out, 제약 당사자 보호). 임계값은 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.
+→ 제약 강제(보정 must/cannot-link + 같은 사진 자동 cannot-link — 같은 사진의 두 얼굴은 타인 확정,
+[ADR 011](docs/decisions/011-same-photo-cannot-link.md)) → 파편 병합(완전 연결, 임계 0.68) → 노이즈
+구제(전역 유사도 내림차순) → 저신뢰 `ambiguous` 분리(leave-one-out, 사람 제약 당사자만 보호) →
+2차 파편 병합(구제·축출로 바뀐 최종 멤버십에 같은 임계 재적용,
+[ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 임계값은 전부 `ClusterConfig` 설정값.
+클러스터링은 전체 비용 0.1% 미만.
 
 **전체 재군집 + ID 재조정 (정확도 최우선)**: 재군집 격리 단위는 **event**([ADR 007](docs/decisions/007-embedding-storage-s3.md)).
 군집의 진실은 항상 event 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집 — 개별 임베딩을 S3 `.npz`에 전부

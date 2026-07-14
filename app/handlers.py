@@ -18,6 +18,7 @@ import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from typing import NamedTuple
 
 import numpy as np
@@ -155,6 +156,32 @@ def _reconcile_constraints(
     _dedupe_pairs([*surviving_must, *new_must]),
     _dedupe_pairs([*surviving_cannot, *new_cannot]),
   )
+
+
+# 같은 사진 자동 cannot-link의 이중 검출 안전판 — 같은 사진 두 행의 임베딩이 이 이상 닮으면
+# 타인 두 명이 아니라 YuNet이 한 얼굴을 두 박스로 이중 검출한 것으로 보고 제약에서 뺀다
+# (잘못된 cannot-link는 같은 사람을 강제로 찢는다). 실 event 실측 같은사진 쌍 최대 0.61,
+# 근중복 판정 관례 0.985(ADR-005 burst)와 큰 마진.
+_SAME_FACE_SIMILARITY = 0.95
+
+
+def _same_photo_cannot_links(event: EventEmbeddings) -> tuple[tuple[int, int], ...]:
+  """같은 사진에 공존하는 얼굴 행 쌍 = 서로 다른 사람이라는 사실 제약 (ADR-011).
+
+  사람 보정과 달리 저장하지 않고 매 재군집마다 photo_ids에서 유도한다 — 삭제 마스킹·append
+  이후에도 항상 현재 행 인덱스와 정합이다. must-link와의 모순 해소(사람 결정 우선)는
+  recluster가 자동 쌍을 탈락시키는 방식으로 처리하므로 여기서는 신경 쓰지 않는다.
+  """
+  rows_by_photo: dict[str, list[int]] = {}
+  for row, photo_id in enumerate(event.photo_ids):
+    rows_by_photo.setdefault(photo_id, []).append(row)
+  pairs = []
+  for rows in rows_by_photo.values():
+    for a, b in combinations(rows, 2):
+      if float(event.embeddings[a] @ event.embeddings[b]) >= _SAME_FACE_SIMILARITY:
+        continue  # 이중 검출 의심 — 안전판 (_SAME_FACE_SIMILARITY)
+      pairs.append((a, b))
+  return tuple(pairs)
 
 
 @dataclass(frozen=True)
@@ -428,6 +455,7 @@ class JobHandlers:
     constraints = Constraints(
       must_link=tuple((row_of[a], row_of[b]) for a, b in event.must_link_pairs),
       cannot_link=tuple((row_of[a], row_of[b]) for a, b in event.cannot_link_pairs),
+      auto_cannot_link=_same_photo_cannot_links(event),
     )
     result = recluster(event.embeddings, event.cluster_ids, constraints, self._cluster_config, self._new_cluster_id)
 
@@ -1068,6 +1096,21 @@ if __name__ == "__main__":
     len(bridged.clusters) == 2
     and {cluster_40_id, cluster_41_id} == {c.cluster_id for c in bridged.clusters}
     and bridged.retired_cluster_ids == [],
+  )
+
+  # ⑭ 같은 사진 자동 cannot-link 유도 (ADR-011): 다인 사진의 얼굴 쌍은 제약이 되고,
+  # 임베딩이 사실상 동일(≥ _SAME_FACE_SIMILARITY)한 쌍은 YuNet 이중 검출로 보고 제외한다
+  base_vec = np.zeros(512, dtype=np.float32)
+  base_vec[0] = 1.0
+  dup_vec = base_vec.copy()  # 이중 검출 재현 — 같은 얼굴의 두 박스는 임베딩이 사실상 동일
+  other_vec = np.zeros(512, dtype=np.float32)
+  other_vec[1] = 1.0
+  auto_event = EventEmbeddings.empty().append_faces(
+    [("f-1", "p-multi", base_vec), ("f-2", "p-multi", dup_vec), ("f-3", "p-multi", other_vec), ("f-4", "p-solo", base_vec)]
+  )
+  check(
+    "같은사진 자동 cannot-link: 타인 쌍만 유도, 이중 검출 쌍·다른 사진 쌍은 제외",
+    _same_photo_cannot_links(auto_event) == ((0, 2), (1, 2)),
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
