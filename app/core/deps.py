@@ -58,12 +58,12 @@ def build_face_extractor(
       face_pairs.append((aligned, image[y : y + h, x : x + w]))
     eyes_closed, blurry = judge_faces(face_pairs, eye_classifier, quality_config)
 
-    # 흔들림 fallback: 얼굴이 하나도 검출되지 않으면 전체 이미지 Laplacian variance로 흔들림을 판정한다.
-    # 완전 흔들린 사진은 얼굴 검출 자체가 실패해 얼굴 crop 기반 판정을 못 하는데(검출 실패 = 판정 불가),
-    # 이때 전체 이미지 variance가 폭락(선명 300+ → 흔들림 ~1)하므로 이를 신호로 쓴다.
-    # 한계: 앞사람만 모션블러이고 배경이 선명한 부분 블러는 전역 variance가 높게 유지돼 잡지 못한다
-    # (얼굴은 미검출, 전역은 선명 판정 → 사각지대). variance 방식의 근본 한계다.
-    if not detected:
+    # 흔들림 fallback: blurry=None = 판정 자격 얼굴이 없음(미검출이거나 전부 극소 얼굴) —
+    # 완전 흔들린 사진은 얼굴 검출 자체가 실패하고, 검출됐어도 극소 얼굴은 variance를 신뢰할 수 없다.
+    # 이때 전체 이미지 variance가 폭락(선명 300+ → 흔들림 ~1)하는 것을 신호로 쓴다.
+    # 한계: 앞사람만 모션블러이고 배경이 선명한 부분 블러, 장노출 빛궤적(고대비 엣지로 variance가 높게
+    # 유지됨)은 잡지 못한다 — variance 방식의 근본 한계다.
+    if blurry is None:
       blurry = blur_variance(image) < quality_config.whole_image_blur_threshold
 
     crops = [crop for crop in aligned_crops if crop is not None]

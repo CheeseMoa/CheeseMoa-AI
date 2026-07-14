@@ -4,12 +4,14 @@
 이 모듈은 저장소(S3 event .npz)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
 
   ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 퇴화는 연결 성분 부분 승격으로 교정 (ADR-008)
-  ② 사용자 보정(must-link/cannot-link) 후처리 강제 — 재군집이 사람 결정을 뒤집지 않게
+  ② 제약 강제 — 사용자 보정(must/cannot-link)이 사람 결정을 뒤집지 않게 + 같은 사진 자동
+     cannot-link(같은 사진의 두 얼굴 = 타인, ADR-011)로 물리적으로 불가능한 동거를 차단
   ③ 파편 병합 — centroid 유사도가 동일 인물 수준인 클러스터 병합 (완전 연결, 단일 인물 파편화 교정, ADR 005)
   ④ 노이즈 구제 — 최근접 centroid 유사도가 충분한 노이즈 얼굴을 클러스터에 편입
   ⑤ 저신뢰 분리 — 절대 유사도·2위 마진 임계 미달 멤버를 ambiguous로 분리 (TBD #3 기본 정책)
-  ⑥ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
-  ⑦ 클러스터별 대표벡터(L2 정규화 평균, 파생 캐시) 계산
+  ⑥ 2차 파편 병합 — 구제·분리로 바뀐 최종 멤버십에 ③과 같은 판정을 재적용 (ADR-010)
+  ⑦ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
+  ⑧ 클러스터별 대표벡터(L2 정규화 평균, 파생 캐시) 계산
 
 을 수행한다 (feature-spec §4). 임베딩 로드/저장과 보정 메시지(merge/split/reassign)의
 제약 변환은 호출자(워커)의 책임이다.
@@ -48,11 +50,12 @@ class ClusterConfig:
   # 기본값은 0.0 — 겹침이 하나라도 있으면 승계 후보가 되고, 최강 겹침부터 배정된다.
   min_match_jaccard: float = 0.0
   # 파편 병합 임계 — centroid 코사인 유사도가 이 이상이면 같은 인물의 파편으로 보고 병합한다.
-  # PoC 검증값 0.7 유지 (ADR-008): 0.6은 성인 단일 인물 파편(centroid ~0.68)을 더 구제하지만,
-  # 교차연령·아동 데이터에서 서로 다른 사람 centroid(실측 최대 0.635)가 같은 사람 파편(최소 0.597)과
-  # 겹쳐 오병합을 일으킨다 — 전역 임계로는 분리 불가. 소규모 단일 인물 앨범 생성은 병합이 아니라
-  # 연결 성분 부분 승격이 담당하므로, 병합은 오병합을 피해 보수적으로 둔다 (오병합보다 미병합, ADR-006).
-  merge_centroid_similarity: float = 0.7
+  # 0.68 (ADR-011): 실 event·저해상도 실측에서 같은 인물 세션 파편이 0.688~0.689로 구 임계 0.7에
+  # 반복적으로 아깝게 미달했고, 같은 사진 자동 cannot-link 가드 도입으로 하향분의 오병합 노출이
+  # 줄었다. 0.6대 중반은 여전히 금지 — 교차연령·아동 데이터에서 서로 다른 사람 centroid(실측 최대
+  # 0.635)가 같은 사람 파편(최소 0.597)과 겹친다(ADR-008). 소규모 단일 인물 앨범 생성은 병합이
+  # 아니라 연결 성분 부분 승격이 담당하므로, 병합은 오병합을 피해 보수적으로 둔다 (ADR-006).
+  merge_centroid_similarity: float = 0.68
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
   rescue_similarity: float = 0.6
@@ -125,10 +128,19 @@ class Constraints:
   must-link로 (전이적으로) 연결된 두 얼굴 사이의 cannot-link는 모순이라 `recluster`가
   ValueError로 거부한다 — 보정 간 충돌의 시간순 해소(나중 결정 우선)는 보정 이력을 아는
   워커 계층에서 끝내고, 이 모듈에는 일관된 제약 셋만 전달해야 한다.
+
+  auto_cannot_link는 사람 보정이 아니라 사실에서 유도된 제약이다 (같은 사진의 두 얼굴 = 서로
+  다른 사람, ADR-011). 병합 차단·클러스터 분리·구제 차단에는 cannot_link와 동일하게 참여하지만,
+  "사람이 직접 지목한 얼굴" 대우는 받지 않는다 — 저신뢰 축출 보호와 축출 마진 비교 제외에 불참.
+  이를 cannot_link 채널에 섞으면 전 얼굴이 축출 보호를 받아 HDBSCAN이 밀도 없는 데이터에서 낸
+  무의미한 클러스터(쌍 유사도 0.2대)가 걸러지지 않는 것이 실 event 시뮬레이션에서 재현됐다.
+  must-link와 모순되는 자동 쌍은 거부하지 않고 탈락시킨다 (사람 결정 우선 — 동일 사진 중복 업로드
+  오염 같은 예외에서 재군집이 죽지 않아야 한다).
   """
 
   must_link: tuple[tuple[int, int], ...] = ()
   cannot_link: tuple[tuple[int, int], ...] = ()
+  auto_cannot_link: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -652,7 +664,7 @@ def recluster(
   """event 전체 임베딩을 재군집하고 기존 cluster_id를 재조정한다 (feature-spec §4 ③④⑤).
 
   재군집 뒤 결정적 후처리를 순서대로 적용한다: 보정 강제(must→cannot-link) → 파편 병합 →
-  노이즈 구제 → 저신뢰 ambiguous 분리 → ID 재조정 → 대표벡터 (모듈 독스트링 ①~⑦).
+  노이즈 구제 → 저신뢰 ambiguous 분리 → 2차 파편 병합 → ID 재조정 → 대표벡터 (모듈 독스트링 ①~⑧).
 
   Args:
     embeddings: shape (N, EMBED_DIM) — event 전체(기존+신규) 임베딩. L2 정규화 단위벡터 전제.
@@ -689,7 +701,19 @@ def recluster(
     )
   _validate_pairs(resolved_constraints.must_link, n, "must-link")
   _validate_pairs(resolved_constraints.cannot_link, n, "cannot-link")
+  _validate_pairs(resolved_constraints.auto_cannot_link, n, "auto-cannot-link")
   comp_of, components = _must_link_components(n, resolved_constraints)
+  # 자동 제약 결합 (Constraints 독스트링·ADR-011): 사람 must-link와 모순되는 자동 쌍은 탈락시키고,
+  # 나머지는 병합·분리·구제에서 사람 cannot-link와 동일하게 참여한다. 축출(보호·마진 제외)은
+  # 사람 cannot-link만 쓴다 — 아래에서 resolved_constraints.cannot_link를 직접 참조하는 이유.
+  blocking_cannot = tuple(
+    dict.fromkeys(
+      (
+        *resolved_constraints.cannot_link,
+        *(pair for pair in resolved_constraints.auto_cannot_link if comp_of[pair[0]] != comp_of[pair[1]]),
+      )
+    )
+  )
 
   # ③ 전체 재군집 — 표본이 min_samples·min_cluster_size 미만이면 밀도 군집이 정의되지 않으므로
   # 전원 노이즈로 두고 제약 후처리만 적용한다 (이식본은 min_samples > N에서 raise하므로 사전 분기).
@@ -708,20 +732,27 @@ def recluster(
 
   # 사용자 보정 강제 — must-link(병합)를 먼저 적용해야 cannot-link(분리)가 최종 상태에서 위반을 본다
   next_label = int(labels.max()) + 1 if n else 0
-  next_label = _enforce_must_link(labels, components, next_label, resolved_constraints.cannot_link)
-  _enforce_cannot_link(labels, comp_of, components, resolved_constraints.cannot_link, emb, next_label)
+  next_label = _enforce_must_link(labels, components, next_label, blocking_cannot)
+  _enforce_cannot_link(labels, comp_of, components, blocking_cannot, emb, next_label)
 
   # 파편 병합 → 노이즈 구제 → 저신뢰 분리 (순서 중요: 병합된 centroid 기준으로 구제하고,
-  # 구제까지 끝난 최종 멤버십에서 저신뢰를 가려낸다)
-  _merge_fragments(labels, emb, resolved_constraints.cannot_link, resolved_config.merge_centroid_similarity)
-  _rescue_noise(labels, emb, resolved_constraints.cannot_link, resolved_config.rescue_similarity)
+  # 구제까지 끝난 최종 멤버십에서 저신뢰를 가려낸다. 병합을 구제 뒤로 옮기면 구제가 파편난
+  # 작은 centroid 기준이 되어 손해라, 시점 차이는 이동이 아니라 아래 2차 병합으로 보완한다)
+  _merge_fragments(labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity)
+  _rescue_noise(labels, emb, blocking_cannot, resolved_config.rescue_similarity)
   protected = {idx for members in components.values() if len(members) >= 2 for idx in members}
   # cannot-link 당사자도 보호 — split로 생긴 소형 클러스터는 구성상 내부 유사도가 낮을 수 있어,
   # 절대 바닥 축출이 클러스터를 통째로 비워 사용자 분리 결정과 cluster_id를 지우는 것이 리뷰에서
   # 재현됐다. 제약 당사자는 사람이 직접 지목한 얼굴이므로 어느 축출 경로로도 빼지 않는다.
+  # 자동 제약(auto_cannot_link)은 여기 불참 — 사람이 지목한 얼굴이 아니고, 참여시키면 사실상 전
+  # 얼굴이 보호되어 축출이 무력화된다 (Constraints 독스트링·ADR-011).
   protected.update(idx for pair in resolved_constraints.cannot_link for idx in pair)
   ambiguous_indices = _evict_ambiguous(labels, emb, resolved_constraints.cannot_link, protected, resolved_config)
   ambiguous_set = set(ambiguous_indices)
+  # 2차 파편 병합 (ADR-010) — 1차 병합은 구제·축출 전 centroid 스냅샷으로 판정하므로, 구제가 멤버를
+  # 추가하면 최종 구성 기준으로는 임계를 넘는 파편 쌍이 남는다 (실 event 실측: 판정 시 0.688 →
+  # 구제 후 0.705). 같은 임계·같은 cannot-link 가드를 최종 멤버십에서 한 번 더 적용한다.
+  _merge_fragments(labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity)
 
   # ID 재조정
   new_clusters = _cluster_groups(labels)
@@ -919,6 +950,57 @@ if __name__ == "__main__":
   check(
     "(e) 동일 인물 2장(0.6)은 승격 — 신규 구제 범위",
     len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1),
+  )
+
+  # (j) 2차 파편 병합 (ADR-010) — 실 event 기하 재현: 파편 A·B가 1차 병합 시점엔 0.69로 임계(0.70)
+  # 미달인데, 노이즈 w가 B로 구제되며 B centroid가 A 쪽으로 이동해 최종 구성으로는 임계를 넘는다.
+  fragment_a = np.stack([axis(0), axis(0)]).astype(np.float32)  # centroid = e1
+  b_dir = 0.69 * axis(0) + math.sqrt(1.0 - 0.69**2) * axis(1)  # A↔B = 0.69 < 0.70
+  fragment_b = np.stack([b_dir, b_dir]).astype(np.float32)
+  # w·b = 0.65, w·e1 = 0.57 — 구제 임계(0.60) 이상·argmax는 B, HDBSCAN 노이즈 대역(거리 0.35),
+  # 저신뢰 축출 마진 0.08(> 0.05)로 축출을 면한다. 구제 후 B centroid의 A 유사도
+  # = (2·0.69 + 0.57)/√(5 + 4·0.65) ≈ 0.707 ≥ 0.70 → 2차 병합 발동.
+  w_e2 = (0.65 - 0.69 * 0.57) / math.sqrt(1.0 - 0.69**2)
+  w = 0.57 * axis(0) + w_e2 * axis(1) + math.sqrt(1.0 - 0.57**2 - w_e2**2) * axis(2)
+  rescued_split = np.vstack([fragment_a, fragment_b, w.astype(np.float32)])
+  labels = hdbscan_labels(rescued_split)
+  check(
+    "(j) 전제: 파편 A·B는 분리 클러스터, w는 노이즈로 시작",
+    len(set(labels[labels != _NOISE])) == 2 and labels[4] == _NOISE,
+  )
+  result = recluster(rescued_split, [None] * 5)
+  check(
+    "(j) 구제로 임계를 넘은 파편은 2차 병합으로 합류 — 전원 한 클러스터",
+    len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1, 2, 3, 4),
+  )
+
+  # (k) 같은 사진 자동 cannot-link (ADR-011) — 행 구성: A 파편 [e1, e1] + B 파편 [b, b], A↔B = 0.72
+  # (병합 임계 0.68 이상 → 제약 없으면 병합). auto 쌍 (0, 2)는 "0과 2가 같은 사진" = 타인 확정.
+  k_b = 0.72 * axis(0) + math.sqrt(1.0 - 0.72**2) * axis(1)
+  k_frags = np.vstack([np.stack([axis(0), axis(0)]), np.stack([k_b, k_b])]).astype(np.float32)
+  result = recluster(k_frags, [None] * 4)
+  check("(k) 전제: 0.72 파편 쌍은 제약 없으면 병합된다 (임계 0.68 하향 확인)", len(result.clusters) == 1)
+  result = recluster(k_frags, [None] * 4, Constraints(auto_cannot_link=((0, 2),)))
+  check(
+    "(k) 같은 사진 얼굴이 걸친 파편 쌍은 유사도가 임계 이상이어도 병합 차단",
+    len(result.clusters) == 2 and result.noise_indices == () and result.ambiguous_indices == (),
+  )
+  # 축출 비보호 대비 검증 — 행 구성: A [e1, e1, x] + B [b', b'], b'·e1 = 0.5.
+  # x(=행 2)는 자기 클러스터 LOO 0.88, B와 0.838로 마진 0.042 < 0.05 → 원래 ambiguous 축출 대상.
+  # 같은 기하에서 사람 cannot-link (2,3)은 당사자 보호 + 마진 비교 제외로 x를 지키지만,
+  # auto 쌍 (2,3)은 어느 특혜도 없어 축출이 정상 동작해야 한다 (event-17 무의미 클러스터 회귀).
+  k_b2 = 0.5 * axis(0) + math.sqrt(1.0 - 0.5**2) * axis(1)
+  k_x = 0.88 * axis(0) + 0.46 * axis(1) + math.sqrt(1.0 - 0.88**2 - 0.46**2) * axis(2)
+  k_mixed = np.vstack([np.stack([axis(0), axis(0)]), k_x[None, :], np.stack([k_b2, k_b2])]).astype(np.float32)
+  result = recluster(k_mixed, [None] * 5, Constraints(cannot_link=((2, 3),)))
+  check(
+    "(k) 사람 cannot-link 당사자 x는 축출 보호로 유지 (기존 동작)",
+    {c.member_indices for c in result.clusters} == {(0, 1, 2), (3, 4)} and result.ambiguous_indices == (),
+  )
+  result = recluster(k_mixed, [None] * 5, Constraints(auto_cannot_link=((2, 3),)))
+  check(
+    "(k) 같은 기하에서 auto 쌍의 x는 보호 없이 정상 축출 (축출 무력화 회귀 방지)",
+    {c.member_indices for c in result.clusters} == {(0, 1), (3, 4)} and result.ambiguous_indices == (2,),
   )
 
   # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C가 0.3(floor 미만)이라
