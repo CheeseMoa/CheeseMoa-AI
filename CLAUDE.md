@@ -229,13 +229,13 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
 0. **[P0] 실 데이터 오염 대응** ([docs/backlog/2026-07-11-followups.md](docs/backlog/2026-07-11-followups.md)) —
    동일 사진 재업로드가 만든 중복 임베딩이 앨범을 쌍 단위로 쪼갬 + `delete_request` 미도달 유령 행
    (원인·재현: [reviews/2026-07-11-duplicate-embedding-split.md](docs/reviews/2026-07-11-duplicate-embedding-split.md))
-0.5 **[P0] 파편화 원인 규명 — 임베딩 vs cluster.py** (입력 품질 교정의 남은 선행 과제,
-   [review §구현 결과](docs/reviews/2026-07-14-input-quality-alignment-landmark.md)): test4는 인물 2명
-   **n=1 샘플**이다. 라벨된 자체 데이터로 *동일 인물 세션 간 코사인 거리 분포 vs 타인 간 분포*를 그려
-   병합 임계(0.68) 침범 여부를 확인할 것. 겹치면 임베딩이 원인(→ 유료 라이선스 정당화), 안 겹치면
-   버그는 `cluster.py`에 있다. **이 측정 없이 모델 교체에 돈을 쓰지 않는다** — CFP-FP 등은 검증
-   지표이지 군집 응집도가 아니다. (정렬 AA·랜드마크 정제는 2026-07-15 구현 완료 — 완료된 목표 참조.
-   지터 억제와 세션 간 파편 접합은 **별개 축**이라 test4 군집은 예고대로 안 바뀌었다.)
+0.5 **[P0] 병합 임계 재보정 — 0.68 → 0.55 (분포 측정으로 판정 완료, 적용 결정 대기)**
+   ([분포 측정 리뷰](docs/reviews/2026-07-15-distance-distribution-verdict.md)): 라벨 코퍼스(5인
+   33얼굴, 동일인 103쌍·타인 781쌍) 측정 결과 **타인 유사도는 최고 0.4584인데 동일 인물 세션 간
+   쌍의 77%가 0.68 미달** — 파편화의 범인은 임베딩이 아니라 `cluster_merge_centroid_similarity=0.68`.
+   ARI 스윕에서 0.45~0.60 전 구간 완벽 분리(0.8118), 임계 0.55로 test4가 앨범 정확히 2개.
+   **유료 라이선스는 이 데이터로는 불필요.** 적용 시 ADR-009 갱신(그리드 0.45~0.75 확장, 교정 후
+   임베딩 재스윕)과 함께 갈 것. 별건: YuNet이 화장품 팔레트 그림을 얼굴로 오검출(리뷰 §별건).
 1. 배포 후속 — 남은 항목: CloudWatch 지표 연동(로그는 완료 — 2026-07-14, awslogs 드라이버로
    `/cheesemoa/ai-worker` 직송, [cloudwatch-logging.md](docs/guides/cloudwatch-logging.md)), Spring 실계약 통합검증, 큐의 visibility timeout·
    redrive policy를 `.env.example` 메모대로 설정. **인스턴스 분리 검토**: 현재 워커가 Spring과 t4g.small
