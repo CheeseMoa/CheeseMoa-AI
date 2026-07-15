@@ -5,7 +5,7 @@
 `ModelSource` 뒤로 완전히 캡슐화되어 있다.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import cv2
 import numpy as np
@@ -16,11 +16,18 @@ DEFAULT_SCORE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3
 TOP_K = 5000
 DEFAULT_MAX_SIDE = 2000
+# 스윕 확정값(measure_landmark_jitter.py --sweep, 2026-07-15): 폭 {128,160,192,224} × 마진 {0.3,0.5,0.75}
+# 중 224/0.75가 전 지표 최고 — 같은 얼굴 유사도 평균 0.9596·최저 0.6881, 랜드마크 이동 평균 3.07%
+DEFAULT_REFINE_NORM_FACE_WIDTH = 224
+DEFAULT_REFINE_MARGIN_RATIO = 0.75
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
 _BBOX_SLICE = slice(0, 4)  # face[0:4]  = x, y, w, h
 _LMK_SLICE = slice(4, 14)  # face[4:14] = 5점 랜드마크 (x,y)x5, YuNet 원본 순서
 _SCORE_IDX = 14  # face[14]   = 신뢰도
+_REFINE_MATCH_IOU = 0.3  # 재검출 결과가 원 얼굴과 같은 얼굴인지 판정하는 하한 (미달 시 원 랜드마크 유지)
+_REFINE_MIN_CROP_SIDE = 32  # 리사이즈된 크롭이 이보다 작으면 재검출 의미가 없어 건너뜀
+_REFINE_MAX_SHIFT_RATIO = 0.5  # 정상 지터는 얼굴폭 15.8% 이내 — 이보다 크면 오매칭으로 보고 폐기
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,12 +51,22 @@ class DetectorConfig:
   nms_threshold: float = NMS_THRESHOLD
   top_k: int = TOP_K
   max_side: int | None = DEFAULT_MAX_SIDE
+  # 2단계 랜드마크 정제 (2026-07-14 리뷰): YuNet은 WIDER FACE(작은 얼굴)로 학습돼 학습 분포 밖의
+  # 대형 얼굴에서 랜드마크가 불안정하다(얼굴폭 대비 최대 15.8% 지터). 대형 얼굴만 골라 정규 스케일로
+  # 축소한 크롭에서 랜드마크를 재추출해 지터를 줄인다.
+  refine_landmarks: bool = True
+  refine_norm_face_width: int = DEFAULT_REFINE_NORM_FACE_WIDTH  # 재검출 크롭에서의 얼굴 목표 폭(px)
+  refine_margin_ratio: float = DEFAULT_REFINE_MARGIN_RATIO  # bbox 대비 여유 크롭 비율
 
   def __post_init__(self) -> None:
     # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
     # 유발하므로 생성 시점에 거부한다.
     if self.max_side is not None and self.max_side <= 0:
       raise ValueError(f"max_side는 양의 정수 또는 None이어야 합니다. 받은 값: {self.max_side}")
+    if self.refine_norm_face_width <= 0:
+      raise ValueError(f"refine_norm_face_width는 양의 정수여야 합니다. 받은 값: {self.refine_norm_face_width}")
+    if self.refine_margin_ratio < 0:
+      raise ValueError(f"refine_margin_ratio는 0 이상이어야 합니다. 받은 값: {self.refine_margin_ratio}")
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -61,6 +78,15 @@ def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
   x1 = min(w, int(bbox[0]) + int(bbox[2]))
   y1 = min(h, int(bbox[1]) + int(bbox[3]))
   return x0, y0, max(0, x1 - x0), max(0, y1 - y0)
+
+
+def _bbox_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+  """(x, y, w, h) 박스 두 개의 IoU. 퇴화 박스(넓이 0)는 0을 반환한다."""
+  ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+  ix1, iy1 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+  inter = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+  union = a[2] * a[3] + b[2] * b[3] - inter
+  return inter / union if union > 0 else 0.0
 
 
 def _to_contiguous_bgr(image: np.ndarray) -> np.ndarray:
@@ -99,6 +125,9 @@ class FaceDetector:
       top_k=resolved_config.top_k,
     )
     self._max_side = resolved_config.max_side
+    self._refine_landmarks = resolved_config.refine_landmarks
+    self._refine_norm_face_width = resolved_config.refine_norm_face_width
+    self._refine_margin_ratio = resolved_config.refine_margin_ratio
 
   def detect(self, image: np.ndarray) -> list[DetectedFace]:
     """디코딩된 BGR 이미지에서 얼굴을 검출한다. 정상 ndarray에는 예외를 던지지 않는다."""
@@ -123,7 +152,60 @@ class FaceDetector:
       face = self._to_detected_face(row, inv, w, h)
       if face is not None:
         faces.append(face)
+    if self._refine_landmarks:
+      # 본검출 raw 순회가 끝난 뒤에 정제를 시작한다 — _refine_face의 setInputSize/detect 재호출이
+      # 위 검출 상태를 덮어쓰므로 순서를 바꾸면 안 된다. 축소본 frame이 아니라 원본 image를 넘겨
+      # max_side 축소를 우회한 원본 해상도 크롭에서 재검출하는 것이 정제의 요점이다.
+      faces = [self._refine_face(image, face) for face in faces]
     return faces
+
+  def _refine_face(self, image: np.ndarray, face: DetectedFace) -> DetectedFace:
+    """대형 얼굴의 랜드마크를 정규 스케일 크롭 재검출로 정제한다. 어떤 실패든 원본 face를 반환한다.
+
+    YuNet의 학습 분포(작은 얼굴)에 맞게 "얼굴 주변을 잘라 → 얼굴폭을 정규 폭으로 축소 → 재검출"한
+    랜드마크를 원본 좌표계로 되돌린다. bbox·score는 원본을 유지한다 — 정제 목적은 랜드마크뿐이고,
+    bbox는 하류(품질 게이트 크롭)에 이미 전파되는 계약이다.
+    """
+    x, y, w, h = face.bbox
+    if w <= self._refine_norm_face_width:
+      return face  # 정규 폭 이하 얼굴은 학습 분포 안이라 문제없고, 확대 재검출은 비용만 든다
+
+    # bbox에 여유 마진을 두고 원본에서 크롭한다 (경계 클램프는 마진만 깎을 뿐 얼굴 자체는 보존)
+    margin = max(w, h) * self._refine_margin_ratio
+    cx0 = max(0, int(x - margin))
+    cy0 = max(0, int(y - margin))
+    cx1 = min(image.shape[1], int(x + w + margin))
+    cy1 = min(image.shape[0], int(y + h + margin))
+    if cx1 <= cx0 or cy1 <= cy0:
+      return face
+
+    # 얼굴폭이 정규 폭이 되도록 축소 — INTER_AREA는 박스필터 저역통과를 내장해 별도 프리블러가 불필요
+    r = self._refine_norm_face_width / w  # 게이트(w > 정규 폭)로 r < 1 보장
+    resized = cv2.resize(image[cy0:cy1, cx0:cx1], None, fx=r, fy=r, interpolation=cv2.INTER_AREA)
+    rh, rw = resized.shape[:2]
+    if min(rh, rw) < _REFINE_MIN_CROP_SIDE:
+      return face
+
+    self._detector.setInputSize((rw, rh))
+    _, raw = self._detector.detect(resized)
+    if raw is None or len(raw) == 0:
+      return face
+
+    # 재검출 후보 중 원 얼굴과 같은 얼굴을 IoU로 고른다 — score argmax는 크롭에 걸친 옆 사람을
+    # 잡을 수 있다. 미검출·다인 크롭 케이스를 이 한 경로로 처리한다.
+    ref_bbox = ((x - cx0) * r, (y - cy0) * r, w * r, h * r)  # 원 bbox를 크롭-리사이즈 좌표계로 변환
+    best_row = max(raw, key=lambda row: _bbox_iou(ref_bbox, tuple(row[_BBOX_SLICE])))
+    if _bbox_iou(ref_bbox, tuple(best_row[_BBOX_SLICE])) < _REFINE_MATCH_IOU:
+      return face
+
+    refined = (best_row[_LMK_SLICE].reshape(_NUM_LANDMARKS, 2) / r + np.array([cx0, cy0])).astype(np.float32)
+    if not np.isfinite(refined).all():
+      return face
+    # 정상 지터는 얼굴폭 15.8% 이내 — 그보다 훨씬 큰 이동은 오매칭 폭주로 보고 폐기한다
+    if float(np.abs(refined - face.landmarks).max()) > _REFINE_MAX_SHIFT_RATIO * w:
+      return face
+    refined.flags.writeable = False  # frozen dataclass 출력이 하류에서 변형되지 않도록 보호
+    return replace(face, landmarks=refined)
 
   def _to_detected_face(self, row: np.ndarray, inv: float, w: int, h: int) -> DetectedFace | None:
     bbox_f = row[_BBOX_SLICE] * inv
