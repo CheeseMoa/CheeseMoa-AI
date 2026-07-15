@@ -18,7 +18,7 @@ from app.messaging.publisher import ResultPublisher, SqsPublisher
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
 from app.pipeline.embed import EmbedConfig, FaceEmbedder
-from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces
+from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces, shake_signals
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
 
@@ -61,11 +61,18 @@ def build_face_extractor(
 
     # 흔들림 fallback: blurry=None = 판정 자격 얼굴이 없음(미검출이거나 전부 극소 얼굴) —
     # 완전 흔들린 사진은 얼굴 검출 자체가 실패하고, 검출됐어도 극소 얼굴은 variance를 신뢰할 수 없다.
-    # 이때 전체 이미지 variance가 폭락(선명 300+ → 흔들림 ~1)하는 것을 신호로 쓴다.
-    # 한계: 앞사람만 모션블러이고 배경이 선명한 부분 블러, 장노출 빛궤적(고대비 엣지로 variance가 높게
-    # 유지됨)은 잡지 못한다 — variance 방식의 근본 한계다.
+    # 1차 신호는 전체 이미지 variance 폭락(선명 300+ → 흔들림 ~1), 2차 신호는 방향성 블러(ADR 014) —
+    # variance는 텍스처 양을 재는 지표라 배경 무늬가 많은 흔들린 사진을 놓치는데, 손떨림은 모든
+    # 에지가 한 방향으로 번져 그라디언트 방향 쏠림으로 잡힌다.
+    # 한계: 앞사람만 모션블러이고 배경이 선명한 부분 블러, 장노출 빛궤적(에지 방향이 궤적을 따라
+    # 다양함)은 여전히 잡지 못한다.
     if blurry is None:
       blurry = blur_variance(image) < quality_config.whole_image_blur_threshold
+      if not blurry and quality_config.shake_coherence_threshold > 0:
+        norm_var, coherence = shake_signals(image)
+        blurry = (
+          coherence >= quality_config.shake_coherence_threshold and norm_var < quality_config.shake_max_norm_variance
+        )
 
     crops = [crop for crop in aligned_crops if crop is not None]
     embeddings = [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]

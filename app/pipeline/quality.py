@@ -46,6 +46,13 @@ _BLUR_DENOISE_KERNEL = (3, 3)  # 고감도 노이즈 억제 — 야간 사진의
 # align은 순수 수학 모듈이나 _ARCFACE_DST는 module-private이라, 좌표를 여기 재선언하고 계약으로 고정한다.
 _EYE_CENTERS = ((38.2946, 51.6963), (73.5318, 51.5014))  # (우안, 좌안)
 
+# shake_signals의 측정 정규화: 전체 이미지를 긴 변 이 크기로 축소해 해상도 의존을 없앤다
+# (_BLUR_NORM_SIZE와 같은 이유 — 원본 크기로 재면 12MP와 스크린샷에 단일 임계가 성립하지 않는다).
+_SHAKE_NORM_MAX_SIDE = 1024
+# 구조 텐서 평균에 넣을 그라디언트 크기 상위 백분위 — 약한 그라디언트(민무늬 영역·노이즈)는 방향
+# 정보가 무의미해 쏠림을 희석하므로 강한 에지 픽셀만 쓴다 (라벨셋 검증값, ADR 014).
+_SHAKE_GRAD_PERCENTILE = 90
+
 
 @dataclass(frozen=True)
 class QualityConfig:
@@ -69,6 +76,16 @@ class QualityConfig:
   # 흔들린 전체 이미지는 variance ~1~7(선명 300+)로 폭락하나, 단순한 선명 장면(민무늬 벽 등)은 낮게
   # 나올 수 있어 오탐 방지 차원에서 보수적으로 튜닝한다. 초기값은 blur_threshold와 동일(실측 보정 필요).
   whole_image_blur_threshold: float = 100.0
+  # 얼굴 미검출 fallback의 2차 신호 — 방향성 블러 (ADR 014). variance는 텍스처 양을 재는 지표라
+  # 배경 무늬가 많은 흔들린 사진을 놓치는데, 손떨림은 모든 에지가 한 방향으로 번져 그라디언트
+  # 방향이 쏠린다(구조 텐서 coherence 0~1). 쏠림이 이 값 이상이면 흔들림 후보. 라벨셋 실측:
+  # 흔들림 0.397~0.631 vs 선명 최고 0.312 — 중간이 아닌 0.40을 쓰는 이유는 샘플 15장의 얇은
+  # 마진에 과적합하지 않기 위한 보수 선택(0.397짜리 1장은 알려진 미탐). 0 = 비활성.
+  shake_coherence_threshold: float = 0.40
+  # 방향 쏠림이 높아도 정규화 variance(긴 변 1024 축소 후 측정)가 이 값 이상이면 선명으로 본다 —
+  # 구도가 단순해 에지 방향이 우연히 쏠린 선명한 사진의 오탐 가드 (라벨셋 child4: 쏠림 0.491이지만
+  # variance 236.9로 명백히 선명). 흔들린 사진의 실측 최고는 55.5.
+  shake_max_norm_variance: float = 60.0
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -85,6 +102,10 @@ class QualityConfig:
       raise ValueError(f"blur_main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.blur_main_face_ratio}")
     if self.whole_image_blur_threshold <= 0.0:
       raise ValueError(f"whole_image_blur_threshold는 양수여야 합니다. 받은 값: {self.whole_image_blur_threshold}")
+    if not 0.0 <= self.shake_coherence_threshold <= 1.0:
+      raise ValueError(f"shake_coherence_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.shake_coherence_threshold}")
+    if self.shake_max_norm_variance <= 0.0:
+      raise ValueError(f"shake_max_norm_variance는 양수여야 합니다. 받은 값: {self.shake_max_norm_variance}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
@@ -119,6 +140,35 @@ def face_blur_variance(crop: np.ndarray) -> float:
   resized = cv2.resize(gray, (_BLUR_NORM_SIZE, _BLUR_NORM_SIZE), interpolation=cv2.INTER_AREA)
   denoised = cv2.GaussianBlur(resized, _BLUR_DENOISE_KERNEL, 0)
   return float(cv2.Laplacian(denoised, cv2.CV_64F).var())
+
+
+def shake_signals(image: np.ndarray) -> tuple[float, float]:
+  """전체 이미지의 (정규화 variance, 방향 쏠림)을 잰다 — 얼굴 미검출 fallback의 방향성 블러 검출용 (ADR 014).
+
+  정규화 variance: 긴 변 1024 축소 + 3x3 가우시안 후 Laplacian variance — 원본 크기로 재는
+  blur_variance와 달리 해상도 의존이 없어 단일 임계가 성립한다.
+  방향 쏠림: 그라디언트 크기 상위 10% 픽셀의 구조 텐서 평균에서 sqrt((Jxx-Jyy)² + 4·Jxy²)/(Jxx+Jyy).
+  0 = 에지 방향이 제각각(등방, 선명한 일반 사진), 1 = 전부 한 방향(손떨림이 모든 에지를 같은
+  방향으로 번지게 한 사진). 텍스처 양과 무관한 신호라 variance가 놓치는 사진을 잡는다.
+  """
+  gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+  scale = _SHAKE_NORM_MAX_SIDE / max(gray.shape)
+  if scale < 1.0:
+    size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
+    gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+  denoised = cv2.GaussianBlur(gray, _BLUR_DENOISE_KERNEL, 0)
+  norm_var = float(cv2.Laplacian(denoised, cv2.CV_64F).var())
+
+  gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+  gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+  magnitude = gx * gx + gy * gy
+  strong = magnitude >= np.percentile(magnitude, _SHAKE_GRAD_PERCENTILE)
+  jxx = float((gx * gx)[strong].mean())
+  jyy = float((gy * gy)[strong].mean())
+  jxy = float((gx * gy)[strong].mean())
+  trace = jxx + jyy
+  coherence = float(np.sqrt((jxx - jyy) ** 2 + 4 * jxy**2) / trace) if trace > 0 else 0.0
+  return norm_var, coherence
 
 
 def crop_eye(aligned: np.ndarray, center: tuple[float, float], box_px: int) -> np.ndarray | None:
@@ -282,5 +332,11 @@ if __name__ == "__main__":
       # deps.build_face_extractor와 같은 fallback — CLI 판정이 프로덕션 라우팅과 일치해야 보정에 쓸 수 있다
       whole_var = blur_variance(image)
       blurry = whole_var < config.whole_image_blur_threshold
-      print(f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback (whole_var={whole_var:.1f})")
+      norm_var, coherence = shake_signals(image)
+      if not blurry and config.shake_coherence_threshold > 0:
+        blurry = coherence >= config.shake_coherence_threshold and norm_var < config.shake_max_norm_variance
+      print(
+        f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback "
+        f"(whole_var={whole_var:.1f} norm_var={norm_var:.1f} coherence={coherence:.3f})"
+      )
     print(f"{path}: {len(detected)} face(s) → eyes_closed={eyes_closed}, blurry={blurry}")
