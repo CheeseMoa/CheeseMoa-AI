@@ -9,6 +9,10 @@
     흔들림 (모델 불필요, OpenCV만). 리사이즈는 해상도 의존성 제거(같은 얼굴도 crop이 클수록 variance가
     낮아짐), 가우시안은 고감도 노이즈가 고주파로 잡혀 흔들린 얼굴을 선명으로 오판하는 것을 막는다.
     극소 얼굴(min_blur_face_px 미만)은 정보가 부족해 판정에서 제외하고 전체 이미지 fallback에 맡긴다.
+    판정 대상은 주 인물 얼굴뿐이다(가장 큰 얼굴 폭 대비 blur_main_face_ratio 이상) — 배경 인물은
+    아웃포커스(피사계 심도)로 뭉개지는 것이 정상 촬영이라 사진 전체의 흔들림 증거가 못 되고, 실제로
+    주 인물이 선명한 사진이 배경 얼굴 하나 때문에 blurry로 오분류됐다(event 30 실측, 2026-07-15).
+    손떨림이라면 주 인물까지 전부 뭉개지므로 주 인물만 봐도 놓치지 않는다.
     정렬 crop은 warpAffine 보간이 고주파를 뭉개 variance를 왜곡하므로 blur 판정엔 쓰지 않는다.
 
 이미지 단위 판정은 "얼굴 1개라도 해당하면 그 사진을 분리" 규칙으로 집계한다.
@@ -42,6 +46,13 @@ _BLUR_DENOISE_KERNEL = (3, 3)  # 고감도 노이즈 억제 — 야간 사진의
 # align은 순수 수학 모듈이나 _ARCFACE_DST는 module-private이라, 좌표를 여기 재선언하고 계약으로 고정한다.
 _EYE_CENTERS = ((38.2946, 51.6963), (73.5318, 51.5014))  # (우안, 좌안)
 
+# shake_signals의 측정 정규화: 전체 이미지를 긴 변 이 크기로 축소해 해상도 의존을 없앤다
+# (_BLUR_NORM_SIZE와 같은 이유 — 원본 크기로 재면 12MP와 스크린샷에 단일 임계가 성립하지 않는다).
+_SHAKE_NORM_MAX_SIDE = 1024
+# 구조 텐서 평균에 넣을 그라디언트 크기 상위 백분위 — 약한 그라디언트(민무늬 영역·노이즈)는 방향
+# 정보가 무의미해 쏠림을 희석하므로 강한 에지 픽셀만 쓴다 (라벨셋 검증값, ADR 014).
+_SHAKE_GRAD_PERCENTILE = 90
+
 
 @dataclass(frozen=True)
 class QualityConfig:
@@ -56,11 +67,25 @@ class QualityConfig:
   # → 판정에서 제외한다. 판정 자격 얼굴이 하나도 없으면 judge_faces가 blurry=None을 반환하고
   # 호출자가 전체 이미지 fallback으로 처리한다.
   min_blur_face_px: int = 64
+  # 흔들림 판정 자격의 상대 크기 하한: 사진에서 가장 큰 얼굴 bbox 폭 대비 이 비율 미만인 얼굴은 주 인물이
+  # 아니라고 보고 blur 판정에서 제외한다. 배경 인물의 아웃포커스가 선명한 사진을 blurry로 오분류하는 것
+  # 방지 (event 30 실측: 주 인물 variance 62~157 선명, 배경 얼굴 9.2·18.5로 오탐). 0 = 비활성(모든 얼굴 판정).
+  blur_main_face_ratio: float = 0.5
   # 얼굴 미검출 시 전체 이미지 Laplacian variance로 흔들림을 판정하는 fallback 임계값 (완전 흔들려
   # 얼굴 검출조차 실패한 사진 구제). 얼굴 crop과 측정 스케일이 달라 별도 설정값이다 — 실측에서 완전
   # 흔들린 전체 이미지는 variance ~1~7(선명 300+)로 폭락하나, 단순한 선명 장면(민무늬 벽 등)은 낮게
   # 나올 수 있어 오탐 방지 차원에서 보수적으로 튜닝한다. 초기값은 blur_threshold와 동일(실측 보정 필요).
   whole_image_blur_threshold: float = 100.0
+  # 얼굴 미검출 fallback의 2차 신호 — 방향성 블러 (ADR 014). variance는 텍스처 양을 재는 지표라
+  # 배경 무늬가 많은 흔들린 사진을 놓치는데, 손떨림은 모든 에지가 한 방향으로 번져 그라디언트
+  # 방향이 쏠린다(구조 텐서 coherence 0~1). 쏠림이 이 값 이상이면 흔들림 후보. 라벨셋 실측:
+  # 흔들림 0.397~0.631 vs 선명 최고 0.312 — 중간이 아닌 0.40을 쓰는 이유는 샘플 15장의 얇은
+  # 마진에 과적합하지 않기 위한 보수 선택(0.397짜리 1장은 알려진 미탐). 0 = 비활성.
+  shake_coherence_threshold: float = 0.40
+  # 방향 쏠림이 높아도 정규화 variance(긴 변 1024 축소 후 측정)가 이 값 이상이면 선명으로 본다 —
+  # 구도가 단순해 에지 방향이 우연히 쏠린 선명한 사진의 오탐 가드 (라벨셋 child4: 쏠림 0.491이지만
+  # variance 236.9로 명백히 선명). 흔들린 사진의 실측 최고는 55.5.
+  shake_max_norm_variance: float = 60.0
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -73,8 +98,14 @@ class QualityConfig:
       raise ValueError(f"blur_threshold는 양수여야 합니다. 받은 값: {self.blur_threshold}")
     if self.min_blur_face_px <= 0:
       raise ValueError(f"min_blur_face_px는 양수여야 합니다. 받은 값: {self.min_blur_face_px}")
+    if not 0.0 <= self.blur_main_face_ratio <= 1.0:
+      raise ValueError(f"blur_main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.blur_main_face_ratio}")
     if self.whole_image_blur_threshold <= 0.0:
       raise ValueError(f"whole_image_blur_threshold는 양수여야 합니다. 받은 값: {self.whole_image_blur_threshold}")
+    if not 0.0 <= self.shake_coherence_threshold <= 1.0:
+      raise ValueError(f"shake_coherence_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.shake_coherence_threshold}")
+    if self.shake_max_norm_variance <= 0.0:
+      raise ValueError(f"shake_max_norm_variance는 양수여야 합니다. 받은 값: {self.shake_max_norm_variance}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
@@ -109,6 +140,35 @@ def face_blur_variance(crop: np.ndarray) -> float:
   resized = cv2.resize(gray, (_BLUR_NORM_SIZE, _BLUR_NORM_SIZE), interpolation=cv2.INTER_AREA)
   denoised = cv2.GaussianBlur(resized, _BLUR_DENOISE_KERNEL, 0)
   return float(cv2.Laplacian(denoised, cv2.CV_64F).var())
+
+
+def shake_signals(image: np.ndarray) -> tuple[float, float]:
+  """전체 이미지의 (정규화 variance, 방향 쏠림)을 잰다 — 얼굴 미검출 fallback의 방향성 블러 검출용 (ADR 014).
+
+  정규화 variance: 긴 변 1024 축소 + 3x3 가우시안 후 Laplacian variance — 원본 크기로 재는
+  blur_variance와 달리 해상도 의존이 없어 단일 임계가 성립한다.
+  방향 쏠림: 그라디언트 크기 상위 10% 픽셀의 구조 텐서 평균에서 sqrt((Jxx-Jyy)² + 4·Jxy²)/(Jxx+Jyy).
+  0 = 에지 방향이 제각각(등방, 선명한 일반 사진), 1 = 전부 한 방향(손떨림이 모든 에지를 같은
+  방향으로 번지게 한 사진). 텍스처 양과 무관한 신호라 variance가 놓치는 사진을 잡는다.
+  """
+  gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+  scale = _SHAKE_NORM_MAX_SIDE / max(gray.shape)
+  if scale < 1.0:
+    size = (round(gray.shape[1] * scale), round(gray.shape[0] * scale))
+    gray = cv2.resize(gray, size, interpolation=cv2.INTER_AREA)
+  denoised = cv2.GaussianBlur(gray, _BLUR_DENOISE_KERNEL, 0)
+  norm_var = float(cv2.Laplacian(denoised, cv2.CV_64F).var())
+
+  gx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+  gy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+  magnitude = gx * gx + gy * gy
+  strong = magnitude >= np.percentile(magnitude, _SHAKE_GRAD_PERCENTILE)
+  jxx = float((gx * gx)[strong].mean())
+  jyy = float((gy * gy)[strong].mean())
+  jxy = float((gx * gy)[strong].mean())
+  trace = jxx + jyy
+  coherence = float(np.sqrt((jxx - jyy) ** 2 + 4 * jxy**2) / trace) if trace > 0 else 0.0
+  return norm_var, coherence
 
 
 def crop_eye(aligned: np.ndarray, center: tuple[float, float], box_px: int) -> np.ndarray | None:
@@ -197,9 +257,16 @@ def judge_faces(
 
   "얼굴 1개라도" 규칙: 어느 한 얼굴이라도 양눈 감김이면 eyes_closed, 어느 한 얼굴이라도 blur면 blurry.
   양눈이 모두 잡히는 얼굴만 눈감음 후보다 — 옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정.
-  blurry는 판정 자격 얼굴(bbox 짧은 변 ≥ min_blur_face_px)이 하나도 없으면 None — 얼굴 미검출과 같은
-  "얼굴로는 알 수 없음"이므로 호출자가 전체 이미지 fallback으로 판정한다.
+  blurry는 주 인물 얼굴만 본다 — 판정 자격은 bbox 짧은 변 ≥ min_blur_face_px 그리고 bbox 폭이 사진 내
+  가장 큰 얼굴 폭의 blur_main_face_ratio 이상. 배경 인물의 아웃포커스는 흔들림 증거가 아니다(모듈 주석).
+  판정 자격 얼굴이 하나도 없으면 None — 얼굴 미검출과 같은 "얼굴로는 알 수 없음"이므로 호출자가
+  전체 이미지 fallback으로 판정한다.
   """
+  widest = max(
+    (crop.shape[1] for _, crop in faces if crop is not None and crop.size > 0),
+    default=0,
+  )
+  min_main_width = config.blur_main_face_ratio * widest
   eyes_closed = False
   blurry: bool | None = None
   for aligned, bbox_crop in faces:
@@ -210,7 +277,7 @@ def judge_faces(
         if all(prob >= config.eye_closed_confidence for prob in probs):
           eyes_closed = True
     if blurry is not True and bbox_crop is not None and bbox_crop.size > 0:
-      if min(bbox_crop.shape[:2]) >= config.min_blur_face_px:
+      if min(bbox_crop.shape[:2]) >= config.min_blur_face_px and bbox_crop.shape[1] >= min_main_width:
         blurry = face_blur_variance(bbox_crop) < config.blur_threshold
     if eyes_closed and blurry:
       break  # 둘 다 확정되면 나머지 얼굴은 볼 필요 없다
@@ -239,21 +306,25 @@ if __name__ == "__main__":
 
     detected = detector.detect(image)
     faces: list[FacePair] = []
-    for i, face in enumerate(detected):
+    for face in detected:
       x, y, bw, bh = face.bbox
-      bbox_crop = image[y : y + bh, x : x + bw]
-      aligned = align_face(image, face.landmarks)
-      faces.append((aligned, bbox_crop))
+      faces.append((align_face(image, face.landmarks), image[y : y + bh, x : x + bw]))
 
+    widest = max((crop.shape[1] for _, crop in faces if crop.size > 0), default=0)
+    for i, (aligned, bbox_crop) in enumerate(faces):
       probs: list[float] = []
       if aligned is not None:
         eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
         if all(crop is not None for crop in eye_crops):
           probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]
       var = face_blur_variance(bbox_crop) if bbox_crop.size else float("nan")
-      qualified = bbox_crop.size > 0 and min(bbox_crop.shape[:2]) >= config.min_blur_face_px
+      note = ""
+      if not (bbox_crop.size > 0 and min(bbox_crop.shape[:2]) >= config.min_blur_face_px):
+        note = " (극소 얼굴 — blur 판정 제외)"
+      elif bbox_crop.shape[1] < config.blur_main_face_ratio * widest:
+        note = " (배경 얼굴 — blur 판정 제외)"
       probs_str = ", ".join(f"{p:.3f}" for p in probs) if probs else "n/a"
-      note = "" if qualified else " (극소 얼굴 — blur 판정 제외)"
+      bh, bw = bbox_crop.shape[:2]
       print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}] blur_var={var:.1f}{note}")
 
     eyes_closed, blurry = judge_faces(faces, classifier, config)
@@ -261,5 +332,11 @@ if __name__ == "__main__":
       # deps.build_face_extractor와 같은 fallback — CLI 판정이 프로덕션 라우팅과 일치해야 보정에 쓸 수 있다
       whole_var = blur_variance(image)
       blurry = whole_var < config.whole_image_blur_threshold
-      print(f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback (whole_var={whole_var:.1f})")
+      norm_var, coherence = shake_signals(image)
+      if not blurry and config.shake_coherence_threshold > 0:
+        blurry = coherence >= config.shake_coherence_threshold and norm_var < config.shake_max_norm_variance
+      print(
+        f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback "
+        f"(whole_var={whole_var:.1f} norm_var={norm_var:.1f} coherence={coherence:.3f})"
+      )
     print(f"{path}: {len(detected)} face(s) → eyes_closed={eyes_closed}, blurry={blurry}")
