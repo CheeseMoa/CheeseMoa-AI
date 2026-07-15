@@ -20,6 +20,11 @@ DEFAULT_MAX_SIDE = 2000
 # 중 224/0.75가 전 지표 최고 — 같은 얼굴 유사도 평균 0.9596·최저 0.6881, 랜드마크 이동 평균 3.07%
 DEFAULT_REFINE_NORM_FACE_WIDTH = 224
 DEFAULT_REFINE_MARGIN_RATIO = 0.75
+# 분포 측정 확정값(ADR-013, 2026-07-15): 실사진 16개 이벤트 210 얼굴에서 배경 행인 얼굴은
+# rel_w(bbox 폭/이미지 긴 변) 최대 0.82%, 앨범 배정 얼굴은 최소 3.29% — 사이가 빈 구간이라
+# 1.0~3.0% 어디를 골라도 앨범 손실 0(고원). 기하 중점(1.64%)보다 약간 보수적인 1.5% 채택
+# (진짜 얼굴을 자르는 실수가 행인 앨범을 놓치는 실수보다 나쁘다).
+DEFAULT_MIN_FACE_REL_WIDTH = 0.015
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
 _BBOX_SLICE = slice(0, 4)  # face[0:4]  = x, y, w, h
@@ -57,6 +62,10 @@ class DetectorConfig:
   refine_landmarks: bool = True
   refine_norm_face_width: int = DEFAULT_REFINE_NORM_FACE_WIDTH  # 재검출 크롭에서의 얼굴 목표 폭(px)
   refine_margin_ratio: float = DEFAULT_REFINE_MARGIN_RATIO  # bbox 대비 여유 크롭 비율
+  # 배경 인물 필터 (ADR-013): 멀리 배경에 찍힌 얼굴이 사진 2장에 반복 등장하면 행인 앨범이
+  # 만들어진다. 상대 크기 기준인 이유는 절대 px 기준이 저해상도 업로드(558×418 이미지의 21px
+  # 앨범 얼굴 실측)를 자르기 때문. 0.0 = 비활성.
+  min_face_rel_width: float = DEFAULT_MIN_FACE_REL_WIDTH
 
   def __post_init__(self) -> None:
     # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
@@ -67,6 +76,9 @@ class DetectorConfig:
       raise ValueError(f"refine_norm_face_width는 양의 정수여야 합니다. 받은 값: {self.refine_norm_face_width}")
     if self.refine_margin_ratio < 0:
       raise ValueError(f"refine_margin_ratio는 0 이상이어야 합니다. 받은 값: {self.refine_margin_ratio}")
+    # 1.0 이상은 모든 얼굴을 제거하는 설정 실수라 생성 시점에 거부한다 (0.0 = 비활성은 허용)
+    if not 0.0 <= self.min_face_rel_width < 1.0:
+      raise ValueError(f"min_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.min_face_rel_width}")
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -125,6 +137,7 @@ class FaceDetector:
       top_k=resolved_config.top_k,
     )
     self._max_side = resolved_config.max_side
+    self._min_face_rel_width = resolved_config.min_face_rel_width
     self._refine_landmarks = resolved_config.refine_landmarks
     self._refine_norm_face_width = resolved_config.refine_norm_face_width
     self._refine_margin_ratio = resolved_config.refine_margin_ratio
@@ -147,10 +160,12 @@ class FaceDetector:
       return []
 
     inv = 1.0 / scale
+    # 배경 인물 필터의 기준은 원본 좌표계 bbox 폭 — 검출용 축소(max_side)와 무관하게 동작한다
+    min_face_w_px = self._min_face_rel_width * max(h, w)
     faces: list[DetectedFace] = []
     for row in raw:
       face = self._to_detected_face(row, inv, w, h)
-      if face is not None:
+      if face is not None and face.bbox[2] >= min_face_w_px:
         faces.append(face)
     if self._refine_landmarks:
       # 본검출 raw 순회가 끝난 뒤에 정제를 시작한다 — _refine_face의 setInputSize/detect 재호출이
