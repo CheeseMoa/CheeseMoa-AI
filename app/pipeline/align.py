@@ -2,8 +2,12 @@
 
 YuNet이 검출한 5점 랜드마크를 ArcFace 표준 기준점에 맞춰 112x112 크롭으로 정렬한다.
 입력·출력 모두 BGR이며 이 모듈은 색공간 변환을 하지 않는다 — RGB 변환은 embed 전처리의 책임이다.
-`insightface.utils.face_align` 대비 변환행렬 np.allclose=True, 픽셀 차이 0으로 동등성이 검증된 이식 구현이다.
+`insightface.utils.face_align` 대비 변환행렬 np.allclose=True, 픽셀 차이 0으로 동등성이 검증된 이식 구현이다
+(픽셀 동등성은 antialias=False 또는 확대(s ≥ 1) 경로 기준 — 축소 경로는 안티에일리어싱 프리블러가
+의도적으로 추가된다, 2026-07-14 리뷰).
 """
+
+import math
 
 import cv2
 import numpy as np
@@ -72,11 +76,51 @@ def _umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
   return T
 
 
-def align_face(image: np.ndarray, landmarks: np.ndarray) -> np.ndarray | None:
+def _prefilter_roi(image: np.ndarray, M: np.ndarray, s: float) -> tuple[np.ndarray, np.ndarray] | None:
+  """축소 warp의 에일리어싱 방지용으로 얼굴 주변 ROI만 가우시안 프리블러한다.
+
+  warpAffine의 INTER_LINEAR는 2x2 이웃만 샘플링해 큰 축소(s ≪ 1)에서 저역통과 없이 원본을
+  서브샘플링한다 — 어느 픽셀이 걸리는지가 서브픽셀 위치에 좌우돼 같은 얼굴도 촬영마다 크롭이
+  달라지고 임베딩이 흔들린다(2026-07-14 리뷰: 같은 얼굴 유사도 최저 0.43). σ = (1/s)/2 는 나이퀴스트
+  기준 축소 배율의 절반 파장에 해당하는 저역통과다.
+
+  블러를 이미지 전체가 아니라 warp가 실제로 샘플링하는 영역(112x112 목적지의 역사상 + 커널 마진)에만
+  적용해, 얼굴이 여러 개인 이미지에서 얼굴마다 전체 이미지를 블러하는 낭비를 피한다. 마진이 커널
+  반경을 덮으므로 픽셀 결과는 전체 블러와 동일하다. 원본 image는 절대 수정하지 않는다(호출자가 같은
+  버퍼를 다른 얼굴 정렬·품질 판정에 재사용한다).
+
+  반환: (블러된 ROI, ROI 좌표계로 보정한 아핀 행렬). ROI가 이미지 밖으로 퇴화하면 None(블러 생략).
+  """
+  sigma = (1.0 / s) / 2.0
+  # 목적지 네 모서리를 원본 좌표로 역사상해 warp가 읽는 영역을 구한다
+  corners = np.array([[0, 0], [ALIGN_SIZE, 0], [0, ALIGN_SIZE], [ALIGN_SIZE, ALIGN_SIZE]], dtype=np.float64)
+  inv = cv2.invertAffineTransform(M)
+  src_corners = corners @ inv[:, :2].T + inv[:, 2]
+  # 마진 = 가우시안 커널 반경(ksize 자동 유도 시 ≈ 4σ) + INTER_LINEAR 2x2 이웃 — 이보다 작으면
+  # ROI 경계 안쪽 픽셀이 borderValue로 오염돼 전체 블러와 결과가 달라진다
+  margin = int(math.ceil(4.0 * sigma)) + 2
+  h, w = image.shape[:2]
+  x0 = max(0, int(math.floor(src_corners[:, 0].min())) - margin)
+  y0 = max(0, int(math.floor(src_corners[:, 1].min())) - margin)
+  x1 = min(w, int(math.ceil(src_corners[:, 0].max())) + margin)
+  y1 = min(h, int(math.ceil(src_corners[:, 1].max())) + margin)
+  if x1 <= x0 or y1 <= y0:
+    return None  # 얼굴이 사실상 화면 밖 — 기존 동작(블러 없는 warp)으로 폴백
+  blurred = cv2.GaussianBlur(image[y0:y1, x0:x1], (0, 0), sigma)
+  # ROI 크롭은 src 좌표를 (x0, y0)만큼 평행이동한 것 — M을 같은 좌표계로 보정한다
+  M_roi = M.copy()
+  M_roi[:, 2] += M[:, :2] @ np.array([x0, y0], dtype=np.float64)
+  return blurred, M_roi
+
+
+def align_face(image: np.ndarray, landmarks: np.ndarray, antialias: bool = True) -> np.ndarray | None:
   """5개 랜드마크를 ArcFace 기준점에 맞춰 ALIGN_SIZE x ALIGN_SIZE BGR 크롭으로 정렬한다.
 
   변환행렬이 퇴화(rank 0 → NaN)하면 None을 반환한다 — 얼굴 단위 실패는 해당 얼굴만 건너뛰는
   파이프라인 정책으로, detect.py의 None 반환 패턴과 일관된다.
+
+  antialias=True(기본)면 축소(s < 1) warp에 한해 배율 기반 가우시안 프리블러를 적용한다.
+  확대 경로와 antialias=False는 기존(insightface 픽셀 동등) 경로 그대로다.
   """
   if landmarks.shape != (_NUM_LANDMARKS, 2):
     raise ValueError(f"landmarks는 shape (5, 2)여야 합니다. 받은 shape: {landmarks.shape}")
@@ -84,6 +128,15 @@ def align_face(image: np.ndarray, landmarks: np.ndarray) -> np.ndarray | None:
   M = _umeyama(landmarks.astype(np.float64), _ARCFACE_DST)[0:2, :]  # shape (2, 3) 아핀 행렬
   if not np.isfinite(M).all():
     return None
+  if antialias:
+    # _umeyama는 d-보정으로 순수 회전을 강제하므로 M[:, :2] = s·R, det = s² — s를 det로 복원한다.
+    # det ≤ 0은 스케일 퇴화(랜드마크 일직선 등)라 배율이 정의되지 않으므로 블러를 건너뛴다.
+    det = float(np.linalg.det(M[:, :2]))
+    if det > 0.0 and (s := math.sqrt(det)) < 1.0:
+      roi = _prefilter_roi(image, M, s)
+      if roi is not None:
+        blurred, M_roi = roi
+        return cv2.warpAffine(blurred, M_roi, (ALIGN_SIZE, ALIGN_SIZE), borderValue=0.0)
   return cv2.warpAffine(image, M, (ALIGN_SIZE, ALIGN_SIZE), borderValue=0.0)
 
 
