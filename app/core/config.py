@@ -51,7 +51,7 @@ class Settings(BaseSettings):
   cluster_min_samples: int = 2  # PoC 검증값 유지 (ADR-009: 3은 소규모 이벤트 회귀로 기각)
   cluster_selection_epsilon: float = 0.15
   cluster_min_match_jaccard: float = 0.0
-  cluster_merge_centroid_similarity: float = 0.68  # ADR-011: 같은사진 가드 도입과 함께 0.7 → 0.68
+  cluster_merge_centroid_similarity: float = 0.55  # ADR-012: 분포 측정 기반 재보정 0.68 → 0.55
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
