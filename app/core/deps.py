@@ -40,6 +40,7 @@ def build_face_extractor(
   embedder: FaceEmbedder,
   eye_classifier: EyeStateClassifier,
   quality_config: QualityConfig,
+  align_antialias: bool = True,
 ) -> FaceExtractor:
   """detect → align → embed에 품질 판정(눈감음/흔들림)을 합성해 handlers의 FaceExtractor를 만든다.
 
@@ -50,7 +51,7 @@ def build_face_extractor(
 
   def extract_faces(image):
     detected = detector.detect(image)
-    aligned_crops = [align_face(image, face.landmarks) for face in detected]
+    aligned_crops = [align_face(image, face.landmarks, antialias=align_antialias) for face in detected]
     # 얼굴별 (정렬 crop|None, 원본 bbox crop) 쌍 — judge_faces가 눈감음(정렬)·흔들림(bbox)을 판정한다
     face_pairs = []
     for face, aligned in zip(detected, aligned_crops):
@@ -101,7 +102,7 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   threads = settings.ort_num_threads or cores
 
   logger.info("AI 모델 로딩 중 (YuNet + AuraFace + 눈감음 CNN) — 최초 실행은 다운로드로 오래 걸릴 수 있습니다")
-  detector = FaceDetector()
+  detector = FaceDetector(settings.to_detector_config())
   embedder = FaceEmbedder(EmbedConfig(intra_op_num_threads=threads, inter_op_num_threads=threads))
   eye_classifier = EyeStateClassifier()
   logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d)", threads, cores)
@@ -109,7 +110,9 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=S3ImageSource(s3_client, settings.images_bucket),
-    extract_faces=build_face_extractor(detector, embedder, eye_classifier, settings.to_quality_config()),
+    extract_faces=build_face_extractor(
+      detector, embedder, eye_classifier, settings.to_quality_config(), align_antialias=settings.align_antialias
+    ),
     cluster_config=settings.to_cluster_config(),
   )
   return WorkerDeps(

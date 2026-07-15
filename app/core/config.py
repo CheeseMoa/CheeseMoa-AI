@@ -15,6 +15,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
+  from app.pipeline.detect import DetectorConfig
   from app.pipeline.quality import QualityConfig
 
 
@@ -50,12 +51,21 @@ class Settings(BaseSettings):
   cluster_min_samples: int = 2  # PoC 검증값 유지 (ADR-009: 3은 소규모 이벤트 회귀로 기각)
   cluster_selection_epsilon: float = 0.15
   cluster_min_match_jaccard: float = 0.0
-  cluster_merge_centroid_similarity: float = 0.68  # ADR-011: 같은사진 가드 도입과 함께 0.7 → 0.68
+  cluster_merge_centroid_similarity: float = 0.55  # ADR-012: 분포 측정 기반 재보정 0.68 → 0.55
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
   cluster_blob_promote_similarity: float = 0.45
   cluster_blob_promote_floor: float = 0.4
+
+  # ── 입력 품질 교정 (2026-07-14 리뷰: 정렬 안티에일리어싱 + 랜드마크 2단계 정제) ──────────
+  # 같은 얼굴 임베딩이 촬영·설정마다 흔들리던 노이즈(최저 유사도 0.43)를 잡는 두 교정의 토글.
+  # 운영에서 문제가 생기면 코드 수정 없이 .env로 끈다.
+  align_antialias: bool = True  # 축소 warp 전 배율 기반 가우시안 프리블러
+  detect_max_side: int = 2000  # 검출 전 긴 변 축소 상한 (기존 하드코딩 값을 노출)
+  detect_refine_landmarks: bool = True  # 대형 얼굴 랜드마크를 정규 스케일 크롭 재검출로 정제
+  detect_refine_norm_face_width: int = 224  # 재검출 크롭에서의 얼굴 목표 폭(px) — 스윕 확정값
+  detect_refine_margin_ratio: float = 0.75  # bbox 대비 여유 크롭 비율 — 스윕 확정값
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
   quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
@@ -85,6 +95,20 @@ class Settings(BaseSettings):
       min_membership_margin=self.cluster_min_membership_margin,
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
+    )
+
+  def to_detector_config(self) -> "DetectorConfig":
+    """설정값을 FaceDetector의 DetectorConfig로 변환한다 (값 검증은 DetectorConfig.__post_init__이 수행).
+
+    to_cluster_config와 같은 이유로 pipeline 임포트를 지연시킨다 (core→pipeline 역의존 회피).
+    """
+    from app.pipeline.detect import DetectorConfig
+
+    return DetectorConfig(
+      max_side=self.detect_max_side,
+      refine_landmarks=self.detect_refine_landmarks,
+      refine_norm_face_width=self.detect_refine_norm_face_width,
+      refine_margin_ratio=self.detect_refine_margin_ratio,
     )
 
   def to_quality_config(self) -> "QualityConfig":

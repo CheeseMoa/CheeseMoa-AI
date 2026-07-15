@@ -35,13 +35,37 @@ AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Lapla
 **face_align — 직접 구현 유지**: `insightface.utils.face_align` 대신 `_umeyama()`/`_ARCFACE_DST`를
 코드 내 직접 구현해 insightface·skimage 의존성 제거(OpenCV+numpy만). 변환행렬 동등성 검증 완료.
 
+**입력 품질이 임베딩 모델 선택보다 먼저다 (2026-07-14 실측 원칙,
+[review](docs/reviews/2026-07-14-input-quality-alignment-landmark.md))**: 파이프라인이 스스로 주입하는
+노이즈가 신원 신호보다 크다 — 같은 사진·같은 얼굴인데 `max_side`만 1600↔2400으로 바꿔도 임베딩
+유사도가 **최저 0.43**까지 흔들린다(파편화 문제의 파편 간 거리 0.587보다 큰 변동). 원인은 ①
+`align.py`의 `warpAffine` 기본 보간(INTER_LINEAR)이 최대 12.7배 축소에서 저역통과 없이 서브샘플링하는
+에일리어싱, ② YuNet이 WIDER FACE 학습이라 초근접 대형 얼굴의 랜드마크가 불안정(얼굴폭 대비 최대 15.8%
+이동). **따라서 정확도 개선은 반드시 정렬·랜드마크 → 그 다음 모델 순서로 접근한다.** 노이즈 바닥이
+0.43인 파이프라인에 더 좋은 임베딩을 얹는 것은 밑 빠진 독에 물 붓기다. `max_side`를 올리는 방향은
+오검출 폭증(28→85개)으로 해법이 아니다. **두 원인 모두 2026-07-15 교정 완료**(정렬 AA 프리블러 +
+대형 얼굴 정규 스케일 재검출, 노이즈 바닥 0.33→0.69 — 완료된 목표 참조). 남은 선행 과제는 세션 간
+거리 분포 측정(다음 구현 목표 0.5).
+
+**임베딩 모델 교체 — 라이선스로 봉쇄됨 (2026-07-14 조사 확정)**: 무료 + 상용 가능 + AuraFace보다
+판별력 우수한 모델은 **존재하지 않는다**. 라이선스는 코드가 아니라 **가중치·학습 데이터**에서 막힌다 —
+InsightFace 모델 주는 "ALL models ... non-commercial research purposes only"(코드만 MIT), Glint360K는
+"데이터셋 및 그 데이터로 학습된 모델"까지, WebFace260M은 "그 서브셋"까지 상용 금지. AdaFace(IR-101/
+WebFace12M)는 동일 crop에서 파편 간 centroid 0.587→**0.809**로 압도적이지만 **상용 불가**이므로
+정확도 기준선(yardstick)으로만 쓴다. LVFace의 HF `mit` 태그는 **함정**(본문은 비상용). AuraFace가
+사실상 유일한 합법 선택지다. 유일한 합법적 성능 향상 경로는 **InsightFace 상용 라이선스 구매**이며,
+결제 전 ⓐ 동아시아 코호트 수치(74.96 vs 백인 94.70) 자체 데이터 A/B 검증, ⓑ 유료 라이선스가 학습
+데이터 출처까지 면책하는지 서면 확인이 **선행 조건**이다. TTA(좌우 반전 평균)·자체 학습·합성 데이터는
+전부 실측/조사로 기각.
+
 **HDBSCAN — PoC numpy 전용 이식본 사용** ([ADR 005](docs/decisions/005-hdbscan-standalone-port.md)):
 알고리즘은 HDBSCAN 유지(단순 UnionFind 대비 ARI 2.7배 우수, ADR 002)하되 구현체는 sklearn이 아닌
 PoC 이식본(라벨 완전 일치 검증, 의존성 제거). 파라미터(ARI 스윕 재확인, [ADR 009](docs/decisions/009-clustering-parameter-tuning.md)):
 `min_cluster_size=2, min_samples=2, metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적
 후처리로 정확도 보강: 연결 성분 부분 승격([ADR 008](docs/decisions/008-blob-promotion-connected-components.md))
 → 제약 강제(보정 must/cannot-link + 같은 사진 자동 cannot-link — 같은 사진의 두 얼굴은 타인 확정,
-[ADR 011](docs/decisions/011-same-photo-cannot-link.md)) → 파편 병합(완전 연결, 임계 0.68) → 노이즈
+[ADR 011](docs/decisions/011-same-photo-cannot-link.md)) → 파편 병합(완전 연결, 임계 0.55 —
+분포 측정 기반 재보정, [ADR 012](docs/decisions/012-merge-threshold-recalibration.md)) → 노이즈
 구제(전역 유사도 내림차순) → 저신뢰 `ambiguous` 분리(leave-one-out, 사람 제약 당사자만 보호) →
 2차 파편 병합(구제·축출로 바뀐 최종 멤버십에 같은 임계 재적용,
 [ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 임계값은 전부 `ClusterConfig` 설정값.
@@ -206,6 +230,12 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
 0. **[P0] 실 데이터 오염 대응** ([docs/backlog/2026-07-11-followups.md](docs/backlog/2026-07-11-followups.md)) —
    동일 사진 재업로드가 만든 중복 임베딩이 앨범을 쌍 단위로 쪼갬 + `delete_request` 미도달 유령 행
    (원인·재현: [reviews/2026-07-11-duplicate-embedding-split.md](docs/reviews/2026-07-11-duplicate-embedding-split.md))
+0.5 **[P1] ADR-012 리스크 해소 — 아동 교차연령 재검증**: 병합 임계 0.55의 유일한 미검증 리스크는
+   ADR-008의 "타인 centroid 최대 0.635"(face-test child 8명 교차연령, **교정 전** 임베딩)다.
+   face-test 데이터 확보 시 교정 후 파이프라인으로 재측정해 ADR-012를 확정할 것. 아동 다수 실
+   이벤트의 오병합 리포트가 트리거. 별건: YuNet이 화장품 팔레트 그림을 얼굴로 오검출
+   ([분포 측정 리뷰](docs/reviews/2026-07-15-distance-distribution-verdict.md) §별건) —
+   score_threshold 또는 크기/종횡비 필터 후보.
 1. 배포 후속 — 남은 항목: CloudWatch 지표 연동(로그는 완료 — 2026-07-14, awslogs 드라이버로
    `/cheesemoa/ai-worker` 직송, [cloudwatch-logging.md](docs/guides/cloudwatch-logging.md)), Spring 실계약 통합검증, 큐의 visibility timeout·
    redrive policy를 `.env.example` 메모대로 설정. **인스턴스 분리 검토**: 현재 워커가 Spring과 t4g.small
@@ -219,6 +249,18 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **병합 임계 재보정 0.68 → 0.55 — 파편화 주 원인 제거** (2026-07-15,
+  [ADR 012](docs/decisions/012-merge-threshold-recalibration.md),
+  [분포 측정 리뷰](docs/reviews/2026-07-15-distance-distribution-verdict.md)) — 교정 후 라벨 코퍼스
+  (5인, 동일인 103쌍·타인 781쌍)에서 타인 최고 0.4584 vs 동일인 쌍 77%가 0.68 미달을 실측. ARI 스윕
+  0.45~0.60 고원(5인 완벽 분리) 중앙 0.55 채택, test4가 기본값만으로 앨범 정확히 2개. 유료 라이선스
+  검토는 근거 상실로 보류. 미검증 리스크(아동 교차연령)는 다음 구현 목표 0.5.
+- **입력 품질 교정 — 정렬 AA + 랜드마크 2단계 정제** (2026-07-15,
+  [review §구현 결과](docs/reviews/2026-07-14-input-quality-alignment-landmark.md)) — `align.py`에 ROI 한정
+  가우시안 프리블러(σ=(1/s)/2, 확대 경로는 픽셀 동일 유지), `detect.py`에 대형 얼굴 정규 스케일 재검출
+  (실패 시 원 랜드마크 폴백, 파라미터는 스윕으로 **224/0.75** 확정 — 리뷰 초기값 160/0.5보다 우수).
+  같은 얼굴 임베딩 유사도(max_side 스윕) 평균 0.9133→**0.9596**, 최저 0.3254→**0.6881**, 랜드마크 지터
+  최대 26.5%→11.0%. 토글 5종(`ALIGN_ANTIALIAS`·`DETECT_REFINE_*` 등)으로 .env 롤백 가능.
 - **EC2 배포 + ORT 스레드 정합** (2026-07-11) — Docker 이미지(arm64, 모델 프리베이크)를 ECR `cheesemoa-ai`로
   올려 EC2에서 상시 실행. 배포 직후 임베딩이 로컬 대비 45배 느렸는데, 원인은 CPU 크레딧 스로틀링이 아니라
   ORT 스레드 오버서브스크립션(2코어 호스트에 기본값 8스레드)이었다 — 코어 수 정합으로 **6배 개선**
