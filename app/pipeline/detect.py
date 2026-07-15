@@ -22,9 +22,10 @@ DEFAULT_REFINE_NORM_FACE_WIDTH = 224
 DEFAULT_REFINE_MARGIN_RATIO = 0.75
 # 분포 측정 확정값(ADR-013, 2026-07-15): 실사진 16개 이벤트 210 얼굴에서 배경 행인 얼굴은
 # rel_w(bbox 폭/이미지 긴 변) 최대 0.82%, 앨범 배정 얼굴은 최소 3.29% — 사이가 빈 구간이라
-# 1.0~3.0% 어디를 골라도 앨범 손실 0(고원). 기하 중점(1.64%)보다 약간 보수적인 1.5% 채택
-# (진짜 얼굴을 자르는 실수가 행인 앨범을 놓치는 실수보다 나쁘다).
-DEFAULT_MIN_FACE_REL_WIDTH = 0.015
+# 1.0~3.0% 어디를 골라도 앨범 손실 0(고원). 고원 상단 쪽 2.5%를 채택해 배경 노이즈 제거를
+# 늘렸다(측정 데이터에서 노이즈 63/121 제거, 앨범 손실 0). 앨범 최소값까지 마진은 1.3배로
+# 얇은 편 — 앨범 사진 누락 리포트가 오면 이 값부터 내려볼 것.
+DEFAULT_MIN_FACE_REL_WIDTH = 0.025
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
 _BBOX_SLICE = slice(0, 4)  # face[0:4]  = x, y, w, h

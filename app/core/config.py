@@ -68,7 +68,7 @@ class Settings(BaseSettings):
   detect_refine_margin_ratio: float = 0.75  # bbox 대비 여유 크롭 비율 — 스윕 확정값
   # 배경 인물 필터 (ADR-013): bbox 폭이 이미지 긴 변의 이 비율 미만인 얼굴을 검출 단계에서
   # 버린다 — 멀리 배경에 찍힌 행인이 앨범을 만드는 것 방지 (분포 측정 확정값, 0 = 비활성).
-  detect_min_face_rel_width: float = 0.015
+  detect_min_face_rel_width: float = 0.025
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
   quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
