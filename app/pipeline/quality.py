@@ -9,6 +9,10 @@
     흔들림 (모델 불필요, OpenCV만). 리사이즈는 해상도 의존성 제거(같은 얼굴도 crop이 클수록 variance가
     낮아짐), 가우시안은 고감도 노이즈가 고주파로 잡혀 흔들린 얼굴을 선명으로 오판하는 것을 막는다.
     극소 얼굴(min_blur_face_px 미만)은 정보가 부족해 판정에서 제외하고 전체 이미지 fallback에 맡긴다.
+    판정 대상은 주 인물 얼굴뿐이다(가장 큰 얼굴 폭 대비 blur_main_face_ratio 이상) — 배경 인물은
+    아웃포커스(피사계 심도)로 뭉개지는 것이 정상 촬영이라 사진 전체의 흔들림 증거가 못 되고, 실제로
+    주 인물이 선명한 사진이 배경 얼굴 하나 때문에 blurry로 오분류됐다(event 30 실측, 2026-07-15).
+    손떨림이라면 주 인물까지 전부 뭉개지므로 주 인물만 봐도 놓치지 않는다.
     정렬 crop은 warpAffine 보간이 고주파를 뭉개 variance를 왜곡하므로 blur 판정엔 쓰지 않는다.
 
 이미지 단위 판정은 "얼굴 1개라도 해당하면 그 사진을 분리" 규칙으로 집계한다.
@@ -56,6 +60,10 @@ class QualityConfig:
   # → 판정에서 제외한다. 판정 자격 얼굴이 하나도 없으면 judge_faces가 blurry=None을 반환하고
   # 호출자가 전체 이미지 fallback으로 처리한다.
   min_blur_face_px: int = 64
+  # 흔들림 판정 자격의 상대 크기 하한: 사진에서 가장 큰 얼굴 bbox 폭 대비 이 비율 미만인 얼굴은 주 인물이
+  # 아니라고 보고 blur 판정에서 제외한다. 배경 인물의 아웃포커스가 선명한 사진을 blurry로 오분류하는 것
+  # 방지 (event 30 실측: 주 인물 variance 62~157 선명, 배경 얼굴 9.2·18.5로 오탐). 0 = 비활성(모든 얼굴 판정).
+  blur_main_face_ratio: float = 0.5
   # 얼굴 미검출 시 전체 이미지 Laplacian variance로 흔들림을 판정하는 fallback 임계값 (완전 흔들려
   # 얼굴 검출조차 실패한 사진 구제). 얼굴 crop과 측정 스케일이 달라 별도 설정값이다 — 실측에서 완전
   # 흔들린 전체 이미지는 variance ~1~7(선명 300+)로 폭락하나, 단순한 선명 장면(민무늬 벽 등)은 낮게
@@ -73,6 +81,8 @@ class QualityConfig:
       raise ValueError(f"blur_threshold는 양수여야 합니다. 받은 값: {self.blur_threshold}")
     if self.min_blur_face_px <= 0:
       raise ValueError(f"min_blur_face_px는 양수여야 합니다. 받은 값: {self.min_blur_face_px}")
+    if not 0.0 <= self.blur_main_face_ratio <= 1.0:
+      raise ValueError(f"blur_main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.blur_main_face_ratio}")
     if self.whole_image_blur_threshold <= 0.0:
       raise ValueError(f"whole_image_blur_threshold는 양수여야 합니다. 받은 값: {self.whole_image_blur_threshold}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
@@ -197,9 +207,16 @@ def judge_faces(
 
   "얼굴 1개라도" 규칙: 어느 한 얼굴이라도 양눈 감김이면 eyes_closed, 어느 한 얼굴이라도 blur면 blurry.
   양눈이 모두 잡히는 얼굴만 눈감음 후보다 — 옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정.
-  blurry는 판정 자격 얼굴(bbox 짧은 변 ≥ min_blur_face_px)이 하나도 없으면 None — 얼굴 미검출과 같은
-  "얼굴로는 알 수 없음"이므로 호출자가 전체 이미지 fallback으로 판정한다.
+  blurry는 주 인물 얼굴만 본다 — 판정 자격은 bbox 짧은 변 ≥ min_blur_face_px 그리고 bbox 폭이 사진 내
+  가장 큰 얼굴 폭의 blur_main_face_ratio 이상. 배경 인물의 아웃포커스는 흔들림 증거가 아니다(모듈 주석).
+  판정 자격 얼굴이 하나도 없으면 None — 얼굴 미검출과 같은 "얼굴로는 알 수 없음"이므로 호출자가
+  전체 이미지 fallback으로 판정한다.
   """
+  widest = max(
+    (crop.shape[1] for _, crop in faces if crop is not None and crop.size > 0),
+    default=0,
+  )
+  min_main_width = config.blur_main_face_ratio * widest
   eyes_closed = False
   blurry: bool | None = None
   for aligned, bbox_crop in faces:
@@ -210,7 +227,7 @@ def judge_faces(
         if all(prob >= config.eye_closed_confidence for prob in probs):
           eyes_closed = True
     if blurry is not True and bbox_crop is not None and bbox_crop.size > 0:
-      if min(bbox_crop.shape[:2]) >= config.min_blur_face_px:
+      if min(bbox_crop.shape[:2]) >= config.min_blur_face_px and bbox_crop.shape[1] >= min_main_width:
         blurry = face_blur_variance(bbox_crop) < config.blur_threshold
     if eyes_closed and blurry:
       break  # 둘 다 확정되면 나머지 얼굴은 볼 필요 없다
@@ -239,21 +256,25 @@ if __name__ == "__main__":
 
     detected = detector.detect(image)
     faces: list[FacePair] = []
-    for i, face in enumerate(detected):
+    for face in detected:
       x, y, bw, bh = face.bbox
-      bbox_crop = image[y : y + bh, x : x + bw]
-      aligned = align_face(image, face.landmarks)
-      faces.append((aligned, bbox_crop))
+      faces.append((align_face(image, face.landmarks), image[y : y + bh, x : x + bw]))
 
+    widest = max((crop.shape[1] for _, crop in faces if crop.size > 0), default=0)
+    for i, (aligned, bbox_crop) in enumerate(faces):
       probs: list[float] = []
       if aligned is not None:
         eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
         if all(crop is not None for crop in eye_crops):
           probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]
       var = face_blur_variance(bbox_crop) if bbox_crop.size else float("nan")
-      qualified = bbox_crop.size > 0 and min(bbox_crop.shape[:2]) >= config.min_blur_face_px
+      note = ""
+      if not (bbox_crop.size > 0 and min(bbox_crop.shape[:2]) >= config.min_blur_face_px):
+        note = " (극소 얼굴 — blur 판정 제외)"
+      elif bbox_crop.shape[1] < config.blur_main_face_ratio * widest:
+        note = " (배경 얼굴 — blur 판정 제외)"
       probs_str = ", ".join(f"{p:.3f}" for p in probs) if probs else "n/a"
-      note = "" if qualified else " (극소 얼굴 — blur 판정 제외)"
+      bh, bw = bbox_crop.shape[:2]
       print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}] blur_var={var:.1f}{note}")
 
     eyes_closed, blurry = judge_faces(faces, classifier, config)
