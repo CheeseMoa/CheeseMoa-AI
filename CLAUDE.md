@@ -32,6 +32,8 @@ face_align(직접 구현 Umeyama, 112×112 ArcFace 기준점) →
 AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Laplacian, 토글 ON시 eyes_closed/blurry로 분리·
 재군집 제외) → HDBSCAN(PoC numpy 이식본, cosine, epsilon=0.15, event 전체 임베딩 재군집) → cluster_id 재조정
 (overlap 매칭으로 번호 승계, 사용자 보정은 제약) → SQS 결과 큐 발행 / event `.npz` 갱신.
+classify 처리 중에는 이미지 루프 도중 처리 장수를 별도 progress 큐로도 발행해 백엔드가 분류
+진행바를 그린다(CHMO-274, 큐 미설정 시 비활성 — [message-examples §⑤](docs/spec/message-examples.md)).
 
 ### 핵심 설계 결정사항
 
@@ -258,6 +260,13 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **분류 진행률 SQS 발행 — job 내부 진행바** (2026-07-16, CHMO-274) — classify가 결과 1건만 끝에
+  발행해 백엔드·앱이 처리 중 진행도를 알 수 없던 문제. `_handle_classify`의 이미지 루프(job 비용의
+  사실상 전부)에서 처리 장수를 별도 progress 큐로 흘려보낸다: 루프 진입 시 `0/total` 1회 + 이후
+  3장마다(`_PROGRESS_REPORT_EVERY`) + 마지막 `total/total`. `processed`가 단조 증가해 백엔드가 순서·중복·재전달을
+  방어(마지막 본 값 이하 버림). best-effort(발행 실패가 job을 안 죽임), progress 큐 URL 미설정 시
+  비활성. `ProgressUpdate`(messages.py)·`SqsProgressPublisher`(publisher.py)·`report_progress` 콜백
+  주입(handlers·deps). Spring의 큐 소비·메모리 보관·FE 폴링은 이 레포 밖(백엔드 담당).
 - **파편병합 face-level 응집 게이트 — 아동 교차연령 오병합 해소** (2026-07-16, CHMO-269,
   [ADR 016](docs/decisions/016-merge-facepair-cohesion-gate.md)) — event 35에서 서로 다른 아이 30장이
   한 앨범으로 뭉치던 문제. 원인은 검출·해상도가 아니라 파편병합이 **centroid**로 판정하는데 아동

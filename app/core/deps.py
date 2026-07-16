@@ -12,13 +12,14 @@ from dataclasses import dataclass
 import boto3
 
 from app.core.config import Settings
-from app.handlers import ExtractedFaces, FaceExtractor, JobHandlers
+from app.handlers import ExtractedFaces, FaceExtractor, JobHandlers, ProgressReporter
 from app.messaging.consumer import MessageConsumer, SqsConsumer
-from app.messaging.publisher import ResultPublisher, SqsPublisher
+from app.messaging.publisher import ResultPublisher, SqsProgressPublisher, SqsPublisher
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
 from app.pipeline.embed import EmbedConfig, FaceEmbedder
 from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces, shake_signals
+from app.schemas.messages import ProgressUpdate
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
 
@@ -81,6 +82,22 @@ def build_face_extractor(
   return extract_faces
 
 
+def _build_progress_reporter(sqs_client, progress_queue_url: str | None) -> ProgressReporter | None:
+  """진행률 발행 리포터를 만든다 (CHMO-274) — 큐 URL이 없으면 None(발행 비활성).
+
+  핸들러는 (job_id, event_id, processed, total)만 넘긴다 — ProgressUpdate 조립·SQS 발행은 여기서
+  가둔다(관심사 분리). 발행 자체는 SqsProgressPublisher가 best-effort로 삼킨다.
+  """
+  if not progress_queue_url:
+    return None
+  publisher = SqsProgressPublisher(sqs_client, progress_queue_url)
+
+  def report(job_id: str, event_id: str, processed: int, total: int) -> None:
+    publisher.publish(ProgressUpdate(job_id=job_id, event_id=event_id, processed=processed, total=total))
+
+  return report
+
+
 def _available_cores() -> int:
   """이 프로세스가 실제로 쓸 수 있는 코어 수.
 
@@ -121,6 +138,7 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
       detector, embedder, eye_classifier, settings.to_quality_config(), align_antialias=settings.align_antialias
     ),
     cluster_config=settings.to_cluster_config(),
+    report_progress=_build_progress_reporter(sqs_client, settings.progress_queue_url),
   )
   return WorkerDeps(
     consumer=SqsConsumer(sqs_client, settings.inbound_queue_url, settings.sqs_wait_time_seconds),
@@ -138,7 +156,11 @@ def check_readiness(settings: Settings) -> None:
   """
   sqs_client = boto3.client("sqs", region_name=settings.aws_region)
   s3_client = boto3.client("s3", region_name=settings.aws_region)
-  for queue_url in (settings.inbound_queue_url, settings.result_queue_url):
+  # progress 큐는 선택 — 미설정(비활성)이면 확인 대상에서 뺀다 (CHMO-274)
+  queue_urls = [settings.inbound_queue_url, settings.result_queue_url]
+  if settings.progress_queue_url:
+    queue_urls.append(settings.progress_queue_url)
+  for queue_url in queue_urls:
     sqs_client.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])
   for bucket in (settings.embeddings_bucket, settings.images_bucket):
     s3_client.head_bucket(Bucket=bucket)

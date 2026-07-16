@@ -168,7 +168,8 @@ def _run_smoke() -> None:
 
   from app.handlers import ExtractedFaces, JobHandlers
   from app.messaging.consumer import InMemoryConsumer
-  from app.messaging.publisher import InMemoryPublisher
+  from app.messaging.publisher import InMemoryProgressPublisher, InMemoryPublisher
+  from app.schemas.messages import ProgressUpdate
   from app.storage.embedding_store import InMemoryEmbeddingStore
   from app.storage.event_embeddings import EMBED_DIM
   from app.storage.image_source import InMemoryImageSource
@@ -207,6 +208,11 @@ def _run_smoke() -> None:
   # "event-폭발"의 .npz를 손상시켜 두면 해당 classify가 StoreCorruptionError로 작업 전체 실패한다
   store.blobs["event-폭발"] = b"\x00\x01\x02"
 
+  progress_publisher = InMemoryProgressPublisher()
+
+  def report_progress(job_id: str, event_id: str, processed: int, total: int) -> None:
+    progress_publisher.publish(ProgressUpdate(job_id=job_id, event_id=event_id, processed=processed, total=total))
+
   handlers = JobHandlers(
     store=store,
     images=InMemoryImageSource(
@@ -218,6 +224,7 @@ def _run_smoke() -> None:
       }
     ),
     extract_faces=fake_extractor,
+    report_progress=report_progress,
   )
 
   ok_body = json.dumps(
@@ -271,6 +278,20 @@ def _run_smoke() -> None:
     sum(1 for result in publisher.published if result.job_id == "job-폭발") == 1,
   )
   check("손상 .npz는 덮어쓰이지 않고 보존", store.blobs["event-폭발"] == b"\x00\x01\x02")
+
+  # 진행률 발행 (CHMO-274): "job-정상"(이미지 4장)은 루프 전 0/4 + 3장마다(3/4) + 마지막(4/4) 발행돼
+  # processed가 [0, 3, 4]로 단조 증가하고 total에 도달한다 (_PROGRESS_REPORT_EVERY=3).
+  normal_progress = [p for p in progress_publisher.published if p.job_id == "job-정상"]
+  check(
+    "정상 job: 진행률 3장마다 발행 + 0/total 시작 + total 도달",
+    [p.processed for p in normal_progress] == [0, 3, 4]
+    and all(p.total == 4 for p in normal_progress)
+    and all(a.processed < b.processed for a, b in zip(normal_progress, normal_progress[1:])),
+  )
+  check(
+    "포이즌 job은 진행률 미발행 (파싱 전 거부)",
+    not any(p.job_id == "job-포이즌" for p in progress_publisher.published),
+  )
 
   worker.request_stop()
   check("종료 플래그 후 run()은 즉시 반환", (worker.run() or True) and worker._stop_requested)
