@@ -291,6 +291,35 @@ class ClassifyResult(_MessageBase):
   retired_cluster_ids: list[Id] = Field(default_factory=list)
 
 
+# ── 아웃바운드 진행률 (progress) ────────────────────────────────────────────────
+# 결과 큐가 아니라 별도 progress 큐로 발행한다 (CHMO-274). classify_request 처리는 이미지 루프가
+# job 비용의 사실상 전부라(임베딩 ≈476ms/장), 워커가 그 루프 도중 처리 장수를 여러 번 흘려보내
+# 백엔드가 분류 진행바를 그린다. ClassifyResult와 큐를 나누는 이유: 결과 큐는 "type 판별 필드가
+# 없다"가 전제(위 §아웃바운드 분류 결과 註)라 여기에 섞을 수 없어, 이 메시지는 type을 갖는다.
+
+
+class ProgressUpdate(_MessageBase):
+  """분류 작업 진행률 1건 — progress 큐 전용 (CHMO-274).
+
+  processed는 이 job 안에서 단조 증가한다(0 → … → total). SQS는 표준 큐에서 순서를 보장하지 않고
+  at-least-once라, 백엔드는 processed를 순서·중복·재전달 방어 키로 쓴다 — 마지막으로 본 값 이하의
+  메시지는 버리면 진행바가 거꾸로 튀지 않는다(job 재시도로 0부터 다시 발행돼도 안전). 그래서 별도
+  seq 필드를 두지 않는다 — processed가 곧 순서 키다.
+  """
+
+  type: Literal["progress"] = "progress"
+  job_id: Id
+  event_id: Id
+  processed: Annotated[int, Field(ge=0)]  # 지금까지 처리(루프 통과)한 이미지 수
+  total: Annotated[int, Field(ge=1)]  # 이 job의 전체 이미지 수 (진행률 분모)
+
+  @model_validator(mode="after")
+  def _reject_overrun(self) -> "ProgressUpdate":
+    if self.processed > self.total:
+      raise ValueError(f"processed는 total을 넘을 수 없습니다. processed={self.processed} total={self.total}")
+    return self
+
+
 if __name__ == "__main__":
   # SQS/워커 없이 wire 계약 자체를 자가 검증한다 (cluster.py __main__과 같은 실행형 확인 패턴).
   # 성공 픽스처는 docs/spec/message-examples.md의 예시와 동일 형태를 유지한다.
@@ -415,6 +444,20 @@ if __name__ == "__main__":
   )
   check("failed 결과 최소 구성", ClassifyResult(job_id="job-9", status="failed").clusters == [])
 
+  progress = ProgressUpdate(job_id="job-1", event_id="event-1", processed=30, total=300)
+  check(
+    "progress 직렬화 라운드트립 + type 동봉",
+    ProgressUpdate.model_validate_json(progress.model_dump_json()) == progress
+    and '"type":"progress"' in progress.model_dump_json().replace(" ", ""),
+  )
+  check(
+    "progress 경계값 (0/total, total/total)",
+    (
+      ProgressUpdate(job_id="j", event_id="e", processed=0, total=1).processed == 0
+      and ProgressUpdate(job_id="j", event_id="e", processed=5, total=5).processed == 5
+    ),
+  )
+
   invalid_cases = [
     ("type 누락", {key: value for key, value in classify_body.items() if key != "type"}),
     ("미지 type", {**classify_body, "type": "unknown_request"}),
@@ -482,5 +525,16 @@ if __name__ == "__main__":
     check("거부: 대표벡터 NaN", True)
   else:
     raise SystemExit("실패: 대표벡터 NaN — ValidationError가 발생해야 하는데 통과됨")
+
+  for case_name, kwargs in [
+    ("progress total=0", {"job_id": "j", "event_id": "e", "processed": 0, "total": 0}),
+    ("progress processed>total", {"job_id": "j", "event_id": "e", "processed": 4, "total": 3}),
+  ]:
+    try:
+      ProgressUpdate(**kwargs)
+    except ValidationError:
+      check(f"거부: {case_name}", True)
+    else:
+      raise SystemExit(f"실패: {case_name} — ValidationError가 발생해야 하는데 통과됨")
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
