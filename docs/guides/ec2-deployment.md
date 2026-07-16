@@ -60,6 +60,34 @@ EC2 접속은 SSH가 아니라 **SSM**을 쓴다(포트 개방·키 불필요). 
 aws ssm start-session --target i-09037b55ec32ab0ea --profile cheesemoa --region ap-northeast-2
 ```
 
+### `.env` (설정 주입)
+
+컨테이너 설정은 EC2 박스에만 있는 **수동 관리 파일** `/home/ec2-user/cheesemoa-ai/.env`를 `docker run
+--env-file`로 통째로 주입한다. 이 파일은 git·CI에 없고 자동 배포도 건드리지 않는다(이미지 코드만
+갱신, `.env`는 그대로 재사용) — **설정을 바꾸려면 여기를 직접 고치고 컨테이너를 재기동**해야 한다.
+형식은 `.env.example` 참고. AWS 자격증명은 넣지 않는다(인스턴스 롤이 공급, 함정 2번).
+
+| 키 | 필수 | 설명 |
+|---|---|---|
+| `INBOUND_QUEUE_URL` | 필수 | 분류 요청 FIFO 큐 (`CheeseMoa-cluster-request.fifo`) |
+| `RESULT_QUEUE_URL` | 필수 | 분류 결과 큐 (`CheeseMoa-cluster-response.fifo`) |
+| `EMBEDDINGS_BUCKET` | 필수 | event `.npz` 버킷 |
+| `IMAGES_BUCKET` | 필수 | 원본 이미지 버킷 (Spring 소유) |
+| `PROGRESS_QUEUE_URL` | 선택 | **분류 진행률 큐** (`cheesemoa-cluster-progress`, CHMO-274). **미설정이면 진행률 발행이 조용히 비활성**(no-op)이라 job은 정상 처리되지만 진행바 메시지가 0건 나간다 — 진행률이 안 보이면 이 줄부터 확인할 것. Spring이 실제로 소비하는 큐 이름과 일치시킬 것(다른 큐는 `CheeseMoa-cluster-*` 대문자라 명명이 섞여 있으니 주의). |
+
+진행률만 켜는 예 (SSM 접속 상태에서, docker는 `sudo` 필요):
+
+```bash
+echo 'PROGRESS_QUEUE_URL=https://sqs.ap-northeast-2.amazonaws.com/889918307386/cheesemoa-cluster-progress' \
+  | sudo tee -a /home/ec2-user/cheesemoa-ai/.env
+sudo tail -3 /home/ec2-user/cheesemoa-ai/.env   # 새 줄이 앞 값에 붙지 않고 독립 줄인지 확인
+```
+
+**`docker restart`로는 적용되지 않는다.** `--env-file`은 `docker run`(컨테이너 생성) 시점에만 읽히고
+환경변수는 컨테이너에 박제된다 — restart는 기존 설정을 그대로 재사용하므로 `.env` 변경이 반영되지
+않는다. **설정을 바꿨으면 컨테이너를 재생성**해야 한다(아래 "컨테이너 기동"의 `docker rm -f` +
+`docker run` 재실행 = `--env-file` 재독). 이미지는 이미 박스에 있어 pull 없이 재생성만 하면 된다.
+
 컨테이너 기동:
 
 ```bash
