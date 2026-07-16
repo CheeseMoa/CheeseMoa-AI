@@ -33,6 +33,15 @@ DEFAULT_MIN_FACE_REL_WIDTH = 0.025
 # 제거한다. 이 미만 AND 종횡비 미만이면 제거.
 DEFAULT_FP_SCORE_THRESHOLD = 0.78
 DEFAULT_FP_ASPECT_THRESHOLD = 0.70  # 종횡비 = bbox 폭/높이 (w/h)
+# 대형 근접 얼굴 재검출 회복 (ADR-017): YuNet은 WIDER FACE(작은 얼굴)로 학습돼 초근접 대형 얼굴에
+# 낮은 score를 주고(실측 최저 0.22), score gate 0.6에 걸려 사라진다 → 공통 사진첩 직행. 크기(rel_w)
+# 하한을 넘는 저score 후보를 "정규 크기로 축소해 재검출"하고, 재검출 score가 이 값 이상이면 되살린다.
+# 실얼굴은 너무 커서 저score였을 뿐이라 정규 스케일에서 score가 오르지만(median 0.44), 진짜 오검출
+# (아웃포커스 배경·신체일부)은 어느 스케일에서도 낮다(median 0.00) — score·선명도로는 안 갈리지만
+# 재검출은 깨끗이 가른다(재검출≥0.80에서 실얼굴 회복·오검출 0/41, survey 2026-07-16).
+DEFAULT_BIG_FACE_REL_WIDTH = 0.30  # 이 rel_w(bbox폭/긴변) 이상의 저score 얼굴만 재검출 회복 대상
+DEFAULT_BIG_FACE_REDETECT_SCORE = 0.80  # 정규 스케일 재검출 score가 이 이상이면 실얼굴로 보고 회복
+_BIG_FACE_MODEL_FLOOR = 0.2  # 회복 활성 시 YuNet 모델 score 바닥 — 저score 대형 후보를 표면화 (실측 최저 0.22 포섭)
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
 _BBOX_SLICE = slice(0, 4)  # face[0:4]  = x, y, w, h
@@ -41,6 +50,11 @@ _SCORE_IDX = 14  # face[14]   = 신뢰도
 _REFINE_MATCH_IOU = 0.3  # 재검출 결과가 원 얼굴과 같은 얼굴인지 판정하는 하한 (미달 시 원 랜드마크 유지)
 _REFINE_MIN_CROP_SIDE = 32  # 리사이즈된 크롭이 이보다 작으면 재검출 의미가 없어 건너뜀
 _REFINE_MAX_SHIFT_RATIO = 0.5  # 정상 지터는 얼굴폭 15.8% 이내 — 이보다 크면 오매칭으로 보고 폐기
+_DEDUP_IOU = 0.5  # 회복된 대형 후보가 같은 얼굴을 중복 검출할 때 억제하는 bbox IoU 하한 (ADR-017)
+# 회복 박스 디둡의 랜드마크 중심 근접 하한(얼굴폭 대비). 저바닥에서 한 대형 얼굴이 offset 박스로
+# 여러 개 되살아나면 bbox IoU는 낮아도(~0.2) 정제 랜드마크는 같은 얼굴을 가리킨다 — 중심 거리가
+# 이 비율×얼굴폭 미만이면 같은 얼굴로 본다. 서로 다른 얼굴의 중심은 대개 1얼굴폭 이상 떨어져 안전.
+_DEDUP_LANDMARK_RATIO = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +92,10 @@ class DetectorConfig:
   # 둘 중 하나만 0이면 (score < S AND aspect < A)가 항상 거짓 → 필터 전체 비활성.
   fp_score_threshold: float = DEFAULT_FP_SCORE_THRESHOLD
   fp_aspect_threshold: float = DEFAULT_FP_ASPECT_THRESHOLD
+  # 대형 근접 얼굴 재검출 회복 (ADR-017): rel_w가 이 값 이상인 저score(<score_threshold) 얼굴을
+  # 정규 스케일 재검출해 score가 big_face_redetect_score 이상이면 되살린다. 둘 중 하나라도 0이면 비활성.
+  big_face_rel_width: float = DEFAULT_BIG_FACE_REL_WIDTH
+  big_face_redetect_score: float = DEFAULT_BIG_FACE_REDETECT_SCORE
 
   def __post_init__(self) -> None:
     # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
@@ -95,6 +113,10 @@ class DetectorConfig:
       raise ValueError(f"fp_score_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.fp_score_threshold}")
     if self.fp_aspect_threshold < 0.0:
       raise ValueError(f"fp_aspect_threshold는 0 이상이어야 합니다. 받은 값: {self.fp_aspect_threshold}")
+    if not 0.0 <= self.big_face_rel_width < 1.0:
+      raise ValueError(f"big_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.big_face_rel_width}")
+    if not 0.0 <= self.big_face_redetect_score <= 1.0:
+      raise ValueError(f"big_face_redetect_score는 [0, 1] 범위여야 합니다. 받은 값: {self.big_face_redetect_score}")
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -144,11 +166,22 @@ class FaceDetector:
     resolved_config = config or DetectorConfig()
     source = resolved_config.model_source or default_yunet_source()
     model_path = source.resolve()  # 생성 시 모델을 1회만 로딩
+    self._score_threshold = resolved_config.score_threshold  # 기본(정상 크기 얼굴) score gate
+    # 대형 근접 얼굴 재검출 회복(ADR-017) 활성 시, 모델 score 바닥을 내려 저score 대형 후보를
+    # 표면화한다 — 실제 keep/drop은 detect()가 정규 스케일 재검출로 판정한다(모델 gate는 후보 노출용).
+    self._big_face_enabled = resolved_config.big_face_rel_width > 0.0 and resolved_config.big_face_redetect_score > 0.0
+    self._big_face_rel_width = resolved_config.big_face_rel_width
+    self._big_face_redetect_score = resolved_config.big_face_redetect_score
+    model_score_threshold = (
+      min(resolved_config.score_threshold, _BIG_FACE_MODEL_FLOOR)
+      if self._big_face_enabled
+      else resolved_config.score_threshold
+    )
     self._detector = cv2.FaceDetectorYN.create(
       model=model_path,
       config="",
       input_size=_YUNET_INIT_SIZE,
-      score_threshold=resolved_config.score_threshold,
+      score_threshold=model_score_threshold,
       nms_threshold=resolved_config.nms_threshold,
       top_k=resolved_config.top_k,
     )
@@ -179,30 +212,49 @@ class FaceDetector:
 
     inv = 1.0 / scale
     # 배경 인물 필터의 기준은 원본 좌표계 bbox 폭 — 검출용 축소(max_side)와 무관하게 동작한다
-    min_face_w_px = self._min_face_rel_width * max(h, w)
-    faces: list[DetectedFace] = []
+    long_side = max(h, w)
+    min_face_w_px = self._min_face_rel_width * long_side
+    confident: list[DetectedFace] = []
+    pending: list[DetectedFace] = []  # 저score 대형 후보 — 정규 스케일 재검출로 keep/drop 판정 (ADR-017)
     for row in raw:
       face = self._to_detected_face(row, inv, w, h)
-      if face is not None and face.bbox[2] >= min_face_w_px and not self._is_large_false_positive(face):
-        faces.append(face)
-    if self._refine_landmarks:
-      # 본검출 raw 순회가 끝난 뒤에 정제를 시작한다 — _refine_face의 setInputSize/detect 재호출이
-      # 위 검출 상태를 덮어쓰므로 순서를 바꾸면 안 된다. 축소본 frame이 아니라 원본 image를 넘겨
-      # max_side 축소를 우회한 원본 해상도 크롭에서 재검출하는 것이 정제의 요점이다.
-      faces = [self._refine_face(image, face) for face in faces]
+      if face is None or face.bbox[2] < min_face_w_px or self._is_large_false_positive(face):
+        continue
+      if face.score >= self._score_threshold:
+        confident.append(face)
+      elif self._big_face_enabled and face.bbox[2] >= self._big_face_rel_width * long_side:
+        pending.append(face)
+      # else: 정상 크기 저score → 폐기 (모델 gate가 회복 활성 시 바닥까지 내려가 여기 도달)
+
+    # 정제·회복은 raw 순회 종료 후에 시작한다 — _refine_face/_recover_large_face의 setInputSize/detect
+    # 재호출이 위 검출 상태를 덮어쓰므로 순서를 바꾸면 안 된다. 축소본 frame이 아니라 원본 image를 넘겨
+    # max_side 축소를 우회한 원본 해상도 크롭에서 재검출한다.
+    faces = [self._refine_face(image, face) for face in confident] if self._refine_landmarks else list(confident)
+    if self._big_face_enabled and pending:
+      # 회복 후보를 재검출 판정한 뒤, 이미 확정된 얼굴(confident)이나 먼저 채택된 회복 얼굴과 중복이
+      # 아닌 것만 추가한다. confident는 절대 억제하지 않아 기존 검출 동작을 보존한다. score 내림차순
+      # 처리로 같은 얼굴의 여러 offset 박스 중 최상 박스를 남긴다.
+      recovered = sorted(
+        (f for f in (self._recover_large_face(image, p) for p in pending) if f is not None),
+        key=lambda f: f.score,
+        reverse=True,
+      )
+      for face in recovered:
+        if not self._duplicates_existing(face, faces):
+          faces.append(face)
     return faces
 
-  def _refine_face(self, image: np.ndarray, face: DetectedFace) -> DetectedFace:
-    """대형 얼굴의 랜드마크를 정규 스케일 크롭 재검출로 정제한다. 어떤 실패든 원본 face를 반환한다.
+  def _normal_scale_redetect(self, image: np.ndarray, face: DetectedFace) -> tuple[float, np.ndarray] | None:
+    """얼굴 주변을 잘라 얼굴폭을 정규 폭으로 리사이즈해 재검출한 (score, 원좌표 랜드마크)를 돌려준다.
 
-    YuNet의 학습 분포(작은 얼굴)에 맞게 "얼굴 주변을 잘라 → 얼굴폭을 정규 폭으로 축소 → 재검출"한
-    랜드마크를 원본 좌표계로 되돌린다. bbox·score는 원본을 유지한다 — 정제 목적은 랜드마크뿐이고,
-    bbox는 하류(품질 게이트 크롭)에 이미 전파되는 계약이다.
+    YuNet 학습 분포(작은 얼굴) 밖의 대형 얼굴을 정규 스케일로 되돌려 재검출한다 — 랜드마크 정제
+    (_refine_face)와 저score 대형 후보의 실얼굴 판정(_recover_large_face) 공용 코어. IoU로 원 얼굴과
+    같은 얼굴을 고르고(크롭에 걸친 옆 사람 배제), 미검출·크롭 실패·오매칭이면 None. score는 재검출
+    결과의 신뢰도(정규 스케일이라 원 저score보다 신뢰할 만하다)다.
     """
     x, y, w, h = face.bbox
-    if w <= self._refine_norm_face_width:
-      return face  # 정규 폭 이하 얼굴은 학습 분포 안이라 문제없고, 확대 재검출은 비용만 든다
-
+    if w <= 0 or h <= 0:
+      return None
     # bbox에 여유 마진을 두고 원본에서 크롭한다 (경계 클램프는 마진만 깎을 뿐 얼굴 자체는 보존)
     margin = max(w, h) * self._refine_margin_ratio
     cx0 = max(0, int(x - margin))
@@ -210,35 +262,84 @@ class FaceDetector:
     cx1 = min(image.shape[1], int(x + w + margin))
     cy1 = min(image.shape[0], int(y + h + margin))
     if cx1 <= cx0 or cy1 <= cy0:
-      return face
-
-    # 얼굴폭이 정규 폭이 되도록 축소 — INTER_AREA는 박스필터 저역통과를 내장해 별도 프리블러가 불필요
-    r = self._refine_norm_face_width / w  # 게이트(w > 정규 폭)로 r < 1 보장
-    resized = cv2.resize(image[cy0:cy1, cx0:cx1], None, fx=r, fy=r, interpolation=cv2.INTER_AREA)
+      return None
+    # 얼굴폭이 정규 폭이 되도록 스케일한다. 축소는 INTER_AREA(박스필터 저역통과 내장), 확대(작은 이미지의
+    # 대형 얼굴)는 INTER_LINEAR. 회복 경로는 정규 폭 미만 얼굴도 재검출해야 하므로 확대를 허용한다.
+    r = self._refine_norm_face_width / w
+    interp = cv2.INTER_AREA if r < 1.0 else cv2.INTER_LINEAR
+    resized = cv2.resize(image[cy0:cy1, cx0:cx1], None, fx=r, fy=r, interpolation=interp)
     rh, rw = resized.shape[:2]
     if min(rh, rw) < _REFINE_MIN_CROP_SIDE:
-      return face
+      return None
 
     self._detector.setInputSize((rw, rh))
     _, raw = self._detector.detect(resized)
     if raw is None or len(raw) == 0:
-      return face
+      return None
 
-    # 재검출 후보 중 원 얼굴과 같은 얼굴을 IoU로 고른다 — score argmax는 크롭에 걸친 옆 사람을
-    # 잡을 수 있다. 미검출·다인 크롭 케이스를 이 한 경로로 처리한다.
     ref_bbox = ((x - cx0) * r, (y - cy0) * r, w * r, h * r)  # 원 bbox를 크롭-리사이즈 좌표계로 변환
     best_row = max(raw, key=lambda row: _bbox_iou(ref_bbox, tuple(row[_BBOX_SLICE])))
     if _bbox_iou(ref_bbox, tuple(best_row[_BBOX_SLICE])) < _REFINE_MATCH_IOU:
-      return face
+      return None
+    score = float(best_row[_SCORE_IDX])
+    landmarks = (best_row[_LMK_SLICE].reshape(_NUM_LANDMARKS, 2) / r + np.array([cx0, cy0])).astype(np.float32)
+    if not np.isfinite(landmarks).all() or not np.isfinite(score):
+      return None
+    return score, landmarks
 
-    refined = (best_row[_LMK_SLICE].reshape(_NUM_LANDMARKS, 2) / r + np.array([cx0, cy0])).astype(np.float32)
-    if not np.isfinite(refined).all():
+  def _refine_face(self, image: np.ndarray, face: DetectedFace) -> DetectedFace:
+    """대형 얼굴의 랜드마크를 정규 스케일 크롭 재검출로 정제한다. 어떤 실패든 원본 face를 반환한다.
+
+    bbox·score는 원본을 유지한다 — 정제 목적은 랜드마크뿐이고, bbox는 하류(품질 게이트 크롭)에 이미
+    전파되는 계약이다.
+    """
+    x, y, w, h = face.bbox
+    if w <= self._refine_norm_face_width:
+      return face  # 정규 폭 이하 얼굴은 학습 분포 안이라 문제없고, 확대 재검출은 비용만 든다
+    result = self._normal_scale_redetect(image, face)
+    if result is None:
       return face
+    _, refined = result
     # 정상 지터는 얼굴폭 15.8% 이내 — 그보다 훨씬 큰 이동은 오매칭 폭주로 보고 폐기한다
     if float(np.abs(refined - face.landmarks).max()) > _REFINE_MAX_SHIFT_RATIO * w:
       return face
     refined.flags.writeable = False  # frozen dataclass 출력이 하류에서 변형되지 않도록 보호
     return replace(face, landmarks=refined)
+
+  def _recover_large_face(self, image: np.ndarray, face: DetectedFace) -> DetectedFace | None:
+    """저score 대형 후보를 정규 스케일 재검출로 판정한다 (ADR-017).
+
+    YuNet이 학습 분포 밖 대형 얼굴에 낮은 score를 주는 약점 때문에 score gate에서 사라진 실얼굴을,
+    정규 스케일 재검출 score가 임계 이상이면 되살린다. 실얼굴은 정규 스케일에서 score가 오르지만
+    오검출(아웃포커스 배경·신체일부)은 어느 스케일에서도 낮다. bbox·score는 원본을 유지하고
+    (하류 계약), 재검출 랜드마크가 정상 지터 범위면 그것으로 정제한다. 임계 미달이면 None(폐기).
+    """
+    result = self._normal_scale_redetect(image, face)
+    if result is None:
+      return None
+    score, refined = result
+    if score < self._big_face_redetect_score:
+      return None  # 재검출에서도 저score → 오검출로 폐기
+    if float(np.abs(refined - face.landmarks).max()) <= _REFINE_MAX_SHIFT_RATIO * face.bbox[2]:
+      refined.flags.writeable = False
+      return replace(face, landmarks=refined)
+    return face  # 실얼굴이나 랜드마크 매칭이 불안정 → 원 랜드마크 유지하고 얼굴은 살린다
+
+  def _duplicates_existing(self, face: DetectedFace, existing: list[DetectedFace]) -> bool:
+    """회복된 face가 이미 채택된 얼굴 중 하나와 같은 얼굴인지 판정한다 (ADR-017 디둡).
+
+    bbox IoU가 높거나(_DEDUP_IOU), 정제 랜드마크 중심 거리가 얼굴폭의 _DEDUP_LANDMARK_RATIO 미만이면
+    같은 얼굴이다 — 저바닥에서 한 대형 얼굴이 offset 박스로 여러 개 되살아나면 IoU는 낮아도 랜드마크는
+    같은 얼굴을 가리키므로 두 신호를 함께 본다.
+    """
+    center = face.landmarks.mean(axis=0)
+    for other in existing:
+      if _bbox_iou(face.bbox, other.bbox) >= _DEDUP_IOU:
+        return True
+      scale = min(face.bbox[2], other.bbox[2])
+      if scale > 0 and float(np.hypot(*(center - other.landmarks.mean(axis=0)))) < _DEDUP_LANDMARK_RATIO * scale:
+        return True
+    return False
 
   def _is_large_false_positive(self, face: DetectedFace) -> bool:
     """score와 종횡비(w/h)가 동시에 낮은 대형 오검출인지 판정한다 (survey 2026-07-15)."""

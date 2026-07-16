@@ -80,6 +80,11 @@ class Settings(BaseSettings):
   # 0이면 (score·종횡비가 음수 불가라 조건이 항상 거짓) 필터 전체 비활성.
   detect_fp_score_threshold: float = 0.78
   detect_fp_aspect_threshold: float = 0.70
+  # 대형 근접 얼굴 재검출 회복 (ADR-017): rel_w가 이 값 이상인 저score 얼굴을 정규 스케일로 재검출해
+  # score가 아래 값 이상이면 되살린다 — YuNet이 초근접 대형 얼굴에 저score를 줘 공통첩으로 빠지던 문제.
+  # 둘 중 하나라도 0이면 비활성(기존 검출 동작).
+  detect_big_face_rel_width: float = 0.30
+  detect_big_face_redetect_score: float = 0.80
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
   quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
@@ -130,6 +135,8 @@ class Settings(BaseSettings):
       min_face_rel_width=self.detect_min_face_rel_width,
       fp_score_threshold=self.detect_fp_score_threshold,
       fp_aspect_threshold=self.detect_fp_aspect_threshold,
+      big_face_rel_width=self.detect_big_face_rel_width,
+      big_face_redetect_score=self.detect_big_face_redetect_score,
     )
 
   def to_quality_config(self) -> "QualityConfig":
