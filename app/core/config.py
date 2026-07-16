@@ -29,6 +29,10 @@ class Settings(BaseSettings):
   # ── AWS 주소 (미정 — 확정 시 .env/배포 환경변수에 실값 주입) ──────────────────
   inbound_queue_url: str  # 단일 FIFO 인바운드 큐 (classify/feedback/delete, messageGroupId=event_id)
   result_queue_url: str  # classify-result 발행 큐
+  # 진행률(progress) 발행 큐 (CHMO-274). 미설정이면 진행률 발행 비활성 — 큐 provisioning 전에
+  # 코드가 배포돼도 안전하게 뜬다 ("0/미설정 = 비활성" 토글 관례). 값이 있으면 classify 처리 중
+  # 처리 장수를 이 큐로 흘려보낸다.
+  progress_queue_url: str | None = None
   embeddings_bucket: str  # event .npz 버킷 — 이 워커가 단일 writer (ADR-007)
   images_bucket: str  # 원본 이미지 버킷 — Spring 소유, 워커는 읽기 전용
   aws_region: str = "ap-northeast-2"

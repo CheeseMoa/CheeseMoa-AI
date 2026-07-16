@@ -156,3 +156,25 @@
 - `status: "failed"`일 때는 `job_id`·`status` 외 전 필드가 빈 리스트일 수 있다.
 - `representative_vector`는 항상 512-dim, NaN/inf 없음.
 - 실패 케이스를 포함한 계약 검증 전체는 `python -m app.schemas.messages`로 실행할 수 있다.
+
+## ⑤ 분류 진행률 — `progress` (AI → Spring, progress 큐, CHMO-274)
+
+`classify_request` 처리 중 워커가 이미지 루프를 도는 **도중** 처리 장수를 이 progress 큐로 여러 번
+발행한다(결과 큐가 아니다). 백엔드는 이 값을 메모리에 들고 있다가 FE 폴링에 분류 진행바로 응답한다.
+progress 큐가 설정되지 않은 배포에서는 이 메시지가 발행되지 않는다(기능 비활성).
+
+```jsonc
+{
+  "type": "progress",                              // 결과 메시지와 큐가 다르지만 판별 필드를 갖는다
+  "job_id": "3f2b9c1e-8d4a-4f6b-9a01-5c7e2d8b4a10", // 요청·결과와 동일한 상관관계 키
+  "event_id": "event-1",
+  "processed": 30,                                 // 지금까지 처리한 이미지 수
+  "total": 300                                     // 이 job의 전체 이미지 수 → 진행률 = processed/total
+}
+```
+
+- 한 job에서 `processed`는 `0 → … → total`로 **단조 증가**한다(루프 진입 시 `0/total` 1회 + 처리
+  3장마다 + 마지막 `total/total`). SQS 표준 큐는 순서 보장이 없고 at-least-once이므로, 백엔드는 `processed`를 순서·중복
+  방어 키로 쓴다 — **마지막으로 본 값 이하의 메시지는 버린다**(job 재시도로 0부터 다시 와도 안전).
+- 진행률은 유실돼도 되는 부수 신호라 발행은 best-effort다(발행 실패가 classify를 죽이지 않는다).
+- `보정(cluster_feedback)`·`삭제(delete_request)`는 이미지 루프가 없어 progress를 발행하지 않는다.

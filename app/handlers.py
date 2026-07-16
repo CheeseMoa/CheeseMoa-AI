@@ -60,6 +60,14 @@ class ExtractedFaces(NamedTuple):
 # detect→align→embed + 품질 판정 합성은 core.deps.build_face_extractor가 만든다.
 FaceExtractor = Callable[[np.ndarray], ExtractedFaces]
 
+# classify 처리 중 진행률 보고 콜백 (job_id, event_id, processed, total) → None (CHMO-274).
+# 핸들러는 ProgressUpdate 스키마·SQS를 모른다 — 발행 배선은 core.deps가 클로저로 주입한다 (관심사 분리).
+ProgressReporter = Callable[[str, str, int, int], None]
+
+# 진행률 발행 간격 — 처리 이미지 이 장수마다 1회 발행한다(루프 진입 시 0/total, 마지막 total/total은
+# 별도로 항상 발행). 진행바를 더 촘촘히/성기게 하려면 이 값을 내리/올린다 (트래픽은 반비례).
+_PROGRESS_REPORT_EVERY = 3
+
 InboundParsed = (
   ClassifyRequest | MergeFeedback | SplitFeedback | ReassignFeedback | ConfirmDistinctFeedback | DeleteRequest
 )
@@ -206,6 +214,7 @@ class JobHandlers:
     cluster_config: ClusterConfig | None = None,
     new_cluster_id: Callable[[], str] | None = None,
     new_face_id: Callable[[], str] | None = None,
+    report_progress: ProgressReporter | None = None,
   ) -> None:
     self._store = store
     self._images = images
@@ -214,6 +223,8 @@ class JobHandlers:
     # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
     self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
     self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
+    # 기본 no-op — progress 큐 미설정 시(또는 스모크) 진행률 발행이 없어도 동작이 같다 (CHMO-274)
+    self._report_progress = report_progress if report_progress is not None else (lambda *_args: None)
 
   def handle(self, message: InboundParsed) -> ClassifyResult:
     """메시지 타입별 핸들러로 분기한다. 예외는 그대로 전파 — 재시도/DLQ 정책은 worker의 몫."""
@@ -228,6 +239,17 @@ class JobHandlers:
 
   # ── classify_request ─────────────────────────────────────────────────────
 
+  def _emit_progress(self, job_id: str, event_id: str, processed: int, total: int) -> None:
+    """진행률을 best-effort로 보고한다 (CHMO-274) — 리포터가 던져도 작업을 죽이지 않는다.
+
+    발행 계층(SqsProgressPublisher)도 자체적으로 예외를 삼키지만, 주입된 리포터가 무엇이든
+    (커스텀 콜백 포함) 진행률 보고가 classify 본류를 깨지 못하도록 여기서 한 겹 더 격리한다.
+    """
+    try:
+      self._report_progress(job_id, event_id, processed, total)
+    except Exception:
+      logger.warning("진행률 보고 실패 job_id=%s %d/%d — 무시하고 진행", job_id, processed, total)
+
   def _handle_classify(self, request: ClassifyRequest) -> ClassifyResult:
     stored = self._store.load(request.event_id) or EventEmbeddings.empty()
     known_photo_ids = set(stored.photo_ids)
@@ -237,7 +259,15 @@ class JobHandlers:
     blurry_images: list[str] = []
     failed_images: list[FailedImage] = []
     new_rows: list[tuple[str, str, np.ndarray]] = []
-    for ref in request.images:
+    # 진행률 발행 (CHMO-274): 이미지 루프가 job 비용의 사실상 전부라 여기서 처리 장수를 흘려보낸다.
+    # 루프 진입 전 0/total 1회 — 백엔드가 즉시 QUEUED→PROCESSING으로 바를 띄우게 한다.
+    total = len(request.images)
+    step = _PROGRESS_REPORT_EVERY
+    self._emit_progress(request.job_id, request.event_id, 0, total)
+    for index, ref in enumerate(request.images):
+      processed = index + 1
+      if processed % step == 0 or processed == total:
+        self._emit_progress(request.job_id, request.event_id, processed, total)
       if ref.image_id in known_photo_ids:
         continue  # 재전달/중복 요청 멱등: 이미 임베딩된 사진은 건너뛴다 (ADR-007 재군집 흐름 3단계)
       try:
@@ -1106,7 +1136,12 @@ if __name__ == "__main__":
   other_vec = np.zeros(512, dtype=np.float32)
   other_vec[1] = 1.0
   auto_event = EventEmbeddings.empty().append_faces(
-    [("f-1", "p-multi", base_vec), ("f-2", "p-multi", dup_vec), ("f-3", "p-multi", other_vec), ("f-4", "p-solo", base_vec)]
+    [
+      ("f-1", "p-multi", base_vec),
+      ("f-2", "p-multi", dup_vec),
+      ("f-3", "p-multi", other_vec),
+      ("f-4", "p-solo", base_vec),
+    ]
   )
   check(
     "같은사진 자동 cannot-link: 타인 쌍만 유도, 이중 검출 쌍·다른 사진 쌍은 제외",
