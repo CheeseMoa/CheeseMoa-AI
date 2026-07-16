@@ -26,6 +26,13 @@ DEFAULT_REFINE_MARGIN_RATIO = 0.75
 # 늘렸다(측정 데이터에서 노이즈 63/121 제거, 앨범 손실 0). 앨범 최소값까지 마진은 1.3배로
 # 얇은 편 — 앨범 사진 누락 리포트가 오면 이 값부터 내려볼 것.
 DEFAULT_MIN_FACE_REL_WIDTH = 0.025
+# 대형 오검출 결합 필터(survey 2026-07-15): 팔짱 낀 팔 등 진짜 얼굴 크기의 오검출은 ADR-013
+# 크기 필터를 통과한다. 단일 축으로는 못 거른다 — 진짜 앨범 얼굴도 score 최저 0.616(초근접
+# 대형)·종횡비(w/h) 최저 0.563(기울인 셀카)까지 내려간다. 그러나 두 축이 동시에 낮은 진짜
+# 얼굴은 없어(score<0.80이면 종횡비 ≥0.76), 결합 규칙이 실사진 앨범 얼굴 손실 0/114로 오검출을
+# 제거한다. 이 미만 AND 종횡비 미만이면 제거.
+DEFAULT_FP_SCORE_THRESHOLD = 0.78
+DEFAULT_FP_ASPECT_THRESHOLD = 0.70  # 종횡비 = bbox 폭/높이 (w/h)
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
 _BBOX_SLICE = slice(0, 4)  # face[0:4]  = x, y, w, h
@@ -67,6 +74,10 @@ class DetectorConfig:
   # 만들어진다. 상대 크기 기준인 이유는 절대 px 기준이 저해상도 업로드(558×418 이미지의 21px
   # 앨범 얼굴 실측)를 자르기 때문. 0.0 = 비활성.
   min_face_rel_width: float = DEFAULT_MIN_FACE_REL_WIDTH
+  # 대형 오검출 결합 필터 (survey 2026-07-15): score와 종횡비가 동시에 낮은 검출만 오검출로 제거.
+  # 둘 중 하나만 0이면 (score < S AND aspect < A)가 항상 거짓 → 필터 전체 비활성.
+  fp_score_threshold: float = DEFAULT_FP_SCORE_THRESHOLD
+  fp_aspect_threshold: float = DEFAULT_FP_ASPECT_THRESHOLD
 
   def __post_init__(self) -> None:
     # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
@@ -80,6 +91,10 @@ class DetectorConfig:
     # 1.0 이상은 모든 얼굴을 제거하는 설정 실수라 생성 시점에 거부한다 (0.0 = 비활성은 허용)
     if not 0.0 <= self.min_face_rel_width < 1.0:
       raise ValueError(f"min_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.min_face_rel_width}")
+    if not 0.0 <= self.fp_score_threshold <= 1.0:
+      raise ValueError(f"fp_score_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.fp_score_threshold}")
+    if self.fp_aspect_threshold < 0.0:
+      raise ValueError(f"fp_aspect_threshold는 0 이상이어야 합니다. 받은 값: {self.fp_aspect_threshold}")
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -139,6 +154,8 @@ class FaceDetector:
     )
     self._max_side = resolved_config.max_side
     self._min_face_rel_width = resolved_config.min_face_rel_width
+    self._fp_score_threshold = resolved_config.fp_score_threshold
+    self._fp_aspect_threshold = resolved_config.fp_aspect_threshold
     self._refine_landmarks = resolved_config.refine_landmarks
     self._refine_norm_face_width = resolved_config.refine_norm_face_width
     self._refine_margin_ratio = resolved_config.refine_margin_ratio
@@ -166,7 +183,7 @@ class FaceDetector:
     faces: list[DetectedFace] = []
     for row in raw:
       face = self._to_detected_face(row, inv, w, h)
-      if face is not None and face.bbox[2] >= min_face_w_px:
+      if face is not None and face.bbox[2] >= min_face_w_px and not self._is_large_false_positive(face):
         faces.append(face)
     if self._refine_landmarks:
       # 본검출 raw 순회가 끝난 뒤에 정제를 시작한다 — _refine_face의 setInputSize/detect 재호출이
@@ -223,6 +240,15 @@ class FaceDetector:
     refined.flags.writeable = False  # frozen dataclass 출력이 하류에서 변형되지 않도록 보호
     return replace(face, landmarks=refined)
 
+  def _is_large_false_positive(self, face: DetectedFace) -> bool:
+    """score와 종횡비(w/h)가 동시에 낮은 대형 오검출인지 판정한다 (survey 2026-07-15)."""
+    # 둘 중 하나라도 0이면 비활성 — 음수 불가라 결합 조건이 항상 거짓이 되는 것과 동치지만
+    # 명시적으로 조기 반환한다.
+    if self._fp_score_threshold <= 0.0 or self._fp_aspect_threshold <= 0.0:
+      return False
+    _, _, bw, bh = face.bbox  # bh > 0 은 _to_detected_face가 보장 → 0 나눗셈 없음
+    return face.score < self._fp_score_threshold and (bw / bh) < self._fp_aspect_threshold
+
   def _to_detected_face(self, row: np.ndarray, inv: float, w: int, h: int) -> DetectedFace | None:
     bbox_f = row[_BBOX_SLICE] * inv
     landmarks = (row[_LMK_SLICE].reshape(_NUM_LANDMARKS, 2) * inv).astype(np.float32)  # 원본 순서 유지
@@ -255,4 +281,5 @@ if __name__ == "__main__":
 
     print(f"{path}: {len(detected)} face(s) in {elapsed_ms:.1f} ms")
     for face in detected:
-      print(f"  bbox={face.bbox} score={face.score:.3f} first_landmark={tuple(face.landmarks[0])}")
+      aspect = face.bbox[2] / face.bbox[3]  # w/h — 결합 오검출 필터 튜닝 재현용
+      print(f"  bbox={face.bbox} score={face.score:.3f} aspect={aspect:.3f} first_landmark={tuple(face.landmarks[0])}")

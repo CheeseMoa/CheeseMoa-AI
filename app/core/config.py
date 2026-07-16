@@ -69,6 +69,12 @@ class Settings(BaseSettings):
   # 배경 인물 필터 (ADR-013): bbox 폭이 이미지 긴 변의 이 비율 미만인 얼굴을 검출 단계에서
   # 버린다 — 멀리 배경에 찍힌 행인이 앨범을 만드는 것 방지 (분포 측정 확정값, 0 = 비활성).
   detect_min_face_rel_width: float = 0.025
+  # 대형 오검출 결합 필터 (ADR-015): score가 이 값 미만 AND 종횡비(폭/높이)가 아래 값 미만이면
+  # 검출 단계에서 버린다 — 팔짱 낀 팔·조형물 등 진짜 얼굴 크기의 오검출 제거 (크기 필터로는 못
+  # 걸러진다). 두 축이 동시에 낮은 것은 오검출뿐이라 결합해야 진짜 얼굴 손실이 없다. 둘 중 하나라도
+  # 0이면 (score·종횡비가 음수 불가라 조건이 항상 거짓) 필터 전체 비활성.
+  detect_fp_score_threshold: float = 0.78
+  detect_fp_aspect_threshold: float = 0.70
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
   quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
@@ -116,6 +122,8 @@ class Settings(BaseSettings):
       refine_norm_face_width=self.detect_refine_norm_face_width,
       refine_margin_ratio=self.detect_refine_margin_ratio,
       min_face_rel_width=self.detect_min_face_rel_width,
+      fp_score_threshold=self.detect_fp_score_threshold,
+      fp_aspect_threshold=self.detect_fp_aspect_threshold,
     )
 
   def to_quality_config(self) -> "QualityConfig":
