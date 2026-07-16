@@ -57,6 +57,17 @@ class ClusterConfig:
   # 재검증되지 않았다(데이터 부재) — 아동 다수 이벤트에서 오병합이 관찰되면 .env로 즉시 복귀하고
   # face-test child 셋을 교정 후 파이프라인으로 재측정할 것 (ADR-012 §리스크).
   merge_centroid_similarity: float = 0.55
+  # 파편병합 face-level 응집 바닥 — 두 파편의 모든 얼굴 쌍(파편 i × 파편 j) 코사인의 평균이 이 값
+  # 이상이어야 병합한다. centroid 임계와 AND로 결합된다 (ADR-016). centroid는 평균이라 어린아이
+  # 얼굴을 뭉뚱그려 서로 다른 아이도 0.55~0.63으로 붙이는데(나이대 효과, event 35 실측), 판별 신호는
+  # 개별 얼굴 쌍에 남아 있다(같은 인물 파편쌍 face평균 0.65 vs 다른 아이 ≤0.50). 이 바닥이 그 갭을
+  # 가른다. 실 라벨 아동 8인 셋에서 현행(비활성) ARI 0.245 → 이 게이트로 0.788, 성인·단일인물 무회귀.
+  # min이 아닌 평균(mean linkage)을 쓰는 이유: 단일 하드 포즈 쌍에 강건하고 마진이 넓다. 0 = 비활성
+  # (centroid만으로 판정, 기존 동작과 동일).
+  # 0.45 (CHMO-269): floor 스윕에서 코퍼스 meanARI 최대(0.622→0.894, child 8인 0.245→0.788), 성인·
+  # 단일인물 무회귀. 실 S3 이벤트에서 분해된 앨범(27·29·33·35)은 적대적 검증 결과 전부 서로 다른
+  # 인물을 가른 진짜 수정(하위군집 cross face평균 0.31~0.44, 타인 분포)으로 확인됨.
+  merge_facepair_floor: float = 0.45
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
   rescue_similarity: float = 0.6
@@ -84,6 +95,7 @@ class ClusterConfig:
     for name in (
       "min_match_jaccard",
       "merge_centroid_similarity",
+      "merge_facepair_floor",
       "rescue_similarity",
       "min_membership_similarity",
       "min_membership_margin",
@@ -455,8 +467,10 @@ def _merge_fragments(
   embeddings: np.ndarray,
   cannot_link: tuple[tuple[int, int], ...],
   threshold: float,
+  facepair_floor: float = 0.0,
 ) -> None:
-  """centroid 코사인 유사도가 동일 인물 수준(threshold)인 클러스터끼리 병합한다 (labels 제자리 수정).
+  """centroid 유사도(threshold) AND 파편 간 face-pair 평균(facepair_floor)이 동일 인물 수준인 클러스터끼리
+  병합한다 (labels 제자리 수정).
 
   allow_single_cluster=False 특성상 한 인물 위주의 밀집이 파편화되는 케이스(ADR 005)와 일반적인
   과분할을 함께 교정한다. cannot-link로 연결된 클러스터 쌍은 병합하지 않는다(사용자 분리 결정 보존).
@@ -464,17 +478,37 @@ def _merge_fragments(
   한다 — 쌍별 검사만 하면 전이 체인(A~B, B~C)이 서로 타인인 A와 C(유사도 ~0.1)를 한 앨범으로
   융합하는 것이 리뷰에서 재현됐다. 유사도 내림차순 greedy에 병합 컴포넌트의 대표 라벨을 최소 멤버
   인덱스 클러스터로 고정해 결과가 결정적이다. 유사도는 병합 전 centroid 스냅샷 기준이다.
+
+  facepair_floor > 0이면 centroid에 더해 face-level 응집을 요구한다 (ADR-016): centroid는 평균이라
+  어린아이 얼굴을 뭉뚱그려 서로 다른 아이도 임계를 넘기는데, 판별 신호는 개별 얼굴 쌍에 남아 있어
+  파편 i × 파편 j 전 얼굴 쌍 코사인의 평균으로 되살린다. 두 조건의 AND라 병합을 더 엄격하게만 만든다
+  (새 오병합 도입 불가). facepair_floor == 0이면 centroid만으로 판정 — 기존 동작과 완전 동일.
   """
   ordered = _cluster_groups(labels)
   if len(ordered) < 2:
     return
   centroids = np.stack([_normalized_mean(embeddings, members) for _, members in ordered])
   similarities = centroids @ centroids.T
+  if facepair_floor > 0.0:
+    # 파편 쌍별 face-pair 평균 — 파편 i의 모든 얼굴 × 파편 j의 모든 얼굴 코사인의 평균 (단위벡터 = 내적)
+    facepair = np.ones_like(similarities)
+    for i in range(len(ordered)):
+      for j in range(i + 1, len(ordered)):
+        cross = embeddings[ordered[i][1]] @ embeddings[ordered[j][1]].T
+        facepair[i, j] = facepair[j, i] = float(cross.mean())
+  else:
+    facepair = None
+
+  def mergeable(i: int, j: int) -> bool:
+    if similarities[i, j] < threshold:
+      return False
+    return facepair is None or facepair[i, j] >= facepair_floor
+
   candidates = [
     (-float(similarities[i, j]), i, j)
     for i in range(len(ordered))
     for j in range(i + 1, len(ordered))
-    if similarities[i, j] >= threshold
+    if mergeable(i, j)
   ]
   if not candidates:
     return
@@ -495,8 +529,8 @@ def _merge_fragments(
       continue
     if _sets_blocked(merged_members[root_i], merged_members[root_j], cannot_link):
       continue
-    if not all(similarities[p, q] >= threshold for p in merged_positions[root_i] for q in merged_positions[root_j]):
-      continue  # 완전 연결 위반 — 다리(bridge) 클러스터를 통한 타인 융합 차단
+    if not all(mergeable(p, q) for p in merged_positions[root_i] for q in merged_positions[root_j]):
+      continue  # 완전 연결 위반 — 다리(bridge) 클러스터를 통한 타인/타아동 융합 차단
     if root_j < root_i:  # 작은 위치가 루트 — 컴포넌트 라벨이 최소 멤버 인덱스 클러스터로 수렴
       root_i, root_j = root_j, root_i
     parent[root_j] = root_i
@@ -739,7 +773,9 @@ def recluster(
   # 파편 병합 → 노이즈 구제 → 저신뢰 분리 (순서 중요: 병합된 centroid 기준으로 구제하고,
   # 구제까지 끝난 최종 멤버십에서 저신뢰를 가려낸다. 병합을 구제 뒤로 옮기면 구제가 파편난
   # 작은 centroid 기준이 되어 손해라, 시점 차이는 이동이 아니라 아래 2차 병합으로 보완한다)
-  _merge_fragments(labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity)
+  _merge_fragments(
+    labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity, resolved_config.merge_facepair_floor
+  )
   _rescue_noise(labels, emb, blocking_cannot, resolved_config.rescue_similarity)
   protected = {idx for members in components.values() if len(members) >= 2 for idx in members}
   # cannot-link 당사자도 보호 — split로 생긴 소형 클러스터는 구성상 내부 유사도가 낮을 수 있어,
@@ -753,7 +789,9 @@ def recluster(
   # 2차 파편 병합 (ADR-010) — 1차 병합은 구제·축출 전 centroid 스냅샷으로 판정하므로, 구제가 멤버를
   # 추가하면 최종 구성 기준으로는 임계를 넘는 파편 쌍이 남는다 (실 event 실측: 판정 시 0.688 →
   # 구제 후 0.705). 같은 임계·같은 cannot-link 가드를 최종 멤버십에서 한 번 더 적용한다.
-  _merge_fragments(labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity)
+  _merge_fragments(
+    labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity, resolved_config.merge_facepair_floor
+  )
 
   # ID 재조정
   new_clusters = _cluster_groups(labels)
@@ -1002,6 +1040,43 @@ if __name__ == "__main__":
   check(
     "(k) 같은 기하에서 auto 쌍의 x는 보호 없이 정상 축출 (축출 무력화 회귀 방지)",
     {c.member_indices for c in result.clusters} == {(0, 1), (3, 4)} and result.ambiguous_indices == (2,),
+  )
+
+  # (l) 파편병합 face-level 응집 게이트 (ADR-016) — centroid는 평균이라 서로 다른 아이도 뭉뚱그려
+  # 임계를 넘기지만(포즈 노이즈 상쇄), 개별 얼굴 쌍엔 판별 신호가 남는다. 두 파편이 base(=아이 공통
+  # 영역) 성분만 공유하고 나머지는 직교 축이면 cross face-pair 평균 = α²인데 centroid 유사도는
+  # 2α²/(α²+1)로 더 높다 — event 35에서 실측한 갭(centroid 0.6·face 0.4)의 합성 재현.
+  diff_a = math.sqrt(0.40)  # 다른 아이: cross 얼굴평균 0.40, centroid 0.571 (> 0.55)
+  diff_b = math.sqrt(1.0 - 0.40)
+  diff_kids = np.stack(
+    [
+      diff_a * axis(0) + diff_b * axis(1),
+      diff_a * axis(0) + diff_b * axis(2),
+      diff_a * axis(0) + diff_b * axis(3),
+      diff_a * axis(0) + diff_b * axis(4),
+    ]
+  ).astype(np.float32)
+  labels_off = np.array([0, 0, 1, 1], dtype=np.int64)
+  _merge_fragments(labels_off, diff_kids, (), 0.55, 0.0)
+  check("(l) 전제: floor=0이면 centroid 0.571로 서로 다른 아이 파편도 병합 (기존 동작 보존)", len(set(labels_off)) == 1)
+  labels_on = np.array([0, 0, 1, 1], dtype=np.int64)
+  _merge_fragments(labels_on, diff_kids, (), 0.55, 0.55)
+  check("(l) face floor 0.55는 cross 얼굴평균 0.40인 다른 아이 파편의 병합을 차단", len(set(labels_on)) == 2)
+  same_a = math.sqrt(0.65)  # 같은 인물: cross 얼굴평균 0.65, centroid 0.788
+  same_b = math.sqrt(1.0 - 0.65)
+  same_person = np.stack(
+    [
+      same_a * axis(0) + same_b * axis(1),
+      same_a * axis(0) + same_b * axis(2),
+      same_a * axis(0) + same_b * axis(3),
+      same_a * axis(0) + same_b * axis(4),
+    ]
+  ).astype(np.float32)
+  labels_same = np.array([0, 0, 1, 1], dtype=np.int64)
+  _merge_fragments(labels_same, same_person, (), 0.55, 0.55)
+  check(
+    "(l) 같은 인물 파편(cross 얼굴평균 0.65)은 face floor 0.55를 통과해 병합 유지 — 성인 무회귀",
+    len(set(labels_same)) == 1,
   )
 
   # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C가 0.3(floor 미만)이라
