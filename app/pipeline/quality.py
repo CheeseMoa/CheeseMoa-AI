@@ -46,6 +46,11 @@ _BLUR_DENOISE_KERNEL = (3, 3)  # 고감도 노이즈 억제 — 야간 사진의
 # align은 순수 수학 모듈이나 _ARCFACE_DST는 module-private이라, 좌표를 여기 재선언하고 계약으로 고정한다.
 _EYE_CENTERS = ((38.2946, 51.6963), (73.5318, 51.5014))  # (우안, 좌안)
 
+# 눈/볼 밝기 비의 볼 참조 위치: 눈 중심에서 이만큼 아래 — 정렬 crop에서 눈 y≈52와 입꼬리 y≈92
+# 사이의 살 영역이다. 박스는 코(crop 중앙)를 피해 눈과 같은 x에 둔다 (ADR 019).
+_CHEEK_DY = 26.0
+_CHEEK_BOX = 16
+
 # shake_signals의 측정 정규화: 전체 이미지를 긴 변 이 크기로 축소해 해상도 의존을 없앤다
 # (_BLUR_NORM_SIZE와 같은 이유 — 원본 크기로 재면 12MP와 스크린샷에 단일 임계가 성립하지 않는다).
 _SHAKE_NORM_MAX_SIDE = 1024
@@ -109,6 +114,18 @@ class QualityConfig:
   eye_closed_confidence: float = 0.85
   # 정렬 crop에서 고정 눈 좌표 둘레로 자를 정사각 한 변(px). 모델 입력 32로 리사이즈하기 전의 원본 창.
   eye_box_px: int = 24
+  # 눈감음 판정 자격의 최소 얼굴 크기(bbox 짧은 변, px) — min_blur_face_px와 같은 근거: 이보다 작으면
+  # 눈 crop의 원본 정보가 몇 px뿐이라 CNN 출력이 무의미하다. 실측(859 얼굴, ADR 019)에서 eyes_closed
+  # 오탐 10건 중 4건이 32~52px의 포스터 그림·옆얼굴이었고, 이 게이트로 면제되는 81 얼굴(9.4%) 중
+  # 진짜 눈감음은 0건. 0 = 비활성.
+  min_eye_face_px: int = 64
+  # 눈감음 판정 자격의 눈/볼 밝기 비 상한 — 판정 대상(감은 눈꺼풀)은 피부라 볼과 밝기가 비슷해야
+  # 한다(실측 정탐 0.79, 전체 p95 1.21). 눈 박스가 볼보다 이 배율 넘게 밝으면 눈 자리에 피부가 아닌
+  # 것(고글 반사, 볼을 덮은 마스크 등)이 있다는 이상 신호 → 미판정. 실측(ADR 019): 고글+마스크 오탐
+  # 2건이 1.73·2.75로 분리(빈 구간 [1.21, 1.73]에서 1.4 채택), 면제 26 얼굴(3.0%) 중 CNN이 감음이라
+  # 한 것은 그 오탐 2건뿐. 짙은 선글라스는 어두워지는 방향이라 못 잡는다(코퍼스에 실사례 부재 — 한계).
+  # 0 = 비활성.
+  eye_cheek_brightness_ceiling: float = 1.4
 
   def __post_init__(self) -> None:
     # DetectorConfig/ClusterConfig와 같은 정책: 무의미한 값은 생성 시점에 거부한다.
@@ -134,6 +151,12 @@ class QualityConfig:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
       raise ValueError(f"eye_box_px는 2 이상이어야 합니다. 받은 값: {self.eye_box_px}")
+    if self.min_eye_face_px < 0:
+      raise ValueError(f"min_eye_face_px는 0 이상이어야 합니다. 받은 값: {self.min_eye_face_px}")
+    if self.eye_cheek_brightness_ceiling < 0.0:
+      raise ValueError(
+        f"eye_cheek_brightness_ceiling는 0 이상이어야 합니다. 받은 값: {self.eye_cheek_brightness_ceiling}"
+      )
 
 
 @dataclass(frozen=True)
@@ -205,6 +228,34 @@ def shake_confirmed(image: np.ndarray, config: QualityConfig) -> bool:
     return True
   _, coherence = shake_signals(image)
   return coherence >= config.shake_coherence_floor
+
+
+def _box_mean(gray: np.ndarray, center: tuple[float, float], box_px: int) -> float | None:
+  half = box_px / 2.0
+  h, w = gray.shape
+  x0, y0 = max(0, int(round(center[0] - half))), max(0, int(round(center[1] - half)))
+  x1, y1 = min(w, int(round(center[0] + half))), min(h, int(round(center[1] + half)))
+  if x1 - x0 < 2 or y1 - y0 < 2:
+    return None
+  return float(gray[y0:y1, x0:x1].mean())
+
+
+def eye_cheek_ratio(aligned: np.ndarray, eye_box_px: int) -> float | None:
+  """정렬 crop의 (눈 박스 평균 밝기 / 같은 x의 볼 평균 밝기) 양눈 평균 — 눈감음 판정 자격 신호 (ADR 019).
+
+  감은 눈꺼풀은 피부라 볼과 밝기가 비슷해야 한다. 이 비가 상한을 넘으면 눈 자리에 피부가 아닌
+  것(고글 반사, 볼을 덮은 마스크)이 있다는 뜻이라 눈 상태 CNN 출력을 신뢰할 수 없다.
+  박스가 경계에 잘려 측정 불가면 None (호출자가 보수적으로 미판정 처리).
+  """
+  gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY)
+  ratios = []
+  for cx, cy in _EYE_CENTERS:
+    eye = _box_mean(gray, (cx, cy), eye_box_px)
+    cheek = _box_mean(gray, (cx, cy + _CHEEK_DY), _CHEEK_BOX)
+    if eye is None or cheek is None:
+      return None
+    ratios.append(eye / max(cheek, 1.0))
+  return float(np.mean(ratios))
 
 
 def crop_eye(aligned: np.ndarray, center: tuple[float, float], box_px: int) -> np.ndarray | None:
@@ -286,6 +337,18 @@ class EyeStateClassifier:
 FacePair = tuple[np.ndarray | None, np.ndarray]
 
 
+def _eye_judgment_eligible(aligned: np.ndarray, bbox_crop: np.ndarray | None, config: QualityConfig) -> bool:
+  """눈감음 판정 자격 게이트 (ADR 019) — 자격 미달 얼굴은 CNN을 태우지 않고 미판정으로 넘긴다."""
+  if config.min_eye_face_px > 0:
+    if bbox_crop is None or bbox_crop.size == 0 or min(bbox_crop.shape[:2]) < config.min_eye_face_px:
+      return False
+  if config.eye_cheek_brightness_ceiling > 0:
+    ratio = eye_cheek_ratio(aligned, config.eye_box_px)
+    if ratio is None or ratio > config.eye_cheek_brightness_ceiling:
+      return False
+  return True
+
+
 def judge_faces(
   faces: Sequence[FacePair], classifier: EyeStateClassifier, config: QualityConfig
 ) -> tuple[bool, bool | None]:
@@ -293,6 +356,9 @@ def judge_faces(
 
   "얼굴 1개라도" 규칙: 어느 한 얼굴이라도 양눈 감김이면 eyes_closed, 어느 한 얼굴이라도 blur면 blurry.
   양눈이 모두 잡히는 얼굴만 눈감음 후보다 — 옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정.
+  눈감음 판정 자격 게이트(ADR 019): bbox 짧은 변 ≥ min_eye_face_px(정보 부족 얼굴 제외) AND
+  눈/볼 밝기 비 ≤ eye_cheek_brightness_ceiling(눈 자리가 피부가 아닌 얼굴 제외) — 실측 오탐의
+  주 유형(초소형 그림 얼굴, 고글·마스크 가림)을 판정 전에 거른다.
   blurry는 주 인물 얼굴만 본다 — 판정 자격은 bbox 짧은 변 ≥ min_blur_face_px 그리고 bbox 폭이 사진 내
   가장 큰 얼굴 폭의 blur_main_face_ratio 이상. 배경 인물의 아웃포커스는 흔들림 증거가 아니다(모듈 주석).
   판정 자격 얼굴이 하나도 없으면 None — 얼굴 미검출과 같은 "얼굴로는 알 수 없음"이므로 호출자가
@@ -306,7 +372,7 @@ def judge_faces(
   eyes_closed = False
   blurry: bool | None = None
   for aligned, bbox_crop in faces:
-    if not eyes_closed and aligned is not None:
+    if not eyes_closed and aligned is not None and _eye_judgment_eligible(aligned, bbox_crop, config):
       eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
       if all(crop is not None for crop in eye_crops):
         probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]  # 위에서 None 배제 확인
@@ -349,7 +415,12 @@ if __name__ == "__main__":
     widest = max((crop.shape[1] for _, crop in faces if crop.size > 0), default=0)
     for i, (aligned, bbox_crop) in enumerate(faces):
       probs: list[float] = []
+      eye_note = ""
       if aligned is not None:
+        if not _eye_judgment_eligible(aligned, bbox_crop, config):
+          ratio = eye_cheek_ratio(aligned, config.eye_box_px)
+          ratio_str = f"{ratio:.2f}" if ratio is not None else "n/a"
+          eye_note = f" (눈감음 판정 자격 미달 — 눈/볼 밝기비 {ratio_str}, ADR 019)"
         eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
         if all(crop is not None for crop in eye_crops):
           probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]
@@ -361,7 +432,7 @@ if __name__ == "__main__":
         note = " (배경 얼굴 — blur 판정 제외)"
       probs_str = ", ".join(f"{p:.3f}" for p in probs) if probs else "n/a"
       bh, bw = bbox_crop.shape[:2]
-      print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}] blur_var={var:.1f}{note}")
+      print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}]{eye_note} blur_var={var:.1f}{note}")
 
     eyes_closed, blurry = judge_faces(faces, classifier, config)
     gate_exempt = False

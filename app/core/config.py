@@ -60,6 +60,8 @@ class Settings(BaseSettings):
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
+  cluster_evict_gray_ceiling: float = 0.46  # ADR-020: LOO centroid 회색지대 상한 — face-pair 재확인 대상
+  cluster_evict_facepair_floor: float = 0.45  # ADR-020: 회색지대 잔류 자격(최강 쌍) — 미만이면 남남 부착 축출
   cluster_blob_promote_similarity: float = 0.45
   cluster_blob_promote_floor: float = 0.4
 
@@ -98,6 +100,10 @@ class Settings(BaseSettings):
   quality_whole_image_collapse_variance: float = 40.0  # fallback 한정 게이트 면제 — 붕괴는 흔들림 확정. 0 = 비활성
   quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
   quality_eye_box_px: int = 24
+  quality_min_eye_face_px: int = 64  # 이보다 작은 얼굴은 눈감음 판정 제외 (정보 부족, ADR 019). 0 = 비활성
+  quality_eye_cheek_brightness_ceiling: float = (
+    1.4  # 눈/볼 밝기 비 상한 — 초과면 가림으로 보고 미판정 (ADR 019). 0 = 비활성
+  )
 
   log_level: str = "INFO"
 
@@ -119,6 +125,8 @@ class Settings(BaseSettings):
       rescue_similarity=self.cluster_rescue_similarity,
       min_membership_similarity=self.cluster_min_membership_similarity,
       min_membership_margin=self.cluster_min_membership_margin,
+      evict_gray_ceiling=self.cluster_evict_gray_ceiling,
+      evict_facepair_floor=self.cluster_evict_facepair_floor,
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
     )
@@ -160,4 +168,6 @@ class Settings(BaseSettings):
       whole_image_collapse_variance=self.quality_whole_image_collapse_variance,
       eye_closed_confidence=self.quality_eye_closed_confidence,
       eye_box_px=self.quality_eye_box_px,
+      min_eye_face_px=self.quality_min_eye_face_px,
+      eye_cheek_brightness_ceiling=self.quality_eye_cheek_brightness_ceiling,
     )
