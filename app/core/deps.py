@@ -50,11 +50,14 @@ def build_face_extractor(
   eye_classifier: EyeStateClassifier,
   quality_config: QualityConfig,
   align_antialias: bool = True,
+  blink_scorer=None,
 ) -> FaceExtractor:
   """detect → align → embed에 품질 판정(눈감음/흔들림)을 합성해 handlers의 FaceExtractor를 만든다.
 
   퇴화 얼굴(정렬 실패·비유한 임베딩)은 각 단계가 None으로 걸러내는 계약이라 임베딩에서 제거한다.
   품질 판정은 정렬 crop(눈감음)과 원본 bbox crop(흔들림)을 쓰며, 정렬 crop은 임베딩용과 공유해 중복 정렬이 없다.
+  눈감음은 blink_scorer(blendshape, ADR 021)가 판정하고 presence 미달은 미판정이다 — CNN 경로는
+  blink 비활성(scorer=None, 롤백)일 때만 쓴다 (judge_faces 주석 참고).
   단일 스레드 워커 전제: FaceDetector는 스레드 안전하지 않지만 동시 호출이 없어 무해하다.
   """
 
@@ -66,7 +69,8 @@ def build_face_extractor(
     for face, aligned in zip(detected, aligned_crops):
       x, y, w, h = face.bbox
       face_pairs.append((aligned, image[y : y + h, x : x + w]))
-    eyes_closed, blurry, blurry_face_w = judge_faces(face_pairs, eye_classifier, quality_config)
+    blinks = [blink_scorer.blink_scores(image, face.landmarks) for face in detected] if blink_scorer else None
+    eyes_closed, blurry, blurry_face_w = judge_faces(face_pairs, eye_classifier, quality_config, blink_scores=blinks)
 
     # 얼굴 경로 붕괴 면제 (ADR 018 §보강 2): blurry 얼굴이 대형 주 인물이고 전체 variance가 붕괴
     # 수준이면 고스팅형 손떨림(쏠림 낮음)으로 보고 재확인 게이트를 건너뛴다 — 얼굴이 화면 대부분이면
@@ -148,17 +152,30 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   cores = _available_cores()
   threads = settings.ort_num_threads or cores
 
+  quality_config = settings.to_quality_config()
   logger.info("AI 모델 로딩 중 (YuNet + AuraFace + 눈감음 CNN) — 최초 실행은 다운로드로 오래 걸릴 수 있습니다")
   detector = FaceDetector(settings.to_detector_config())
   embedder = FaceEmbedder(EmbedConfig(intra_op_num_threads=threads, inter_op_num_threads=threads))
   eye_classifier = EyeStateClassifier()
-  logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d)", threads, cores)
+  blink_scorer = None
+  if quality_config.blink_threshold > 0:
+    # blink 비활성(threshold=0) 운영은 litert 임포트·모델 다운로드 자체를 건너뛴다 — 롤백 스위치가
+    # 의존성 문제까지 우회할 수 있도록 임포트를 여기 가둔다 (ADR 021).
+    from app.pipeline.blink import BlinkConfig, FaceBlinkScorer
+
+    blink_scorer = FaceBlinkScorer(BlinkConfig(num_threads=threads))
+  logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d, blink=%s)", threads, cores, bool(blink_scorer))
 
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=S3ImageSource(s3_client, settings.images_bucket),
     extract_faces=build_face_extractor(
-      detector, embedder, eye_classifier, settings.to_quality_config(), align_antialias=settings.align_antialias
+      detector,
+      embedder,
+      eye_classifier,
+      quality_config,
+      align_antialias=settings.align_antialias,
+      blink_scorer=blink_scorer,
     ),
     cluster_config=settings.to_cluster_config(),
     report_progress=_build_progress_reporter(sqs_client, settings.progress_queue_url),

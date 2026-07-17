@@ -23,5 +23,8 @@ opencv-python-headless>=4.8.0
 numpy>=1.26,<2.0
 huggingface_hub>=0.23
 onnxruntime>=1.26,<2.0
+# 눈감음 blendshape 하이브리드(ADR 021)의 TFLite 런타임 — mediapipe pip은 linux aarch64 휠이 없어
+# EC2(t4g) 배포 불가, litert는 cp312 manylinux aarch64 휠 제공. face_landmarker.task 내부 모델 실행용.
+ai-edge-litert>=2.1,<3
 boto3>=1.34
 pydantic-settings>=2.6,<3

@@ -1,7 +1,12 @@
-"""순수 파이프라인 단계로서의 사진 품질 판정 (눈감음 CNN + 흔들림 Laplacian).
+"""순수 파이프라인 단계로서의 사진 품질 판정 (눈감음 하이브리드 + 흔들림 Laplacian).
 
 두 게이트를 제공한다:
-  - 눈감음: align.py가 5점(눈·코·입꼬리)으로 정렬한 112x112 crop의 고정 눈 좌표에서 양눈을 잘라
+  - 눈감음 (ADR 021): blendshape(blink.FaceBlinkScorer — Face Landmarker litert 이식)의
+    min(blinkL, blinkR) ≥ blink_threshold. 얼굴 전체 컨텍스트를 보므로 눈 패치 CNN의 도메인 실패
+    (유아 오탐·보정 이미지 미탐·수면 미탐)가 없다. presence 미달(극단 회전·이중 검출 잔재 등,
+    실측 ~9%)은 미판정 — CNN 폴백은 실측에서 정탐 기여 0에 유아 오탐만 재생산해 제거했다.
+    blink 비활성(blink_threshold=0, 롤백 스위치)일 때만 종전 CNN 경로로 판정한다 —
+    align.py가 5점(눈·코·입꼬리)으로 정렬한 112x112 crop의 고정 눈 좌표에서 양눈을 잘라
     open-closed-eye-0001 CNN으로 open/closed 분류. 양눈 모두 closed면 그 얼굴은 눈감음.
     입꼬리 랜드마크는 align의 Umeyama 변환을 통해 롤·스케일 정규화에 기여하므로, 기운 얼굴에서도
     눈 crop이 일정하게 프레이밍된다.
@@ -135,6 +140,18 @@ class QualityConfig:
   # 한 것은 그 오탐 2건뿐. 짙은 선글라스는 어두워지는 방향이라 못 잡는다(코퍼스에 실사례 부재 — 한계).
   # 0 = 비활성.
   eye_cheek_brightness_ceiling: float = 1.4
+  # 눈감음 하이브리드 1차 판정 — blendshape(blink.FaceBlinkScorer)의 min(blinkL, blinkR)이 이 값
+  # 이상이면 그 얼굴은 눈감음 (ADR 021). A/B 실측(871 얼굴): 감음 0.42~0.75 vs 뜬 눈 p90 0.138의
+  # 빈 구간 [0.36, 0.42]에서 0.40 채택 — 유아 오탐·보정 이미지 미탐·수면 미탐(눈 CNN 도메인 실패
+  # 3종)을 전부 해결하고 585 자격 얼굴 오탐 0. blink 판정이 성립한 얼굴은 CNN·ADR-019 게이트를
+  # 타지 않는다(고글·선글라스도 blendshape가 직접 정답). **0 = 비활성 = blink 자체를 끄는 롤백
+  # 스위치** — 순수 CNN 경로(종전 동작)로 복귀한다.
+  blink_threshold: float = 0.40
+  # blink 판정의 자격 — 랜드마크 모델의 얼굴 presence(시그모이드)가 이 값 미만이면 그 얼굴은
+  # 눈감음 미판정이다 (mediapipe min_detection_confidence 기본값과 동일한 0.5). CNN 폴백은 없다 —
+  # 실측(871 얼굴)에서 폴백의 정탐 기여 0, 유아 오탐(이중 검출 잔재 RoI)만 재생산해 제거.
+  # 실측: 참조 대비 파리티 스윕에서 presence≥0.5 통과율 95%+, 극단 회전·옆얼굴이 여기서 걸러진다.
+  blink_presence_floor: float = 0.5
 
   def __post_init__(self) -> None:
     # DetectorConfig/ClusterConfig와 같은 정책: 무의미한 값은 생성 시점에 거부한다.
@@ -168,6 +185,10 @@ class QualityConfig:
       raise ValueError(
         f"eye_cheek_brightness_ceiling는 0 이상이어야 합니다. 받은 값: {self.eye_cheek_brightness_ceiling}"
       )
+    if not 0.0 <= self.blink_threshold <= 1.0:
+      raise ValueError(f"blink_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.blink_threshold}")
+    if not 0.0 <= self.blink_presence_floor <= 1.0:
+      raise ValueError(f"blink_presence_floor는 [0, 1] 범위여야 합니다. 받은 값: {self.blink_presence_floor}")
 
 
 @dataclass(frozen=True)
@@ -375,15 +396,23 @@ def _eye_judgment_eligible(aligned: np.ndarray, bbox_crop: np.ndarray | None, co
 
 
 def judge_faces(
-  faces: Sequence[FacePair], classifier: EyeStateClassifier, config: QualityConfig
+  faces: Sequence[FacePair],
+  classifier: EyeStateClassifier,
+  config: QualityConfig,
+  blink_scores: Sequence[tuple[float, float, float] | None] | None = None,
 ) -> tuple[bool, bool | None, int]:
   """얼굴별 (정렬 crop, bbox crop) 목록 → 이미지 단위 (eyes_closed, blurry, blurry 얼굴 최대 폭) 판정.
 
   "얼굴 1개라도" 규칙: 어느 한 얼굴이라도 양눈 감김이면 eyes_closed, 어느 한 얼굴이라도 blur면 blurry.
-  양눈이 모두 잡히는 얼굴만 눈감음 후보다 — 옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정.
-  눈감음 판정 자격 게이트(ADR 019): bbox 짧은 변 ≥ min_eye_face_px(정보 부족 얼굴 제외) AND
-  눈/볼 밝기 비 ≤ eye_cheek_brightness_ceiling(눈 자리가 피부가 아닌 얼굴 제외) — 실측 오탐의
-  주 유형(초소형 그림 얼굴, 고글·마스크 가림)을 판정 전에 거른다.
+  눈감음 (ADR 021): blink_scores(faces와 같은 순서, blink.FaceBlinkScorer의 (presence, blinkL,
+  blinkR), 미계산/RoI 퇴화는 None)가 주어지고 blink_threshold > 0이면 blendshape 단독으로 판정한다
+  — presence ≥ blink_presence_floor인 얼굴만 min(blinkL, blinkR) ≥ blink_threshold, presence 미달은
+  미판정(CNN 폴백 없음 — 실측에서 폴백의 정탐 기여 0, 유아 오탐만 재생산). blendshape는 가림·유아·
+  보정 이미지에서 CNN보다 강건해 ADR-019 자격 게이트도 필요 없다 (A/B 실측).
+  blink 비활성(blink_scores=None 또는 blink_threshold=0)이면 종전 CNN 경로로 판정한다:
+  양눈이 모두 잡히는 얼굴만 눈감음 후보(옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정) +
+  눈감음 판정 자격 게이트(ADR 019 — bbox 짧은 변 ≥ min_eye_face_px AND 눈/볼 밝기 비 ≤
+  eye_cheek_brightness_ceiling, 실측 오탐 주 유형인 초소형 그림·가림 얼굴 제외).
   blurry는 주 인물 얼굴만 본다 — 판정 자격은 bbox 짧은 변 ≥ min_blur_face_px 그리고 bbox 폭이 사진 내
   가장 큰 얼굴 폭의 blur_main_face_ratio 이상. 배경 인물의 아웃포커스는 흔들림 증거가 아니다(모듈 주석).
   판정 자격 얼굴이 하나도 없으면 None — 얼굴 미검출과 같은 "얼굴로는 알 수 없음"이므로 호출자가
@@ -400,13 +429,22 @@ def judge_faces(
   eyes_closed = False
   blurry: bool | None = None
   blurry_face_w = 0
-  for aligned, bbox_crop in faces:
-    if not eyes_closed and aligned is not None and _eye_judgment_eligible(aligned, bbox_crop, config):
-      eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
-      if all(crop is not None for crop in eye_crops):
-        probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]  # 위에서 None 배제 확인
-        if all(prob >= config.eye_closed_confidence for prob in probs):
-          eyes_closed = True
+  blink_active = blink_scores is not None and config.blink_threshold > 0
+  for i, (aligned, bbox_crop) in enumerate(faces):
+    if not eyes_closed:
+      if blink_active:
+        # presence 미달·RoI 퇴화는 미판정이다 — CNN 폴백은 실측(871 얼굴)에서 정탐 기여 0에
+        # 유아 오탐만 재생산했다(랜드마커가 얼굴이 아니라는 RoI에서 눈 패치 CNN의 확신은
+        # 신뢰 근거가 없다). CNN은 blink 비활성 롤백(blink_threshold=0)일 때만 판정한다.
+        blink = blink_scores[i]
+        if blink is not None and blink[0] >= config.blink_presence_floor:
+          eyes_closed = min(blink[1], blink[2]) >= config.blink_threshold
+      elif aligned is not None and _eye_judgment_eligible(aligned, bbox_crop, config):
+        eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
+        if all(crop is not None for crop in eye_crops):
+          probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]  # 위에서 None 배제 확인
+          if all(prob >= config.eye_closed_confidence for prob in probs):
+            eyes_closed = True
     if bbox_crop is not None and bbox_crop.size > 0:
       if min(bbox_crop.shape[:2]) >= config.min_blur_face_px and bbox_crop.shape[1] >= min_main_width:
         if face_blur_variance(bbox_crop) < config.blur_threshold:
@@ -424,11 +462,13 @@ if __name__ == "__main__":
   import sys
 
   from app.pipeline.align import align_face
+  from app.pipeline.blink import FaceBlinkScorer
   from app.pipeline.detect import FaceDetector
 
   detector = FaceDetector()
   classifier = EyeStateClassifier()
   config = QualityConfig()
+  scorer = FaceBlinkScorer() if config.blink_threshold > 0 else None
   for path in sys.argv[1:]:
     # Windows 한글 경로 대응: cv2.imread는 비ASCII 경로에서 None만 반환하므로 fromfile+imdecode를 쓴다
     data = np.fromfile(path, dtype=np.uint8)
@@ -442,16 +482,20 @@ if __name__ == "__main__":
     for face in detected:
       x, y, bw, bh = face.bbox
       faces.append((align_face(image, face.landmarks), image[y : y + bh, x : x + bw]))
+    # deps.build_face_extractor와 같은 하이브리드 — CLI 판정이 프로덕션 라우팅과 일치해야 보정에 쓸 수 있다
+    blinks = [scorer.blink_scores(image, face.landmarks) for face in detected] if scorer else None
 
     widest = max((crop.shape[1] for _, crop in faces if crop.size > 0), default=0)
     for i, (aligned, bbox_crop) in enumerate(faces):
+      blink = blinks[i] if blinks else None
+      blink_str = f"presence={blink[0]:.2f} blink=[{blink[1]:.3f}, {blink[2]:.3f}]" if blink else "blink=n/a"
       probs: list[float] = []
       eye_note = ""
       if aligned is not None:
         if not _eye_judgment_eligible(aligned, bbox_crop, config):
           ratio = eye_cheek_ratio(aligned, config.eye_box_px)
           ratio_str = f"{ratio:.2f}" if ratio is not None else "n/a"
-          eye_note = f" (눈감음 판정 자격 미달 — 눈/볼 밝기비 {ratio_str}, ADR 019)"
+          eye_note = " (CNN 폴백 자격 미달 — 눈/볼 밝기비 " + ratio_str + ", ADR 019)"
         eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
         if all(crop is not None for crop in eye_crops):
           probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]
@@ -463,9 +507,9 @@ if __name__ == "__main__":
         note = " (배경 얼굴 — blur 판정 제외)"
       probs_str = ", ".join(f"{p:.3f}" for p in probs) if probs else "n/a"
       bh, bw = bbox_crop.shape[:2]
-      print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}]{eye_note} blur_var={var:.1f}{note}")
+      print(f"  {path} face{i} bbox={bw}x{bh}: {blink_str} cnn_closed=[{probs_str}]{eye_note} blur_var={var:.1f}{note}")
 
-    eyes_closed, blurry, blurry_face_w = judge_faces(faces, classifier, config)
+    eyes_closed, blurry, blurry_face_w = judge_faces(faces, classifier, config, blink_scores=blinks)
     gate_exempt = False
     if blurry and face_collapse_exempt(image, blurry_face_w, config):
       # deps.build_face_extractor와 같은 얼굴 경로 붕괴 면제 (ADR 018 §보강 2)
