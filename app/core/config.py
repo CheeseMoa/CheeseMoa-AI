@@ -97,6 +97,7 @@ class Settings(BaseSettings):
   quality_shake_max_norm_variance: float = 60.0  # 쏠림이 높아도 정규화 variance가 이 값 이상이면 선명으로 본다
   quality_shake_coherence_floor: float = 0.35  # 흔들림 재확인 게이트 — 쏠림이 이 값 미만이면 해제. 0 = 비활성
   quality_whole_image_collapse_variance: float = 40.0  # fallback 한정 게이트 면제 — 붕괴는 흔들림 확정. 0 = 비활성
+  quality_collapse_face_rel_width: float = 0.22  # 붕괴 면제 얼굴 경로 확장 — rel_w 하한 (ADR 018). 0 = 비활성
   quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
   quality_eye_box_px: int = 24
   quality_min_eye_face_px: int = 64  # 이보다 작은 얼굴은 눈감음 판정 제외 (정보 부족, ADR 019). 0 = 비활성
@@ -165,6 +166,7 @@ class Settings(BaseSettings):
       shake_max_norm_variance=self.quality_shake_max_norm_variance,
       shake_coherence_floor=self.quality_shake_coherence_floor,
       whole_image_collapse_variance=self.quality_whole_image_collapse_variance,
+      collapse_face_rel_width=self.quality_collapse_face_rel_width,
       eye_closed_confidence=self.quality_eye_closed_confidence,
       eye_box_px=self.quality_eye_box_px,
       min_eye_face_px=self.quality_min_eye_face_px,
