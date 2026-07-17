@@ -105,6 +105,10 @@ class Settings(BaseSettings):
   quality_eye_cheek_brightness_ceiling: float = (
     1.4  # 눈/볼 밝기 비 상한 — 초과면 가림으로 보고 미판정 (ADR 019). 0 = 비활성
   )
+  # 눈감음 하이브리드 1차(blendshape, ADR 021): min(blinkL, blinkR)가 이 값 이상이면 눈감음.
+  # 0 = blink 비활성(롤백 스위치) — litert·face_landmarker 로딩 자체를 건너뛰고 순수 CNN 경로로 복귀.
+  quality_blink_threshold: float = 0.40
+  quality_blink_presence_floor: float = 0.5  # 랜드마크 presence가 미만이면 blink를 버리고 CNN 폴백 (ADR 021)
 
   log_level: str = "INFO"
 
@@ -172,4 +176,6 @@ class Settings(BaseSettings):
       eye_box_px=self.quality_eye_box_px,
       min_eye_face_px=self.quality_min_eye_face_px,
       eye_cheek_brightness_ceiling=self.quality_eye_cheek_brightness_ceiling,
+      blink_threshold=self.quality_blink_threshold,
+      blink_presence_floor=self.quality_blink_presence_floor,
     )

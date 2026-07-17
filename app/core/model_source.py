@@ -29,6 +29,16 @@ EYE_MODEL_URL = (
 EYE_MODEL_FILENAME = "open_closed_eye.onnx"
 EYE_MODEL_PATH_ENV = "EYE_MODEL_PATH"
 
+# MediaPipe Face Landmarker 번들(.task = tflite 3개를 담은 zip, Apache 2.0) — 눈감음 하이브리드
+# 판정(ADR 021)이 내부의 face_landmarks_detector.tflite + face_blendshapes.tflite만 litert로 실행한다
+# (mediapipe pip 패키지는 linux aarch64 휠이 없어 EC2 배포 불가 — 런타임은 ai-edge-litert).
+# 버전 고정 경로(/1/)를 쓴다 — latest는 모델 교체 시 파리티 검증 없이 동작이 바뀐다.
+FACELANDMARKER_MODEL_URL = (
+  "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+FACELANDMARKER_MODEL_FILENAME = "face_landmarker.task"
+FACELANDMARKER_MODEL_PATH_ENV = "FACELANDMARKER_MODEL_PATH"
+
 
 @runtime_checkable
 class ModelSource(Protocol):
@@ -158,3 +168,15 @@ def default_eye_source() -> ModelSource:
   if local_path:
     return LocalModelSource(local_path)
   return UrlModelSource(EYE_MODEL_URL, EYE_MODEL_FILENAME)
+
+
+def default_face_landmarker_source() -> ModelSource:
+  """FaceBlinkScorer가 face_landmarker.task 번들을 얻을 때 사용하는 기본 소스.
+
+  default_eye_source와 동형(로컬 오버라이드 → URL 다운로드). .task는 zip 그대로 캐시하고
+  내부 tflite 추출은 소비자(app/pipeline/blink.py)의 책임이다.
+  """
+  local_path = os.getenv(FACELANDMARKER_MODEL_PATH_ENV)
+  if local_path:
+    return LocalModelSource(local_path)
+  return UrlModelSource(FACELANDMARKER_MODEL_URL, FACELANDMARKER_MODEL_FILENAME)
