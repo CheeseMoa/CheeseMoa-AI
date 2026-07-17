@@ -277,8 +277,10 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    오탐 0건으로 착수 근거 상실([survey](docs/reviews/2026-07-17-smile-eyes-geometry-survey.md)).
    원본 해상도 눈 crop도 실측 기각 — 이중 리샘플링의 소프트한 입력이 오히려 CNN 학습 분포(운전자
    모니터링 저해상도)에 정합해, 원본 직접 crop은 기존 정탐을 붕괴시키고 웃음 실눈 오탐을 새로
-   유발한다([리뷰](docs/reviews/2026-07-17-native-eyecrop-verdict.md)). 남은 경로는 라벨셋 → 임계/
-   양눈 규칙 재보정 → 부족 시 상용 가능 대체 신호(FaceMesh EAR 등) 순
+   유발한다([리뷰](docs/reviews/2026-07-17-native-eyecrop-verdict.md)). 대체 모델 A/B는 실측 완료 —
+   MediaPipe Face Landmarker blendshape(Apache 2.0)가 알려진 실패 3종(유아 오탐·보정 이미지 미탐·
+   수면 미탐)을 전부 해결하고 585 얼굴 오탐 0(t=0.40). 단 극단 회전·옆얼굴 23% 미검출(하이브리드
+   필요)·arm64/메모리 검증이 채택 선행 조건([A/B 리뷰](docs/reviews/2026-07-17-mediapipe-blink-ab.md))
 4. Spring과 `confirm_distinct` 트리거 정책 합의 — 즉시 발행(안전) vs 공유 시점 일괄 발행(발행 전 새
    업로드가 끼면 그 사이 재군집은 보호 공백). 단, 상태 기반 계약 개편
    ([docs/backlog/state-based-feedback-contract.md](docs/backlog/state-based-feedback-contract.md))
