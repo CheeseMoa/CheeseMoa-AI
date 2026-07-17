@@ -82,8 +82,9 @@ class Settings(BaseSettings):
   detect_fp_aspect_threshold: float = 0.70
   # 대형 근접 얼굴 재검출 회복 (ADR-017): rel_w가 이 값 이상인 저score 얼굴을 정규 스케일로 재검출해
   # score가 아래 값 이상이면 되살린다 — YuNet이 초근접 대형 얼굴에 저score를 줘 공통첩으로 빠지던 문제.
-  # 둘 중 하나라도 0이면 비활성(기존 검출 동작).
-  detect_big_face_rel_width: float = 0.30
+  # 둘 중 하나라도 0이면 비활성(기존 검출 동작). 0.30→0.20 재보정(ADR-017 §재보정): 화면을 덮는
+  # 얼굴은 bbox 파편이 rel_w 0.28대로 나와 게이트 미달 — 스윕 실측 FP 0·손실 0.
+  detect_big_face_rel_width: float = 0.20
   detect_big_face_redetect_score: float = 0.80
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
