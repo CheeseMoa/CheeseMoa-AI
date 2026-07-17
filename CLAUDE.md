@@ -274,7 +274,11 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
 2. pytest 도입 — 각 모듈 `__main__` 스모크를 tests/로 승격 (`# TODO(CHMO-165)` 표시 지점)
 3. (후속) 품질 게이트 개선 — 눈/흔들림 임계 라벨셋 튜닝(현재 라벨 부재), 부분 블러 대응, 실물 대형
    선글라스·유아 눈 오탐(ADR 019 §한계 — 리포트 축적 시). 웃음 예외용 표정 CNN은 2026-07-17 실측에서
-   오탐 0건으로 착수 근거 상실([survey](docs/reviews/2026-07-17-smile-eyes-geometry-survey.md))
+   오탐 0건으로 착수 근거 상실([survey](docs/reviews/2026-07-17-smile-eyes-geometry-survey.md)).
+   원본 해상도 눈 crop도 실측 기각 — 이중 리샘플링의 소프트한 입력이 오히려 CNN 학습 분포(운전자
+   모니터링 저해상도)에 정합해, 원본 직접 crop은 기존 정탐을 붕괴시키고 웃음 실눈 오탐을 새로
+   유발한다([리뷰](docs/reviews/2026-07-17-native-eyecrop-verdict.md)). 남은 경로는 라벨셋 → 임계/
+   양눈 규칙 재보정 → 부족 시 상용 가능 대체 신호(FaceMesh EAR 등) 순
 4. Spring과 `confirm_distinct` 트리거 정책 합의 — 즉시 발행(안전) vs 공유 시점 일괄 발행(발행 전 새
    업로드가 끼면 그 사이 재군집은 보호 공백). 단, 상태 기반 계약 개편
    ([docs/backlog/state-based-feedback-contract.md](docs/backlog/state-based-feedback-contract.md))
