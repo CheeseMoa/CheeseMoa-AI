@@ -91,7 +91,7 @@ class Settings(BaseSettings):
   quality_min_blur_face_px: int = 64  # 이보다 작은 얼굴은 blur 판정 제외 (variance 신뢰 불가)
   quality_blur_main_face_ratio: float = 0.5  # 최대 얼굴 폭 대비 이 비율 미만은 배경 얼굴로 보고 blur 판정 제외
   quality_whole_image_blur_threshold: float = 100.0  # 판정 자격 얼굴 없을 때 전체 이미지 fallback (별도 보정)
-  quality_shake_coherence_threshold: float = 0.40  # fallback 2차 신호 — 방향 쏠림 임계 (ADR 014). 0 = 비활성
+  quality_shake_coherence_threshold: float = 0.35  # fallback 2차 신호 — 쏠림 임계 (ADR 014 §재보정). 0 = 비활성
   quality_shake_max_norm_variance: float = 60.0  # 쏠림이 높아도 정규화 variance가 이 값 이상이면 선명으로 본다
   quality_shake_coherence_floor: float = 0.35  # 흔들림 재확인 게이트 — 쏠림이 이 값 미만이면 해제. 0 = 비활성
   quality_whole_image_collapse_variance: float = 40.0  # fallback 한정 게이트 면제 — 붕괴는 흔들림 확정. 0 = 비활성
