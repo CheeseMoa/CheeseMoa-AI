@@ -97,6 +97,10 @@ class Settings(BaseSettings):
   quality_whole_image_collapse_variance: float = 40.0  # fallback 한정 게이트 면제 — 붕괴는 흔들림 확정. 0 = 비활성
   quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
   quality_eye_box_px: int = 24
+  quality_min_eye_face_px: int = 64  # 이보다 작은 얼굴은 눈감음 판정 제외 (정보 부족, ADR 019). 0 = 비활성
+  quality_eye_cheek_brightness_ceiling: float = (
+    1.4  # 눈/볼 밝기 비 상한 — 초과면 가림으로 보고 미판정 (ADR 019). 0 = 비활성
+  )
 
   log_level: str = "INFO"
 
@@ -159,4 +163,6 @@ class Settings(BaseSettings):
       whole_image_collapse_variance=self.quality_whole_image_collapse_variance,
       eye_closed_confidence=self.quality_eye_closed_confidence,
       eye_box_px=self.quality_eye_box_px,
+      min_eye_face_px=self.quality_min_eye_face_px,
+      eye_cheek_brightness_ceiling=self.quality_eye_cheek_brightness_ceiling,
     )
