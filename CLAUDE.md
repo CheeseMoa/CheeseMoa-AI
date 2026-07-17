@@ -103,6 +103,8 @@ Laplacian variance — 단 **주 인물 얼굴만**(최대 얼굴 폭의 50% 미
 variance 기반 blurry 판정(얼굴·fallback 공통)은 최종적으로 흔들림 재확인 게이트를 거친다 — 전체
 이미지 방향 쏠림이 바닥(0.35) 미만이면 손떨림이 아니라 소프트 원판(옛날 인화 재촬영·앱 스무딩)으로
 보고 해제, variance는 잔결의 양만 재서 둘을 구분 못한다([ADR 018](docs/decisions/018-shake-coherence-floor.md)).
+단 fallback에서 whole_var가 붕괴 수준(<40)이면 게이트 면제·흔들림 확정 — 고스팅형 손떨림은 쏠림이
+낮게 나온다(event 55 실측, ADR 018 보강).
 임계는 `QualityConfig`. 한계: 웃음 캔디드 오탐(표정 CNN 후속 필요), 부분 모션블러+선명 배경 사각지대,
 회전 손떨림(전역 쏠림 낮음 — ADR 018 게이트가 해제하는 방향), 아웃포커스 주 인물(등방이라 동일).
 모델 소싱: `model_source.py`의 `UrlModelSource`.
@@ -273,8 +275,11 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
   쏠림(손떨림은 이방성, 소프트 원판은 등방): 오탐 최고 0.268 vs 흔들림 최저 0.444(얼굴 경로)의 빈
   구간에서 0.35를 바닥으로 채택, variance 판정 말미에 게이트로 적용(`shake_confirmed`,
   `QUALITY_SHAKE_COHERENCE_FLOOR`, 0=비활성). 얼굴 crop 쏠림은 판별력 없음(겹침 실측). event 50
-  오탐 8장 전부 해제 + 나머지 51장 무변경, test2 라벨셋 무회귀. 한계: 등방성 블러(아웃포커스 주
-  인물·회전 손떨림)를 함께 해제 — 미탐 리포트 축적 시 라벨셋 추가 후 재보정.
+  오탐 8장 전부 해제 + 나머지 51장 무변경, test2 라벨셋 무회귀. **보강(당일)**: event 55에서
+  고스팅형 손떨림(겹침 번짐 — 쏠림 0.306으로 낮음)이 게이트에 오해제되어 공통첩으로 유출 →
+  fallback 한정 variance 붕괴 면제(whole_var<40이면 쏠림 무관 흔들림 확정, 흔들림 13.5 vs 무얼굴
+  옛날 사진 98.9) 추가. 얼굴 경로엔 면제 불가(블러 프레임 옛날 사진의 whole_var가 1.7~24로 겹침) —
+  등방성 블러 얼굴은 남은 한계, 미탐 리포트 축적 시 라벨셋 추가 후 재보정.
 - **대형 근접 얼굴 재검출 회복 — 초근접 얼굴 미검출 해소** (2026-07-16,
   [ADR 017](docs/decisions/017-size-aware-detection-score-threshold.md)) — event 36에서 얼굴이 크게 나온
   아이(0010=`6acd1055`)가 공통 사진첩으로 빠지던 문제. 원인은 YuNet(WIDER FACE 학습)이 초근접 대형
