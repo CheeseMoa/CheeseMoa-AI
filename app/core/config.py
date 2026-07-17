@@ -60,6 +60,8 @@ class Settings(BaseSettings):
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
+  cluster_evict_gray_ceiling: float = 0.46  # ADR-020: LOO centroid 회색지대 상한 — face-pair 재확인 대상
+  cluster_evict_facepair_floor: float = 0.45  # ADR-020: 회색지대 잔류 자격(최강 쌍) — 미만이면 남남 부착 축출
   cluster_blob_promote_similarity: float = 0.45
   cluster_blob_promote_floor: float = 0.4
 
@@ -122,6 +124,8 @@ class Settings(BaseSettings):
       rescue_similarity=self.cluster_rescue_similarity,
       min_membership_similarity=self.cluster_min_membership_similarity,
       min_membership_margin=self.cluster_min_membership_margin,
+      evict_gray_ceiling=self.cluster_evict_gray_ceiling,
+      evict_facepair_floor=self.cluster_evict_facepair_floor,
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
     )

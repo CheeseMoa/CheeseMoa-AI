@@ -9,6 +9,7 @@
   ③ 파편 병합 — centroid 유사도가 동일 인물 수준인 클러스터 병합 (완전 연결, 단일 인물 파편화 교정, ADR 005)
   ④ 노이즈 구제 — 최근접 centroid 유사도가 충분한 노이즈 얼굴을 클러스터에 편입
   ⑤ 저신뢰 분리 — 절대 유사도·2위 마진 임계 미달 멤버를 ambiguous로 분리 (TBD #3 기본 정책)
+     + 회색지대(centroid 바닥은 넘었지만 낮음) 멤버는 face-pair 증거로 재확인해 증거 없으면 축출 (ADR 020)
   ⑥ 2차 파편 병합 — 구제·분리로 바뀐 최종 멤버십에 ③과 같은 판정을 재적용 (ADR-010)
   ⑦ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
   ⑧ 클러스터별 대표벡터(L2 정규화 평균, 파생 캐시) 계산
@@ -79,6 +80,19 @@ class ClusterConfig:
   # 자기 centroid 절대 유사도 바닥, 그리고 2위 클러스터와의 유사도 마진.
   min_membership_similarity: float = 0.4
   min_membership_margin: float = 0.05
+  # 저신뢰 분리의 회색지대 face-pair 재확인 게이트 (ADR 020) — LOO centroid가 바닥(0.4)은 넘었지만
+  # 이 값 미만인 "회색지대" 멤버는, 클러스터 내 최강 face-pair가 아래 floor 미만이면(동일인 증거
+  # 부재) 노이즈로 축출한다. 전역 바닥 상향은 불가 — 동일인 LOO와 남남 LOO가 [0.40, 0.46)에서
+  # 섞인다(라벨 코퍼스 진짜 멤버 최저 0.502 vs 실 이벤트 남남 부착 0.402~0.456, event 61 실측
+  # 0.425). 판별 신호는 ADR-016과 동일하게 개별 쌍에 남는다: 남남 부착의 top쌍 ≤0.44 vs 진짜
+  # 멤버 top쌍 ≥0.469. ceiling 0.46 = 남남 관측 최고 0.456 직상 + 코퍼스 진짜 멤버 LOO 최저
+  # 0.502 아래. 둘 중 하나라도 0이면 비활성(기존 동작).
+  evict_gray_ceiling: float = 0.46
+  # 회색지대 멤버의 잔류 자격 — 클러스터 내 최강 face-pair가 이 이상이면 동일인 증거로 보고 보호.
+  # 0.45 = blob 승격 간선 임계와 동일값: 실측 갭 [0.44, 0.469] 안이면서, 승격 성분(전 간선 ≥0.45)의
+  # 멤버가 승격 직후 이 게이트로 재강등되는 churn을 구조적으로 차단한다 (blob_promote_floor
+  # 불변식과 같은 계열 — __post_init__에서 강제).
+  evict_facepair_floor: float = 0.45
   # 균질 blob 부분 승격 간선 임계 — HDBSCAN이 클러스터 0개를 낸 전원 노이즈에서, 쌍 유사도가 이 이상인
   # 얼굴끼리 간선으로 이어 연결 성분을 만든다 (ADR-008). 실측 동일 인물 쌍 하한(0.46, 포즈 변화 실사진)
   # 직하이면서 타인 상한(≲0.3) 대비 넉넉한 마진 (TBD #4에서 실데이터 재조정).
@@ -103,6 +117,8 @@ class ClusterConfig:
       "rescue_similarity",
       "min_membership_similarity",
       "min_membership_margin",
+      "evict_gray_ceiling",
+      "evict_facepair_floor",
       "blob_promote_similarity",
       "blob_promote_floor",
     ):
@@ -135,6 +151,20 @@ class ClusterConfig:
         "blob_promote_floor는 min_membership_similarity 이상이어야 합니다. "
         f"받은 값: blob_floor={self.blob_promote_floor}, membership_floor={self.min_membership_similarity}"
       )
+    if self.evict_gray_ceiling > 0 and self.evict_facepair_floor > 0:
+      if self.evict_gray_ceiling < self.min_membership_similarity:
+        # ceiling이 바닥 아래면 회색지대가 공집합이라 게이트가 조용히 죽는다 — 오설정을 즉시 드러낸다
+        raise ValueError(
+          "evict_gray_ceiling은 min_membership_similarity 이상이어야 합니다. "
+          f"받은 값: ceiling={self.evict_gray_ceiling}, membership_floor={self.min_membership_similarity}"
+        )
+      if self.evict_facepair_floor > self.blob_promote_similarity:
+        # 승격 성분의 간선(≥ promote_similarity)이 facepair floor를 자동 충족해야, 방금 승격된
+        # 성분이 같은 실행의 회색지대 게이트로 곧바로 해체되는 churn이 없다 (위 불변식들과 같은 계열).
+        raise ValueError(
+          "evict_facepair_floor는 blob_promote_similarity 이하여야 합니다. "
+          f"받은 값: facepair_floor={self.evict_facepair_floor}, promote={self.blob_promote_similarity}"
+        )
 
 
 @dataclass(frozen=True)
@@ -600,6 +630,10 @@ def _evict_ambiguous(
   자신 없는 배정을 인물 앨범에 넣지 않는다 (feature-spec §7, TBD #3의 기본 정책):
   - 자기 클러스터 유사도가 바닥(min_membership_similarity) 미만 → 어디에도 속하지 않는 얼굴이므로
     노이즈로 강등한다 (반환 목록에는 없음 — noise_indices로 집계된다).
+  - 바닥은 넘었지만 회색지대(< evict_gray_ceiling)인 멤버는 face-pair 증거로 재확인한다 (ADR 020):
+    클러스터 내 최강 쌍이 evict_facepair_floor 미만이면 클러스터의 누구와도 동일인 증거가 없는
+    남남 부착이므로 노이즈로 강등한다. centroid는 회색지대에서 동일인/남남이 섞여(전역 바닥 상향
+    불가) 판별 신호가 개별 쌍에만 남는다 — ADR-016(파편병합 face-pair 게이트)과 같은 원리.
   - 2위 클러스터와의 유사도 마진이 min_membership_margin 미만 → 두 인물 사이의 애매한 얼굴이므로
     ambiguous로 분리해 반환한다.
   자기 클러스터 유사도는 leave-one-out centroid(자기를 뺀 평균) 기준이다 — 자기가 포함된
@@ -624,6 +658,7 @@ def _evict_ambiguous(
       linked[pos_a, pos_b] = linked[pos_b, pos_a] = True
 
   all_sims = embeddings @ centroids.T  # (N, 클러스터 수) — 멤버별 matmul 대신 1회 BLAS 호출 (N=8천에서 ~3배 차이)
+  gray_gate = config.evict_gray_ceiling > 0 and config.evict_facepair_floor > 0
   demoted_noise: list[int] = []
   ambiguous: list[int] = []
   for pos, (_, members) in enumerate(ordered):
@@ -633,12 +668,21 @@ def _evict_ambiguous(
     loo_sims = _loo_similarities(embeddings, members)
     unlinked = [q for q in range(count) if q != pos and not linked[pos, q]]
     others_max = all_sims[member_arr][:, unlinked].max(axis=1) if unlinked else None
+    pair_sims = None
+    if gray_gate and bool((loo_sims < config.evict_gray_ceiling).any()):
+      pair_sims = embeddings[member_arr] @ embeddings[member_arr].T  # 회색지대 멤버가 있을 때만 계산
     for row, idx in enumerate(members):
       if idx in protected:
         continue
       sim_own = float(loo_sims[row])
       if sim_own < config.min_membership_similarity:
         demoted_noise.append(idx)
+      elif (
+        pair_sims is not None
+        and sim_own < config.evict_gray_ceiling
+        and float(np.delete(pair_sims[row], row).max()) < config.evict_facepair_floor
+      ):
+        demoted_noise.append(idx)  # 회색지대 + 동일인 쌍 증거 부재 = 남남 부착 (ADR 020)
       elif others_max is not None and sim_own - float(others_max[row]) < config.min_membership_margin:
         ambiguous.append(idx)
   for idx in demoted_noise + ambiguous:
