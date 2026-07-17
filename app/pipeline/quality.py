@@ -86,6 +86,15 @@ class QualityConfig:
   # 구도가 단순해 에지 방향이 우연히 쏠린 선명한 사진의 오탐 가드 (라벨셋 child4: 쏠림 0.491이지만
   # variance 236.9로 명백히 선명). 흔들린 사진의 실측 최고는 55.5.
   shake_max_norm_variance: float = 60.0
+  # 흔들림 재확인 게이트 — variance가 임계 미달(흔들림)이어도 전체 이미지 방향 쏠림이 이 값 미만이면
+  # 손떨림이 아니라 원판 자체가 소프트한 사진(옛날 인화 재촬영·앱 스무딩)으로 보고 blurry를 해제한다.
+  # variance는 잔결의 양만 재서 "디테일이 원래 없는 사진"과 "흔들려서 디테일이 뭉개진 사진"을 구분
+  # 못하는데, 손떨림은 모든 에지가 한 방향으로 번져 쏠림이 높다(얼굴 crop 쏠림은 판별력 없음 — 실측
+  # 흔들림 0.132~0.349 vs 옛날사진 0.044~0.454 겹침). event 50 실측: 옛날 사진 오탐 최고 0.268 vs
+  # 흔들림 라벨셋 최저 0.397(얼굴 미검출)·0.444(얼굴 검출) — 빈 구간 중 미탐 리스크가 적은 쪽인
+  # 0.35 채택. 2차 신호(shake_coherence_threshold ≥ 이 값)로 잡힌 사진은 정의상 게이트를 통과한다.
+  # 한계: 등방성 블러(아웃포커스 주 인물·회전 손떨림)는 쏠림이 낮아 함께 해제된다. 0 = 비활성.
+  shake_coherence_floor: float = 0.35
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -106,6 +115,8 @@ class QualityConfig:
       raise ValueError(f"shake_coherence_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.shake_coherence_threshold}")
     if self.shake_max_norm_variance <= 0.0:
       raise ValueError(f"shake_max_norm_variance는 양수여야 합니다. 받은 값: {self.shake_max_norm_variance}")
+    if not 0.0 <= self.shake_coherence_floor <= 1.0:
+      raise ValueError(f"shake_coherence_floor는 [0, 1] 범위여야 합니다. 받은 값: {self.shake_coherence_floor}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
@@ -169,6 +180,18 @@ def shake_signals(image: np.ndarray) -> tuple[float, float]:
   trace = jxx + jyy
   coherence = float(np.sqrt((jxx - jyy) ** 2 + 4 * jxy**2) / trace) if trace > 0 else 0.0
   return norm_var, coherence
+
+
+def shake_confirmed(image: np.ndarray, config: QualityConfig) -> bool:
+  """variance가 흔들림이라 한 사진을 전체 이미지 방향 쏠림으로 재확인한다 (shake_coherence_floor 주석 참고).
+
+  True = 쏠림이 바닥값 이상(손떨림 정합) → blurry 유지. False = 등방(원판이 소프트한 사진) → 해제.
+  얼굴 판정·전체 이미지 fallback 공통 최종 게이트로, blurry=True일 때만 호출한다.
+  """
+  if config.shake_coherence_floor <= 0:
+    return True
+  _, coherence = shake_signals(image)
+  return coherence >= config.shake_coherence_floor
 
 
 def crop_eye(aligned: np.ndarray, center: tuple[float, float], box_px: int) -> np.ndarray | None:
@@ -339,4 +362,7 @@ if __name__ == "__main__":
         f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback "
         f"(whole_var={whole_var:.1f} norm_var={norm_var:.1f} coherence={coherence:.3f})"
       )
+    if blurry and not shake_confirmed(image, config):
+      blurry = False
+      print(f"  {path}: variance는 흔들림이나 방향 쏠림 미달 → 소프트 원판으로 보고 해제")
     print(f"{path}: {len(detected)} face(s) → eyes_closed={eyes_closed}, blurry={blurry}")
