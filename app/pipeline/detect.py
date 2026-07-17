@@ -39,7 +39,10 @@ DEFAULT_FP_ASPECT_THRESHOLD = 0.70  # 종횡비 = bbox 폭/높이 (w/h)
 # 실얼굴은 너무 커서 저score였을 뿐이라 정규 스케일에서 score가 오르지만(median 0.44), 진짜 오검출
 # (아웃포커스 배경·신체일부)은 어느 스케일에서도 낮다(median 0.00) — score·선명도로는 안 갈리지만
 # 재검출은 깨끗이 가른다(재검출≥0.80에서 실얼굴 회복·오검출 0/41, survey 2026-07-16).
-DEFAULT_BIG_FACE_REL_WIDTH = 0.30  # 이 rel_w(bbox폭/긴변) 이상의 저score 얼굴만 재검출 회복 대상
+# rel_w 하한 0.30→0.20 재보정(ADR-017 §재보정, 2026-07-17): 화면을 다 덮는 얼굴은 YuNet이 bbox를
+# 실제보다 훨씬 작게(파편으로) 그려 rel_w 0.280·0.295로 게이트에 미달했다(event 60 등 미검출 2장).
+# 게이트 스윕 실측(783장): 0.20으로 내려도 오검출 통과 0·기존 검출 손실 0 — 판별은 재검출 score가 한다.
+DEFAULT_BIG_FACE_REL_WIDTH = 0.20  # 이 rel_w(bbox폭/긴변) 이상의 저score 얼굴만 재검출 회복 대상
 DEFAULT_BIG_FACE_REDETECT_SCORE = 0.80  # 정규 스케일 재검출 score가 이 이상이면 실얼굴로 보고 회복
 _BIG_FACE_MODEL_FLOOR = 0.2  # 회복 활성 시 YuNet 모델 score 바닥 — 저score 대형 후보를 표면화 (실측 최저 0.22 포섭)
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
