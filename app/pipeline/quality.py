@@ -95,6 +95,13 @@ class QualityConfig:
   # 0.35 채택. 2차 신호(shake_coherence_threshold ≥ 이 값)로 잡힌 사진은 정의상 게이트를 통과한다.
   # 한계: 등방성 블러(아웃포커스 주 인물·회전 손떨림)는 쏠림이 낮아 함께 해제된다. 0 = 비활성.
   shake_coherence_floor: float = 0.35
+  # 재확인 게이트의 면제 조건(fallback 한정) — 전체 이미지 raw variance가 이 값 미만이면 잔결 붕괴
+  # 수준의 블러라 쏠림과 무관하게 흔들림을 유지한다. 고스팅형 손떨림(겹침 번짐)은 에지 방향이 다양해
+  # 쏠림이 낮게 나오는데(event 55 실측 13.5/0.306 — 게이트가 오해제), 소프트 원판은 얼굴 미검출이어도
+  # variance가 이만큼 붕괴하지 않는다(event 50 무얼굴 옛날 사진 98.9). 13.5와 98.9 사이 40 채택.
+  # 얼굴 경로에는 적용하지 않는다 — 블러 프레임을 두른 옛날 사진은 전체 variance가 1.7~24까지
+  # 떨어져(합성 블러 배경) 면제가 오탐을 되살린다. 0 = 비활성(게이트 항상 적용).
+  whole_image_collapse_variance: float = 40.0
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -117,6 +124,10 @@ class QualityConfig:
       raise ValueError(f"shake_max_norm_variance는 양수여야 합니다. 받은 값: {self.shake_max_norm_variance}")
     if not 0.0 <= self.shake_coherence_floor <= 1.0:
       raise ValueError(f"shake_coherence_floor는 [0, 1] 범위여야 합니다. 받은 값: {self.shake_coherence_floor}")
+    if self.whole_image_collapse_variance < 0.0:
+      raise ValueError(
+        f"whole_image_collapse_variance는 0 이상이어야 합니다. 받은 값: {self.whole_image_collapse_variance}"
+      )
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
@@ -351,10 +362,12 @@ if __name__ == "__main__":
       print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}] blur_var={var:.1f}{note}")
 
     eyes_closed, blurry = judge_faces(faces, classifier, config)
+    gate_exempt = False
     if blurry is None:
       # deps.build_face_extractor와 같은 fallback — CLI 판정이 프로덕션 라우팅과 일치해야 보정에 쓸 수 있다
       whole_var = blur_variance(image)
       blurry = whole_var < config.whole_image_blur_threshold
+      gate_exempt = blurry and whole_var < config.whole_image_collapse_variance
       norm_var, coherence = shake_signals(image)
       if not blurry and config.shake_coherence_threshold > 0:
         blurry = coherence >= config.shake_coherence_threshold and norm_var < config.shake_max_norm_variance
@@ -362,7 +375,9 @@ if __name__ == "__main__":
         f"  {path}: blur 판정 자격 얼굴 없음 → 전체 이미지 fallback "
         f"(whole_var={whole_var:.1f} norm_var={norm_var:.1f} coherence={coherence:.3f})"
       )
-    if blurry and not shake_confirmed(image, config):
+      if gate_exempt:
+        print(f"  {path}: variance 붕괴 수준 → 쏠림 재확인 면제 (흔들림 확정)")
+    if blurry and not gate_exempt and not shake_confirmed(image, config):
       blurry = False
       print(f"  {path}: variance는 흔들림이나 방향 쏠림 미달 → 소프트 원판으로 보고 해제")
     print(f"{path}: {len(detected)} face(s) → eyes_closed={eyes_closed}, blurry={blurry}")
