@@ -88,6 +88,10 @@ class Settings(BaseSettings):
   # 얼굴은 bbox 파편이 rel_w 0.28대로 나와 게이트 미달 — 스윕 실측 FP 0·손실 0.
   detect_big_face_rel_width: float = 0.20
   detect_big_face_redetect_score: float = 0.80
+  # 재검출 랜드마크 신뢰 임계 (survey_refine_shift.py 실측): 재검출 score가 이 값 이상이면 이동량
+  # 가드를 무시하고 재검출 랜드마크를 채택 — 초대형 얼굴은 bbox가 파편이라 올바른 교정도 파편 폭
+  # 기준 가드에 걸려 깨진 랜드마크가 유지되던 문제(event 73 공통첩 유출·유령 앨범). 0 = 비활성.
+  detect_refine_trust_redetect_score: float = 0.80
 
   # ── 품질 게이트 임계값 (눈감음/흔들림 — 하드코딩 금지, 기본값은 초기값이며 face-test 실측 보정) ──
   quality_blur_threshold: float = 25.0  # 정규화 variance 기준 (test2 라벨셋 보정, QualityConfig 주석 참고)
@@ -154,6 +158,7 @@ class Settings(BaseSettings):
       fp_aspect_threshold=self.detect_fp_aspect_threshold,
       big_face_rel_width=self.detect_big_face_rel_width,
       big_face_redetect_score=self.detect_big_face_redetect_score,
+      refine_trust_redetect_score=self.detect_refine_trust_redetect_score,
     )
 
   def to_quality_config(self) -> "QualityConfig":

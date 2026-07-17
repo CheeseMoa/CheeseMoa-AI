@@ -31,7 +31,11 @@ score<0.78 AND 종횡비(w/h)<0.70 제거, [ADR 015](docs/decisions/015-detectio
 + 대형 근접 얼굴 재검출 회복 — rel_w≥0.20 저score(<0.6) 후보를 정규 스케일 재검출해 재검출 score≥0.80이면
 되살림, YuNet이 초근접 대형 얼굴에 저score를 줘 공통첩으로 빠지던 문제, rel_w 하한 0.30→0.20 재보정 —
 화면을 덮는 얼굴은 bbox 파편이 rel_w 0.28대로 나와 게이트 미달(event 60 미검출),
-[ADR 017](docs/decisions/017-size-aware-detection-score-threshold.md) §재보정) →
+[ADR 017](docs/decisions/017-size-aware-detection-score-threshold.md) §재보정
++ 재검출 랜드마크 신뢰 — 재검출 score≥0.80이면 랜드마크 이동량 가드를 무시하고 재검출 랜드마크 채택,
+가드 기준이 파편 bbox 폭이라 초대형 얼굴의 올바른 교정을 오매칭으로 오판해 깨진 랜드마크가 유지되고
+그 쓰레기 임베딩이 공통첩 유출·유령 앨범을 만들던 문제(event 73),
+[ADR 023](docs/decisions/023-refine-trust-redetect-landmarks.md)) →
 face_align(직접 구현 Umeyama, 112×112 ArcFace 기준점) →
 AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Laplacian, 토글 ON시 eyes_closed/blurry로 분리·
 재군집 제외) → HDBSCAN(PoC numpy 이식본, cosine, epsilon=0.15, event 전체 임베딩 재군집) → cluster_id 재조정
@@ -300,6 +304,19 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **재검출 랜드마크 신뢰 임계 — 초대형 얼굴 파편 bbox의 가드 오판 해소** (2026-07-17,
+  [ADR 023](docs/decisions/023-refine-trust-redetect-landmarks.md)) — event 73(group 27)에서 얼굴이
+  크게 나온 1인 사진이 공통 사진첩으로 빠지던 문제. YuNet이 초대형 얼굴에 파편 bbox(score 0.640,
+  게이트 0.6을 살짝 통과해 ADR-017 회복 경로 미적용)를 주고, 랜드마크 정제의 재검출이 올바른
+  랜드마크(score 0.860)를 찾고도 이동량 가드(0.5 × 파편 bbox 폭)에 걸려 폐기 → 깨진 랜드마크의
+  쓰레기 임베딩(동일인과도 0.24)이 노이즈로 유출. 같은 뿌리로 recover 경로의 "가드 걸리면 원
+  랜드마크 유지" 폴백이 offset 파편 박스 3개를 쓰레기 임베딩으로 살려 유령 인물 앨범까지 생성.
+  실측(34개 이벤트 520장, 가드 발동 33건): 좋은 교정은 재검출 score 전부 ≥0.86(NN 0.32→0.98 등),
+  무익한 후보는 전부 ≤0.39 — 빈 구간에서 회복 임계와 같은 0.80을 신뢰 임계로 채택, 이상이면
+  가드 무시하고 재검출 랜드마크 채택(refine·recover 공통). 교정된 중심이 본 얼굴을 가리켜 파편
+  박스는 디둡으로 제거 → 유령 앨범 뿌리 차단. 검증: 31/34 이벤트 불변, 변경 3개 전부 의도된
+  수정(리포트 사진 앨범 편입 + 유령 앨범 소멸), 라벨 코퍼스 child ARI 0.573→0.794(순개선)·나머지
+  불변. `DETECT_REFINE_TRUST_REDETECT_SCORE`(0=비활성), 도구 `scripts/survey_refine_shift.py`.
 - **눈감음 판정 blendshape 교체 — Face Landmarker litert 이식** (2026-07-17,
   [ADR 021](docs/decisions/021-blink-blendshape-litert.md)) — 눈 패치 CNN의 도메인 실패(유아 오탐·
   보정 스톡 미탐·수면 미탐, event 61)를 A/B 실측(871 얼굴, [리뷰](docs/reviews/2026-07-17-mediapipe-blink-ab.md))
