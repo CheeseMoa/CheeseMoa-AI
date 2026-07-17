@@ -106,9 +106,18 @@ class QualityConfig:
   # 수준의 블러라 쏠림과 무관하게 흔들림을 유지한다. 고스팅형 손떨림(겹침 번짐)은 에지 방향이 다양해
   # 쏠림이 낮게 나오는데(event 55 실측 13.5/0.306 — 게이트가 오해제), 소프트 원판은 얼굴 미검출이어도
   # variance가 이만큼 붕괴하지 않는다(event 50 무얼굴 옛날 사진 98.9). 13.5와 98.9 사이 40 채택.
-  # 얼굴 경로에는 적용하지 않는다 — 블러 프레임을 두른 옛날 사진은 전체 variance가 1.7~24까지
+  # 얼굴 경로에는 무조건 적용하지 않는다 — 블러 프레임을 두른 옛날 사진은 전체 variance가 1.7~24까지
   # 떨어져(합성 블러 배경) 면제가 오탐을 되살린다. 0 = 비활성(게이트 항상 적용).
   whole_image_collapse_variance: float = 40.0
+  # 붕괴 면제의 얼굴 경로 확장 조건 (ADR 018 §보강 2) — blurry로 판정된 얼굴의 bbox 폭이 이미지
+  # 긴 변 대비 이 비율 이상이면(대형 주 인물) 얼굴 경로에서도 위 붕괴 면제를 적용한다. 얼굴이 화면
+  # 대부분을 차지하면 whole_var는 사실상 얼굴 자체를 재는 것이라 fallback 면제 논리가 그대로 성립하고,
+  # 옛날 인화 오탐은 두 갈래로 걸러진다 — whole_var 붕괴 사진은 전부 얼굴이 작고(rel_w≤0.172, 붕괴는
+  # 얼굴 밖 블러 프레임의 가짜 신호), 얼굴이 큰 사진은 whole_var 미붕괴(113.1). 고스팅 손떨림 대형
+  # 셀피(rel_w 0.280, whole_var 13.5 — event 64)와의 빈 구간 [0.172, 0.280] 기하 중앙 0.22 채택
+  # (코퍼스 499장 스윕: 발동은 고스팅뿐, 오탐 0 — 단 고스팅 정탐 표본이 유니크 1장이라 재보정 대상).
+  # 0 = 비활성(얼굴 경로 면제 없음 — 종전 동작).
+  collapse_face_rel_width: float = 0.22
   # 눈감음: closed 클래스 softmax 확률이 이 값 이상이면 그 눈을 감은 것으로 본다. face-test 실측 보정값 0.85 —
   # 진짜 감은 눈은 min 확률 ≥0.8인데, 뒤통수 오검출(0.65)·안경 실눈(0.52) 같은 약한 오탐이 그 아래로 떨어진다.
   eye_closed_confidence: float = 0.85
@@ -147,6 +156,8 @@ class QualityConfig:
       raise ValueError(
         f"whole_image_collapse_variance는 0 이상이어야 합니다. 받은 값: {self.whole_image_collapse_variance}"
       )
+    if not 0.0 <= self.collapse_face_rel_width < 1.0:
+      raise ValueError(f"collapse_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.collapse_face_rel_width}")
     if not 0.0 <= self.eye_closed_confidence <= 1.0:
       raise ValueError(f"eye_closed_confidence는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_closed_confidence}")
     if self.eye_box_px <= 1:
@@ -228,6 +239,20 @@ def shake_confirmed(image: np.ndarray, config: QualityConfig) -> bool:
     return True
   _, coherence = shake_signals(image)
   return coherence >= config.shake_coherence_floor
+
+
+def face_collapse_exempt(image: np.ndarray, blurry_face_w: int, config: QualityConfig) -> bool:
+  """얼굴 경로의 재확인 게이트 면제 (ADR 018 §보강 2) — collapse_face_rel_width 주석 참고.
+
+  blurry로 판정된 얼굴이 대형 주 인물(bbox 폭 ≥ 긴 변 × collapse_face_rel_width)이고 전체 variance가
+  붕괴 수준이면, 고스팅형 손떨림(쏠림 낮음)으로 보고 shake_confirmed 게이트를 건너뛰어 blurry를
+  유지한다. 얼굴 경로에서 blurry=True일 때만 호출한다.
+  """
+  if config.collapse_face_rel_width <= 0 or config.whole_image_collapse_variance <= 0:
+    return False
+  if blurry_face_w < config.collapse_face_rel_width * max(image.shape[:2]):
+    return False
+  return blur_variance(image) < config.whole_image_collapse_variance
 
 
 def _box_mean(gray: np.ndarray, center: tuple[float, float], box_px: int) -> float | None:
@@ -351,8 +376,8 @@ def _eye_judgment_eligible(aligned: np.ndarray, bbox_crop: np.ndarray | None, co
 
 def judge_faces(
   faces: Sequence[FacePair], classifier: EyeStateClassifier, config: QualityConfig
-) -> tuple[bool, bool | None]:
-  """얼굴별 (정렬 crop, bbox crop) 목록 → 이미지 단위 (eyes_closed, blurry) 판정.
+) -> tuple[bool, bool | None, int]:
+  """얼굴별 (정렬 crop, bbox crop) 목록 → 이미지 단위 (eyes_closed, blurry, blurry 얼굴 최대 폭) 판정.
 
   "얼굴 1개라도" 규칙: 어느 한 얼굴이라도 양눈 감김이면 eyes_closed, 어느 한 얼굴이라도 blur면 blurry.
   양눈이 모두 잡히는 얼굴만 눈감음 후보다 — 옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정.
@@ -363,6 +388,9 @@ def judge_faces(
   가장 큰 얼굴 폭의 blur_main_face_ratio 이상. 배경 인물의 아웃포커스는 흔들림 증거가 아니다(모듈 주석).
   판정 자격 얼굴이 하나도 없으면 None — 얼굴 미검출과 같은 "얼굴로는 알 수 없음"이므로 호출자가
   전체 이미지 fallback으로 판정한다.
+  세 번째 반환값은 blurry로 판정된 얼굴들의 최대 bbox 폭(px, 없으면 0) — 호출자가 이미지 긴 변과
+  비교해 얼굴 경로 붕괴 면제(collapse_face_rel_width, ADR 018 §보강 2)의 자격을 정한다. 이 값을
+  모으기 위해 blurry 확정 후에도 자격 얼굴의 variance 판정을 계속한다(112px 리사이즈뿐이라 저비용).
   """
   widest = max(
     (crop.shape[1] for _, crop in faces if crop is not None and crop.size > 0),
@@ -371,6 +399,7 @@ def judge_faces(
   min_main_width = config.blur_main_face_ratio * widest
   eyes_closed = False
   blurry: bool | None = None
+  blurry_face_w = 0
   for aligned, bbox_crop in faces:
     if not eyes_closed and aligned is not None and _eye_judgment_eligible(aligned, bbox_crop, config):
       eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
@@ -378,12 +407,14 @@ def judge_faces(
         probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]  # 위에서 None 배제 확인
         if all(prob >= config.eye_closed_confidence for prob in probs):
           eyes_closed = True
-    if blurry is not True and bbox_crop is not None and bbox_crop.size > 0:
+    if bbox_crop is not None and bbox_crop.size > 0:
       if min(bbox_crop.shape[:2]) >= config.min_blur_face_px and bbox_crop.shape[1] >= min_main_width:
-        blurry = face_blur_variance(bbox_crop) < config.blur_threshold
-    if eyes_closed and blurry:
-      break  # 둘 다 확정되면 나머지 얼굴은 볼 필요 없다
-  return eyes_closed, blurry
+        if face_blur_variance(bbox_crop) < config.blur_threshold:
+          blurry = True
+          blurry_face_w = max(blurry_face_w, bbox_crop.shape[1])
+        elif blurry is None:
+          blurry = False
+  return eyes_closed, blurry, blurry_face_w
 
 
 if __name__ == "__main__":
@@ -434,8 +465,12 @@ if __name__ == "__main__":
       bh, bw = bbox_crop.shape[:2]
       print(f"  {path} face{i} bbox={bw}x{bh}: closed_prob=[{probs_str}]{eye_note} blur_var={var:.1f}{note}")
 
-    eyes_closed, blurry = judge_faces(faces, classifier, config)
+    eyes_closed, blurry, blurry_face_w = judge_faces(faces, classifier, config)
     gate_exempt = False
+    if blurry and face_collapse_exempt(image, blurry_face_w, config):
+      # deps.build_face_extractor와 같은 얼굴 경로 붕괴 면제 (ADR 018 §보강 2)
+      gate_exempt = True
+      print(f"  {path}: 대형 얼굴 blurry + variance 붕괴 → 쏠림 재확인 면제 (흔들림 확정)")
     if blurry is None:
       # deps.build_face_extractor와 같은 fallback — CLI 판정이 프로덕션 라우팅과 일치해야 보정에 쓸 수 있다
       whole_var = blur_variance(image)
