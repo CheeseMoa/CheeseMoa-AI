@@ -109,6 +109,7 @@ class Settings(BaseSettings):
   # 0 = blink 비활성(롤백 스위치) — litert·face_landmarker 로딩 자체를 건너뛰고 순수 CNN 경로로 복귀.
   quality_blink_threshold: float = 0.40
   quality_blink_presence_floor: float = 0.5  # 랜드마크 presence가 미만이면 blink를 버리고 CNN 폴백 (ADR 021)
+  quality_eye_main_face_ratio: float = 0.5  # 최대 얼굴 폭 대비 이 비율 미만은 배경 얼굴로 보고 눈감음 판정 제외
 
   log_level: str = "INFO"
 
@@ -178,4 +179,5 @@ class Settings(BaseSettings):
       eye_cheek_brightness_ceiling=self.quality_eye_cheek_brightness_ceiling,
       blink_threshold=self.quality_blink_threshold,
       blink_presence_floor=self.quality_blink_presence_floor,
+      eye_main_face_ratio=self.quality_eye_main_face_ratio,
     )

@@ -152,6 +152,12 @@ class QualityConfig:
   # 실측(871 얼굴)에서 폴백의 정탐 기여 0, 유아 오탐(이중 검출 잔재 RoI)만 재생산해 제거.
   # 실측: 참조 대비 파리티 스윕에서 presence≥0.5 통과율 95%+, 극단 회전·옆얼굴이 여기서 걸러진다.
   blink_presence_floor: float = 0.5
+  # 눈감음 판정 자격의 상대 크기 하한 — blur_main_face_ratio와 같은 논리를 눈감음에 적용한다: 사진에서
+  # 가장 큰 얼굴 bbox 폭 대비 이 비율 미만인 얼굴은 주 인물이 아니라고 보고 눈감음 판정에서 제외한다.
+  # 배경 행인이 눈을 감아도 그 사진을 눈감음첩으로 보낼 이유가 아니다 — event 69 실측: 주인물 2명
+  # (blink 0.017~0.024, 뜸)이 선명한 사진이 프레임 끝에 걸린 행인 얼굴(최대 얼굴의 15% 폭, blink
+  # 0.426)로 eyes_closed 오탐. blink·CNN 롤백 경로 공통 적용. 0 = 비활성(모든 얼굴 판정 — 종전 동작).
+  eye_main_face_ratio: float = 0.5
 
   def __post_init__(self) -> None:
     # DetectorConfig/ClusterConfig와 같은 정책: 무의미한 값은 생성 시점에 거부한다.
@@ -189,6 +195,8 @@ class QualityConfig:
       raise ValueError(f"blink_threshold는 [0, 1] 범위여야 합니다. 받은 값: {self.blink_threshold}")
     if not 0.0 <= self.blink_presence_floor <= 1.0:
       raise ValueError(f"blink_presence_floor는 [0, 1] 범위여야 합니다. 받은 값: {self.blink_presence_floor}")
+    if not 0.0 <= self.eye_main_face_ratio <= 1.0:
+      raise ValueError(f"eye_main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_main_face_ratio}")
 
 
 @dataclass(frozen=True)
@@ -409,6 +417,8 @@ def judge_faces(
   — presence ≥ blink_presence_floor인 얼굴만 min(blinkL, blinkR) ≥ blink_threshold, presence 미달은
   미판정(CNN 폴백 없음 — 실측에서 폴백의 정탐 기여 0, 유아 오탐만 재생산). blendshape는 가림·유아·
   보정 이미지에서 CNN보다 강건해 ADR-019 자격 게이트도 필요 없다 (A/B 실측).
+  눈감음도 blurry처럼 주 인물 얼굴만 본다(eye_main_face_ratio, blink·CNN 경로 공통) — 배경 행인의
+  감은 눈은 사진을 눈감음첩으로 보낼 이유가 아니다 (event 69: 프레임 끝 행인 오탐).
   blink 비활성(blink_scores=None 또는 blink_threshold=0)이면 종전 CNN 경로로 판정한다:
   양눈이 모두 잡히는 얼굴만 눈감음 후보(옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정) +
   눈감음 판정 자격 게이트(ADR 019 — bbox 짧은 변 ≥ min_eye_face_px AND 눈/볼 밝기 비 ≤
@@ -426,12 +436,19 @@ def judge_faces(
     default=0,
   )
   min_main_width = config.blur_main_face_ratio * widest
+  min_eye_main_width = config.eye_main_face_ratio * widest
   eyes_closed = False
   blurry: bool | None = None
   blurry_face_w = 0
   blink_active = blink_scores is not None and config.blink_threshold > 0
   for i, (aligned, bbox_crop) in enumerate(faces):
-    if not eyes_closed:
+    # 배경 얼굴(최대 얼굴 폭 대비 eye_main_face_ratio 미만)은 눈감음 미판정 — blur와 같은 주 인물
+    # 규칙 (event 69: 행인의 감은 눈이 주인물 2명 뜬 사진을 eyes_closed로 오분류). 비활성(0)이면
+    # 종전대로 모든 얼굴을 판정한다.
+    eye_main = config.eye_main_face_ratio <= 0 or (
+      bbox_crop is not None and bbox_crop.size > 0 and bbox_crop.shape[1] >= min_eye_main_width
+    )
+    if not eyes_closed and eye_main:
       if blink_active:
         # presence 미달·RoI 퇴화는 미판정이다 — CNN 폴백은 실측(871 얼굴)에서 정탐 기여 0에
         # 유아 오탐만 재생산했다(랜드마커가 얼굴이 아니라는 RoI에서 눈 패치 CNN의 확신은
@@ -491,11 +508,17 @@ if __name__ == "__main__":
       blink_str = f"presence={blink[0]:.2f} blink=[{blink[1]:.3f}, {blink[2]:.3f}]" if blink else "blink=n/a"
       probs: list[float] = []
       eye_note = ""
+      if (
+        config.eye_main_face_ratio > 0
+        and bbox_crop.size > 0
+        and bbox_crop.shape[1] < config.eye_main_face_ratio * widest
+      ):
+        eye_note = " (배경 얼굴 — 눈감음 판정 제외)"
       if aligned is not None:
         if not _eye_judgment_eligible(aligned, bbox_crop, config):
           ratio = eye_cheek_ratio(aligned, config.eye_box_px)
           ratio_str = f"{ratio:.2f}" if ratio is not None else "n/a"
-          eye_note = " (CNN 폴백 자격 미달 — 눈/볼 밝기비 " + ratio_str + ", ADR 019)"
+          eye_note += " (CNN 폴백 자격 미달 — 눈/볼 밝기비 " + ratio_str + ", ADR 019)"
         eye_crops = [crop_eye(aligned, center, config.eye_box_px) for center in _EYE_CENTERS]
         if all(crop is not None for crop in eye_crops):
           probs = classifier.closed_prob(eye_crops)  # type: ignore[arg-type]
