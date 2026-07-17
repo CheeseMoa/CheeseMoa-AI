@@ -18,7 +18,14 @@ from app.messaging.publisher import ResultPublisher, SqsProgressPublisher, SqsPu
 from app.pipeline.align import align_face
 from app.pipeline.detect import FaceDetector
 from app.pipeline.embed import EmbedConfig, FaceEmbedder
-from app.pipeline.quality import EyeStateClassifier, QualityConfig, blur_variance, judge_faces, shake_signals
+from app.pipeline.quality import (
+  EyeStateClassifier,
+  QualityConfig,
+  blur_variance,
+  judge_faces,
+  shake_confirmed,
+  shake_signals,
+)
 from app.schemas.messages import ProgressUpdate
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
@@ -74,6 +81,12 @@ def build_face_extractor(
         blurry = (
           coherence >= quality_config.shake_coherence_threshold and norm_var < quality_config.shake_max_norm_variance
         )
+
+    # 흔들림 재확인 게이트: variance 기반 blurry(얼굴 경로·fallback 공통)를 전체 이미지 방향 쏠림으로
+    # 재확인한다 — 옛날 인화 재촬영처럼 원판이 소프트한 사진은 잔결이 없어도 손떨림이 아니다
+    # (event 50 실측, shake_coherence_floor 주석). 2차 신호로 잡힌 사진은 쏠림이 이미 높아 통과한다.
+    if blurry and not shake_confirmed(image, quality_config):
+      blurry = False
 
     crops = [crop for crop in aligned_crops if crop is not None]
     embeddings = [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]

@@ -93,6 +93,7 @@ class Settings(BaseSettings):
   quality_whole_image_blur_threshold: float = 100.0  # 판정 자격 얼굴 없을 때 전체 이미지 fallback (별도 보정)
   quality_shake_coherence_threshold: float = 0.40  # fallback 2차 신호 — 방향 쏠림 임계 (ADR 014). 0 = 비활성
   quality_shake_max_norm_variance: float = 60.0  # 쏠림이 높아도 정규화 variance가 이 값 이상이면 선명으로 본다
+  quality_shake_coherence_floor: float = 0.35  # 흔들림 재확인 게이트 — 쏠림이 이 값 미만이면 해제. 0 = 비활성
   quality_eye_closed_confidence: float = 0.85  # face-test 실측 보정 (약한 오탐 제거, feature-spec §10 #3)
   quality_eye_box_px: int = 24
 
@@ -153,6 +154,7 @@ class Settings(BaseSettings):
       whole_image_blur_threshold=self.quality_whole_image_blur_threshold,
       shake_coherence_threshold=self.quality_shake_coherence_threshold,
       shake_max_norm_variance=self.quality_shake_max_norm_variance,
+      shake_coherence_floor=self.quality_shake_coherence_floor,
       eye_closed_confidence=self.quality_eye_closed_confidence,
       eye_box_px=self.quality_eye_box_px,
     )

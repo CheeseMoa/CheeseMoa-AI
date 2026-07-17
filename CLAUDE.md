@@ -100,8 +100,12 @@ Laplacian variance — 단 **주 인물 얼굴만**(최대 얼굴 폭의 50% 미
 폭락 OR 방향성 블러(그라디언트 방향 쏠림 ≥0.40 AND 정규화 variance <60 — variance는 텍스처 양을 재는
 지표라 놓치는 사진을 손떨림의 방향 쏠림으로 잡는다, [ADR 014](docs/decisions/014-directional-blur-fallback.md)).
 이미지 단위 "얼굴 1개라도 해당", 토글 ON시 `eyes_closed`/`blurry`로 분리·재군집 제외(request-scoped).
+variance 기반 blurry 판정(얼굴·fallback 공통)은 최종적으로 흔들림 재확인 게이트를 거친다 — 전체
+이미지 방향 쏠림이 바닥(0.35) 미만이면 손떨림이 아니라 소프트 원판(옛날 인화 재촬영·앱 스무딩)으로
+보고 해제, variance는 잔결의 양만 재서 둘을 구분 못한다([ADR 018](docs/decisions/018-shake-coherence-floor.md)).
 임계는 `QualityConfig`. 한계: 웃음 캔디드 오탐(표정 CNN 후속 필요), 부분 모션블러+선명 배경 사각지대,
-회전 손떨림(전역 쏠림 낮음). 모델 소싱: `model_source.py`의 `UrlModelSource`.
+회전 손떨림(전역 쏠림 낮음 — ADR 018 게이트가 해제하는 방향), 아웃포커스 주 인물(등방이라 동일).
+모델 소싱: `model_source.py`의 `UrlModelSource`.
 
 ---
 
@@ -262,6 +266,15 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **흔들림 재확인 게이트 — 옛날 사진 blurry 오탐 해소** (2026-07-17,
+  [ADR 018](docs/decisions/018-shake-coherence-floor.md)) — event 50(앨범 205)에서 옛날 인화 사진
+  재촬영본 8장이 전부 blurry로 오분류되던 문제. variance는 잔결의 양만 재서 "원판이 소프트한 사진"과
+  "흔들린 사진"을 구분 못한다(임계 조정 불가 — 옛날 사진 분포가 연속). 판별축은 전체 이미지 방향
+  쏠림(손떨림은 이방성, 소프트 원판은 등방): 오탐 최고 0.268 vs 흔들림 최저 0.444(얼굴 경로)의 빈
+  구간에서 0.35를 바닥으로 채택, variance 판정 말미에 게이트로 적용(`shake_confirmed`,
+  `QUALITY_SHAKE_COHERENCE_FLOOR`, 0=비활성). 얼굴 crop 쏠림은 판별력 없음(겹침 실측). event 50
+  오탐 8장 전부 해제 + 나머지 51장 무변경, test2 라벨셋 무회귀. 한계: 등방성 블러(아웃포커스 주
+  인물·회전 손떨림)를 함께 해제 — 미탐 리포트 축적 시 라벨셋 추가 후 재보정.
 - **대형 근접 얼굴 재검출 회복 — 초근접 얼굴 미검출 해소** (2026-07-16,
   [ADR 017](docs/decisions/017-size-aware-detection-score-threshold.md)) — event 36에서 얼굴이 크게 나온
   아이(0010=`6acd1055`)가 공통 사진첩으로 빠지던 문제. 원인은 YuNet(WIDER FACE 학습)이 초근접 대형
