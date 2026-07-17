@@ -44,6 +44,14 @@ DEFAULT_FP_ASPECT_THRESHOLD = 0.70  # 종횡비 = bbox 폭/높이 (w/h)
 # 게이트 스윕 실측(783장): 0.20으로 내려도 오검출 통과 0·기존 검출 손실 0 — 판별은 재검출 score가 한다.
 DEFAULT_BIG_FACE_REL_WIDTH = 0.20  # 이 rel_w(bbox폭/긴변) 이상의 저score 얼굴만 재검출 회복 대상
 DEFAULT_BIG_FACE_REDETECT_SCORE = 0.80  # 정규 스케일 재검출 score가 이 이상이면 실얼굴로 보고 회복
+# 재검출 랜드마크 신뢰 임계 (survey_refine_shift.py, 2026-07-17): 이동량 가드(_REFINE_MAX_SHIFT_RATIO)의
+# 기준이 원 bbox 폭인데, 초대형 얼굴은 YuNet이 bbox를 파편으로 그려 진짜 얼굴이 파편보다 훨씬 크다 —
+# 올바른 교정도 "파편 폭 × 0.5"를 넘어 가드에 걸리고, 깨진 원 랜드마크가 유지돼 쓰레기 임베딩이 된다
+# (event 73: 공통첩 유출 + 쓰레기끼리 뭉친 유령 앨범). 34개 이벤트 520장 실측에서 가드 발동 33건 중
+# 재검출 score는 좋은 교정 전부 ≥0.86, 무익한 후보(양쪽 다 쓰레기) 전부 ≤0.39로 갈린다(빈 구간
+# [0.39, 0.86], 오매칭 점프 0건) — 회복 임계와 같은 0.80을 채택. 재검출 score가 이 값 이상이면
+# 이동량 가드를 무시하고 재검출 랜드마크를 채택한다. 0 = 비활성(종전 가드만).
+DEFAULT_REFINE_TRUST_REDETECT_SCORE = 0.80
 _BIG_FACE_MODEL_FLOOR = 0.2  # 회복 활성 시 YuNet 모델 score 바닥 — 저score 대형 후보를 표면화 (실측 최저 0.22 포섭)
 _YUNET_INIT_SIZE = (320, 320)  # 초기 placeholder; 이미지마다 setInputSize()로 덮어씀
 _NUM_LANDMARKS = 5
@@ -99,6 +107,9 @@ class DetectorConfig:
   # 정규 스케일 재검출해 score가 big_face_redetect_score 이상이면 되살린다. 둘 중 하나라도 0이면 비활성.
   big_face_rel_width: float = DEFAULT_BIG_FACE_REL_WIDTH
   big_face_redetect_score: float = DEFAULT_BIG_FACE_REDETECT_SCORE
+  # 재검출 랜드마크 신뢰 임계: 재검출 score가 이 값 이상이면 이동량 가드를 무시하고 재검출
+  # 랜드마크를 채택한다 — 파편 bbox의 초대형 얼굴 교정 (DEFAULT 주석 참고). 0 = 비활성.
+  refine_trust_redetect_score: float = DEFAULT_REFINE_TRUST_REDETECT_SCORE
 
   def __post_init__(self) -> None:
     # None만 다운스케일 비활성화를 의미한다. 0/음수는 scale=0 → 1/scale ZeroDivisionError를
@@ -120,6 +131,10 @@ class DetectorConfig:
       raise ValueError(f"big_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.big_face_rel_width}")
     if not 0.0 <= self.big_face_redetect_score <= 1.0:
       raise ValueError(f"big_face_redetect_score는 [0, 1] 범위여야 합니다. 받은 값: {self.big_face_redetect_score}")
+    if not 0.0 <= self.refine_trust_redetect_score <= 1.0:
+      raise ValueError(
+        f"refine_trust_redetect_score는 [0, 1] 범위여야 합니다. 받은 값: {self.refine_trust_redetect_score}"
+      )
 
 
 def _clamp_bbox(bbox: np.ndarray, w: int, h: int) -> tuple[int, int, int, int]:
@@ -195,6 +210,7 @@ class FaceDetector:
     self._refine_landmarks = resolved_config.refine_landmarks
     self._refine_norm_face_width = resolved_config.refine_norm_face_width
     self._refine_margin_ratio = resolved_config.refine_margin_ratio
+    self._refine_trust_score = resolved_config.refine_trust_redetect_score
 
   def detect(self, image: np.ndarray) -> list[DetectedFace]:
     """디코딩된 BGR 이미지에서 얼굴을 검출한다. 정상 ndarray에는 예외를 던지지 않는다."""
@@ -302,9 +318,13 @@ class FaceDetector:
     result = self._normal_scale_redetect(image, face)
     if result is None:
       return face
-    _, refined = result
-    # 정상 지터는 얼굴폭 15.8% 이내 — 그보다 훨씬 큰 이동은 오매칭 폭주로 보고 폐기한다
-    if float(np.abs(refined - face.landmarks).max()) > _REFINE_MAX_SHIFT_RATIO * w:
+    score, refined = result
+    # 정상 지터는 얼굴폭 15.8% 이내 — 그보다 훨씬 큰 이동은 오매칭 폭주로 보고 폐기한다.
+    # 단 재검출 score가 신뢰 임계 이상이면 채택한다 — 초대형 얼굴은 원 bbox가 파편이라 올바른
+    # 교정도 파편 폭 기준 가드를 넘는다 (event 73 공통첩 유출, DEFAULT_REFINE_TRUST_REDETECT_SCORE 주석).
+    if float(np.abs(refined - face.landmarks).max()) > _REFINE_MAX_SHIFT_RATIO * w and not self._trusted_redetect(
+      score
+    ):
       return face
     refined.flags.writeable = False  # frozen dataclass 출력이 하류에서 변형되지 않도록 보호
     return replace(face, landmarks=refined)
@@ -323,10 +343,19 @@ class FaceDetector:
     score, refined = result
     if score < self._big_face_redetect_score:
       return None  # 재검출에서도 저score → 오검출로 폐기
-    if float(np.abs(refined - face.landmarks).max()) <= _REFINE_MAX_SHIFT_RATIO * face.bbox[2]:
+    # 신뢰 임계 이상이면 이동량 가드를 무시하고 재검출 랜드마크를 채택한다 — 여기서 원 랜드마크를
+    # 유지하면 offset 파편 박스가 쓰레기 임베딩으로 살아남아 디둡(랜드마크 중심)도 비껴가고,
+    # 사진 3장 이상에서 반복되면 쓰레기끼리 뭉친 유령 인물 앨범이 된다 (event 73 실측 741d1aef).
+    if float(np.abs(refined - face.landmarks).max()) <= _REFINE_MAX_SHIFT_RATIO * face.bbox[
+      2
+    ] or self._trusted_redetect(score):
       refined.flags.writeable = False
       return replace(face, landmarks=refined)
     return face  # 실얼굴이나 랜드마크 매칭이 불안정 → 원 랜드마크 유지하고 얼굴은 살린다
+
+  def _trusted_redetect(self, score: float) -> bool:
+    """재검출 score가 신뢰 임계 이상인지 — 이동량 가드를 무시하고 재검출 랜드마크를 채택할 자격."""
+    return self._refine_trust_score > 0.0 and score >= self._refine_trust_score
 
   def _duplicates_existing(self, face: DetectedFace, existing: list[DetectedFace]) -> bool:
     """회복된 face가 이미 채택된 얼굴 중 하나와 같은 얼굴인지 판정한다 (ADR-017 디둡).
