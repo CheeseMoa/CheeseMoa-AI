@@ -73,7 +73,7 @@ class Settings(BaseSettings):
   # 주 인물 자격 — 사진 최대 얼굴 폭 대비 이 비율 미만은 행인으로 보고 위 카운트에서 제외 (ADR 022 규칙). 0=전체 카운트
   cluster_common_main_face_ratio: float = 0.5
   # 실인물 자격 — 미배정 얼굴이 event 내 어떤 얼굴과도 유사도가 이 값 미만이면 오검출로 보고 카운트에서 제외 (ADR 025). 0=비활성
-  cluster_common_face_min_similarity: float = 0.2
+  cluster_common_face_min_similarity: float = 0.185
 
   # ── 입력 품질 교정 (2026-07-14 리뷰: 정렬 안티에일리어싱 + 랜드마크 2단계 정제) ──────────
   # 같은 얼굴 임베딩이 촬영·설정마다 흔들리던 노이즈(최저 유사도 0.43)를 잡는 두 교정의 토글.

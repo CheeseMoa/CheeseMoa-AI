@@ -773,6 +773,12 @@ if __name__ == "__main__":
     vector[401] = math.sin(theta)
     return vector
 
+  def garbage_vector(step: int) -> np.ndarray:
+    """오검출(털·사물)의 쓰레기 임베딩 모사 — 전용 축이라 모든 인물 벡터와 유사도 0 (ADR 025 실측 0.183 이하 대역)."""
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[450 + step] = 1.0
+    return vector
+
   def fake_image(
     faces: list[tuple[int, int]] | list[tuple[int, int, int]], *, eyes_closed: bool = False, blurry: bool = False
   ) -> np.ndarray:
@@ -797,7 +803,9 @@ if __name__ == "__main__":
     for slot in range(count):
       person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
       widths.append(float(image[0, slot + 1, 2]))
-      if person >= 40:
+      if person >= 50:
+        vectors.append(garbage_vector(step))
+      elif person >= 40:
         vectors.append(confirm_distinct_vector(person, step))
       elif person >= 20:
         vectors.append(spread_person_vector(person, step))
@@ -1412,6 +1420,45 @@ if __name__ == "__main__":
   check(
     "썸네일 비활성 (렌더러·스토어 미주입): 전 클러스터 None — 종전 동작",
     len(plain.clusters) == 1 and plain.clusters[0].thumbnail_s3_key is None,
+  )
+
+  # ⑱ 오검출 머릿수 게이트 (ADR 025): 인물 사진에 주 인물 크기의 오검출(모두와 바닥 유사도)이 붙어도
+  # 단체 사진이 아니다 — 인물 앨범에만 소속, 공용 노출 없음. event 93 퍼 후드 셀피 회귀 고정.
+  image_source.images.update(
+    {
+      "img-f1.jpg": fake_image([(15, 0)]),
+      "img-f2.jpg": fake_image([(15, 1)]),
+      "img-fur.jpg": fake_image([(15, 2, 200), (50, 0, 150)]),  # 인물 15 + 주 인물 크기 오검출(인물 50)
+    }
+  )
+  fur_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c12",
+      "group_id": "group-1",
+      "event_id": "event-12",
+      "images": [
+        {"image_id": "img-f1", "s3_key": "img-f1.jpg"},
+        {"image_id": "img-f2", "s3_key": "img-f2.jpg"},
+        {"image_id": "img-fur", "s3_key": "img-fur.jpg"},
+      ],
+    }
+  )
+  fur = handlers.handle(parse_inbound_message(fur_body))
+  check(
+    "오검출 머릿수 게이트: 인물+오검출 사진은 단체 아님 — 인물 앨범만, 공용·uncertain 없음",
+    sum("img-fur" in c.image_ids for c in fur.clusters) == 1 and fur.common_album == [] and fur.uncertain == [],
+  )
+  gate_off_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    cluster_config=ClusterConfig(common_face_min_similarity=0.0),
+  )
+  gate_off = gate_off_handlers.handle(parse_inbound_message(fur_body))
+  check(
+    "오검출 머릿수 게이트 비활성(0): 오검출이 주 인물로 세어져 공용 노출 재현 (검증의 적대적 성질 유지)",
+    gate_off.common_album == ["img-fur"],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
