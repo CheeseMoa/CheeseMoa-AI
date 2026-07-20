@@ -17,6 +17,7 @@ if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
   from app.pipeline.detect import DetectorConfig
   from app.pipeline.quality import QualityConfig
+  from app.pipeline.thumbnail import ThumbnailConfig
 
 
 class Settings(BaseSettings):
@@ -71,6 +72,8 @@ class Settings(BaseSettings):
   cluster_group_photo_to_common: bool = True
   # 주 인물 자격 — 사진 최대 얼굴 폭 대비 이 비율 미만은 행인으로 보고 위 카운트에서 제외 (ADR 022 규칙). 0=전체 카운트
   cluster_common_main_face_ratio: float = 0.5
+  # 실인물 자격 — 미배정 얼굴이 event 내 어떤 얼굴과도 유사도가 이 값 미만이면 오검출로 보고 카운트에서 제외 (ADR 025). 0=비활성
+  cluster_common_face_min_similarity: float = 0.2
 
   # ── 입력 품질 교정 (2026-07-14 리뷰: 정렬 안티에일리어싱 + 랜드마크 2단계 정제) ──────────
   # 같은 얼굴 임베딩이 촬영·설정마다 흔들리던 노이즈(최저 유사도 0.43)를 잡는 두 교정의 토글.
@@ -122,6 +125,14 @@ class Settings(BaseSettings):
   quality_blink_presence_floor: float = 0.5  # 랜드마크 presence가 미만이면 blink를 버리고 CNN 폴백 (ADR 021)
   quality_eye_main_face_ratio: float = 0.5  # 최대 얼굴 폭 대비 이 비율 미만은 배경 얼굴로 보고 눈감음 판정 제외
 
+  # ── 인물 앨범 대표 얼굴 썸네일 (CHMO-335) ────────────────────────────────────
+  # 재군집 후 클러스터마다 대표 얼굴을 crop해 embeddings_bucket의 {thumbnail_prefix}{event_id}/
+  # {cluster_id}.jpg에 덮어쓰고, 결과 메시지에 그 키를 싣는다 (Spring이 presigned URL 발급).
+  thumbnail_max_side: int = Field(default=256, ge=0)  # 썸네일 긴 변 상한 px. 0 = 기능 전체 비활성 (롤백 스위치)
+  thumbnail_jpeg_quality: int = Field(default=85, ge=1, le=100)
+  thumbnail_bbox_scale: float = Field(default=1.4, gt=0)  # 얼굴 bbox 확장 배율 — 여백 포함 crop
+  thumbnail_prefix: str = "thumbnails/"  # 썸네일 키 = {prefix}{event_id}/{cluster_id}.jpg
+
   log_level: str = "INFO"
 
   def to_cluster_config(self) -> "ClusterConfig":
@@ -149,6 +160,7 @@ class Settings(BaseSettings):
       blob_promote_floor=self.cluster_blob_promote_floor,
       group_photo_to_common=self.cluster_group_photo_to_common,
       common_main_face_ratio=self.cluster_common_main_face_ratio,
+      common_face_min_similarity=self.cluster_common_face_min_similarity,
     )
 
   def to_detector_config(self) -> "DetectorConfig":
@@ -169,6 +181,20 @@ class Settings(BaseSettings):
       big_face_rel_width=self.detect_big_face_rel_width,
       big_face_redetect_score=self.detect_big_face_redetect_score,
       refine_trust_redetect_score=self.detect_refine_trust_redetect_score,
+    )
+
+  def to_thumbnail_config(self) -> "ThumbnailConfig":
+    """설정값을 썸네일 렌더의 ThumbnailConfig로 변환한다 (값 검증은 ThumbnailConfig.__post_init__이 수행).
+
+    to_cluster_config와 같은 이유로 pipeline 임포트를 지연시킨다 (core→pipeline 역의존 회피).
+    비활성 여부(thumbnail_max_side == 0)는 호출자(deps)가 먼저 판단한다 — 0은 여기서 검증 실패다.
+    """
+    from app.pipeline.thumbnail import ThumbnailConfig
+
+    return ThumbnailConfig(
+      bbox_scale=self.thumbnail_bbox_scale,
+      max_side=self.thumbnail_max_side,
+      jpeg_quality=self.thumbnail_jpeg_quality,
     )
 
   def to_quality_config(self) -> "QualityConfig":

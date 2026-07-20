@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import boto3
 
 from app.core.config import Settings
-from app.handlers import ExtractedFaces, FaceExtractor, JobHandlers, ProgressReporter
+from app.handlers import ExtractedFaces, FaceExtractor, JobHandlers, ProgressReporter, ThumbnailRenderer
 from app.messaging.consumer import MessageConsumer, SqsConsumer
 from app.messaging.publisher import ResultPublisher, SqsProgressPublisher, SqsPublisher
 from app.pipeline.align import align_face
@@ -30,6 +30,7 @@ from app.pipeline.quality import (
 from app.schemas.messages import ProgressUpdate
 from app.storage.embedding_store import S3EmbeddingStore
 from app.storage.image_source import S3ImageSource
+from app.storage.thumbnail_store import S3ThumbnailStore
 
 logger = logging.getLogger(__name__)
 
@@ -102,16 +103,18 @@ def build_face_extractor(
     if blurry and not gate_exempt and not shake_confirmed(image, quality_config):
       blurry = False
 
-    # 퇴화 필터(정렬 실패·비유한 임베딩) 이후에도 임베딩↔얼굴 폭이 짝을 유지해야 한다 —
-    # 폭은 라우팅의 주 인물 판정(사진 최대 얼굴 폭 대비 비율) 입력이다 (CHMO-330).
-    kept = [(crop, float(face.bbox[2])) for face, crop in zip(detected, aligned_crops) if crop is not None]
+    # 퇴화 필터(정렬 실패·비유한 임베딩) 이후에도 임베딩↔얼굴 폭·bbox가 짝을 유지해야 한다 —
+    # 폭은 라우팅의 주 인물 판정 입력(CHMO-330), bbox는 대표 얼굴 썸네일 crop 입력이다(CHMO-335).
+    kept = [(crop, face.bbox) for face, crop in zip(detected, aligned_crops) if crop is not None]
     embeddings: list = []
     face_widths: list[float] = []
-    for embedding, (_, width) in zip(embedder.embed_batch([crop for crop, _ in kept]), kept):
+    bboxes: list[tuple[int, int, int, int]] = []
+    for embedding, (_, bbox) in zip(embedder.embed_batch([crop for crop, _ in kept]), kept):
       if embedding is not None:
         embeddings.append(embedding)
-        face_widths.append(width)
-    return ExtractedFaces(embeddings, eyes_closed, blurry, face_widths)
+        face_widths.append(float(bbox[2]))
+        bboxes.append(bbox)
+    return ExtractedFaces(embeddings, eyes_closed, blurry, face_widths, bboxes)
 
   return extract_faces
 
@@ -130,6 +133,24 @@ def _build_progress_reporter(sqs_client, progress_queue_url: str | None) -> Prog
     publisher.publish(ProgressUpdate(job_id=job_id, event_id=event_id, processed=processed, total=total))
 
   return report
+
+
+def _build_thumbnail_renderer(settings: Settings) -> ThumbnailRenderer | None:
+  """대표 얼굴 썸네일 렌더러를 만든다 (CHMO-335) — max_side가 0이면 None(기능 비활성, 롤백 스위치).
+
+  핸들러는 (BGR 원본, bbox)만 넘긴다 — ThumbnailConfig 조립·cv2 렌더는 여기서 가둔다
+  (_build_progress_reporter와 같은 관심사 분리).
+  """
+  if settings.thumbnail_max_side <= 0:
+    return None
+  from app.pipeline.thumbnail import render_face_thumbnail
+
+  config = settings.to_thumbnail_config()
+
+  def render(image, bbox: tuple[float, float, float, float]) -> bytes:
+    return render_face_thumbnail(image, bbox, config)
+
+  return render
 
 
 def _available_cores() -> int:
@@ -173,6 +194,7 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
     blink_scorer = FaceBlinkScorer(BlinkConfig(num_threads=threads))
   logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d, blink=%s)", threads, cores, bool(blink_scorer))
 
+  thumbnail_renderer = _build_thumbnail_renderer(settings)
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=S3ImageSource(s3_client, settings.images_bucket),
@@ -186,6 +208,11 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
     ),
     cluster_config=settings.to_cluster_config(),
     report_progress=_build_progress_reporter(sqs_client, settings.progress_queue_url),
+    # 썸네일은 렌더러·스토어 둘 다 있어야 활성 — 비활성(max_side=0)이면 둘 다 None으로 종전 동작 (CHMO-335)
+    render_thumbnail=thumbnail_renderer,
+    thumbnails=S3ThumbnailStore(s3_client, settings.embeddings_bucket, settings.thumbnail_prefix)
+    if thumbnail_renderer is not None
+    else None,
   )
   return WorkerDeps(
     consumer=SqsConsumer(sqs_client, settings.inbound_queue_url, settings.sqs_wait_time_seconds),
@@ -209,6 +236,7 @@ def check_readiness(settings: Settings) -> None:
     queue_urls.append(settings.progress_queue_url)
   for queue_url in queue_urls:
     sqs_client.get_queue_attributes(QueueUrl=queue_url, AttributeNames=["QueueArn"])
+  # 썸네일(CHMO-335)은 embeddings_bucket을 공유하므로 별도 확인 대상이 없다
   for bucket in (settings.embeddings_bucket, settings.images_bucket):
     s3_client.head_bucket(Bucket=bucket)
   logger.info("SQS/S3 연결 확인 완료 — 레디니스 통과")

@@ -247,6 +247,10 @@ class ResultCluster(_MessageBase):
   image_ids: list[Id] = Field(min_length=1)
   # PersonCluster.centroid(멤버 임베딩 L2 정규화 평균)의 사본 — Spring 표시용 파생값 (ADR-007)
   representative_vector: list[FiniteFloat] = Field(min_length=EMBED_DIM, max_length=EMBED_DIM)
+  # 대표 얼굴 썸네일 JPEG의 S3 키 (워커 embeddings 버킷, CHMO-335) — Spring이 presigned URL 발급에 쓴다.
+  # None = 썸네일 없음: 기능 비활성(THUMBNAIL_MAX_SIDE=0) / 렌더·업로드 실패(best-effort) /
+  # v2 이하 .npz 행만으로 구성된 클러스터(bbox·원본 키 미상 — 대표 후보 부재).
+  thumbnail_s3_key: Id | None = None
 
 
 class UncertainImage(_MessageBase):
@@ -424,6 +428,7 @@ if __name__ == "__main__":
         is_new=False,
         image_ids=["img-1", "img-2", "img-7"],
         representative_vector=[0.0] * (EMBED_DIM - 1) + [1.0],
+        thumbnail_s3_key="thumbnails/event-1/person-A.jpg",
       )
     ],
     common_album=["img-9"],
@@ -437,6 +442,13 @@ if __name__ == "__main__":
     retired_cluster_ids=["person-C"],
   )
   check("classify-result 직렬화 라운드트립", ClassifyResult.model_validate_json(result.model_dump_json()) == result)
+  check(
+    "thumbnail_s3_key 생략 시 None (구버전 워커·비활성 결과 하위호환)",
+    ResultCluster(
+      cluster_id="person-B", is_new=True, image_ids=["img-1"], representative_vector=[0.0] * (EMBED_DIM - 1) + [1.0]
+    ).thumbnail_s3_key
+    is None,
+  )
   check(
     "uncertain 항목은 예약 앨범 id 기본 부여 (reassign 출처)",
     all(uncertain.album_id == UNCERTAIN_ALBUM_ID for uncertain in result.uncertain)

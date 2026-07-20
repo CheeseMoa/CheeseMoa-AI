@@ -170,13 +170,14 @@ CheeseMoa-AI/
 │   ├── core/                # 설정(config.py)·프로덕션 조립(deps.py)·모델 소싱(model_source.py)
 │   ├── messaging/           # SQS 수신(consumer.py)·발행(publisher.py) + 인메모리 페이크
 │   ├── storage/             # event .npz 코덱(event_embeddings.py)·저장소(embedding_store.py)·
-│   │                        # 원본 이미지 소스(image_source.py) + 인메모리 페이크
+│   │                        # 원본 이미지 소스(image_source.py)·썸네일 저장소(thumbnail_store.py) + 인메모리 페이크
 │   ├── pipeline/            # AI 파이프라인 로직
 │   │   ├── detect.py        # YuNet 얼굴 감지
 │   │   ├── align.py         # face_align 직접 구현
 │   │   ├── embed.py         # AuraFace 임베딩
 │   │   ├── cluster.py       # 전체 재군집 + cluster_id 재조정 (순수 로직)
 │   │   ├── quality.py       # 품질 게이트 — 눈감음 CNN(EyeStateClassifier) + 흔들림 Laplacian (순수 로직)
+│   │   ├── thumbnail.py     # 대표 얼굴 썸네일 렌더 — bbox crop→다운스케일→JPEG (순수 함수, CHMO-335)
 │   │   └── hdbscan_standalone.py  # HDBSCAN numpy 이식본 (PoC 검증)
 │   └── schemas/             # Pydantic 스키마 (SQS 메시지)
 ├── .env.example             # 환경변수 예시 — SQS 큐 URL·S3 버킷명은 미정(placeholder)
@@ -307,6 +308,18 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **인물 앨범 대표 얼굴 썸네일 — 워커 crop·S3 업로드 + 계약 확장** (2026-07-20, CHMO-335) — 앱의
+  인물 앨범 목록용 썸네일. 대표 선정 신호(LOO centroid 유사도)·디코딩 원본·bbox가 전부 워커 안에
+  있으므로 워커가 재군집 직후 클러스터마다 대표 얼굴을 crop(bbox 1.4배 여백)→다운스케일(긴 변 256px)
+  →JPEG→S3 업로드하고 결과에 키만 싣는다(`ResultCluster.thumbnail_s3_key`, null 가능 — Spring은
+  presigned URL 매 조회 발급으로 서빙만). Lambda·백엔드 크롭은 원본 재디코딩 중복으로 기각.
+  `.npz` **스키마 v3**(bboxes·s3_keys 열 — v2 이하는 미상 폴백으로 해당 행만 대표 후보 제외),
+  `pipeline/thumbnail.py`(순수 렌더)·`storage/thumbnail_store.py`(Protocol+S3+페이크) 신설,
+  키는 `thumbnails/{event_id}/{cluster_id}.jpg` 고정·덮어쓰기, 은퇴 클러스터 썸네일은 best-effort
+  삭제. 대표 원본은 클러스터당 1장만 재fetch(공유 t4g RAM 제약 — 요청 전체 이미지 캐시 금지),
+  썸네일 실패는 경고 로그 + 해당 키 null로 격리(job 정상 진행). `THUMBNAIL_MAX_SIDE=0`이 롤백
+  스위치(기능 전체 비활성). 잔여: 워커 IAM에 embeddings 버킷 `s3:DeleteObject` 권한 확인,
+  Spring과 presigned URL 캐시 정책(매 조회 발급) 합의.
 - **파편병합 승인을 컴포넌트 전체 재평가로 — 같은 인물 앨범 분리 해소** (2026-07-20,
   [ADR 024](docs/decisions/024-merge-component-linkage.md)) — event 90(group 35)에서 주 인물의
   2얼굴 파편 앨범이 병합 게이트(0.632/0.479)를 통과하고도 별도 앨범으로 남던 문제. 구 완전 연결

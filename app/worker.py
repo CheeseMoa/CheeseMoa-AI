@@ -173,6 +173,7 @@ def _run_smoke() -> None:
   from app.storage.embedding_store import InMemoryEmbeddingStore
   from app.storage.event_embeddings import EMBED_DIM
   from app.storage.image_source import InMemoryImageSource
+  from app.storage.thumbnail_store import InMemoryThumbnailStore
 
   logging.basicConfig(level="WARNING")  # 의도된 실패 케이스의 ERROR 로그만 보이게
   passed = 0
@@ -202,7 +203,8 @@ def _run_smoke() -> None:
   def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
     vectors = [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
-    return ExtractedFaces(vectors)  # 품질 플래그는 이 스모크 범위 밖 — 기본 False
+    # 품질 플래그는 이 스모크 범위 밖 — 기본 False. bbox는 썸네일 배선 검증용 합성값 (CHMO-335)
+    return ExtractedFaces(vectors, face_widths=[100.0] * count, bboxes=[(0, 0, 100, 100)] * count)
 
   store = InMemoryEmbeddingStore()
   # "event-폭발"의 .npz를 손상시켜 두면 해당 classify가 StoreCorruptionError로 작업 전체 실패한다
@@ -213,6 +215,7 @@ def _run_smoke() -> None:
   def report_progress(job_id: str, event_id: str, processed: int, total: int) -> None:
     progress_publisher.publish(ProgressUpdate(job_id=job_id, event_id=event_id, processed=processed, total=total))
 
+  thumb_store = InMemoryThumbnailStore()
   handlers = JobHandlers(
     store=store,
     images=InMemoryImageSource(
@@ -225,6 +228,8 @@ def _run_smoke() -> None:
     ),
     extract_faces=fake_extractor,
     report_progress=report_progress,
+    render_thumbnail=lambda image, bbox: b"jpeg",  # 실렌더는 pipeline.thumbnail __main__이 검증
+    thumbnails=thumb_store,
   )
 
   ok_body = json.dumps(
@@ -278,6 +283,13 @@ def _run_smoke() -> None:
     sum(1 for result in publisher.published if result.job_id == "job-폭발") == 1,
   )
   check("손상 .npz는 덮어쓰이지 않고 보존", store.blobs["event-폭발"] == b"\x00\x01\x02")
+  check(
+    "대표 얼굴 썸네일: 클러스터마다 키 동봉 + 업로드 (발행 경유 종단, CHMO-335)",
+    all(
+      c.thumbnail_s3_key == f"thumbnails/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
+      for c in results["job-정상"].clusters
+    ),
+  )
 
   # 진행률 발행 (CHMO-274): "job-정상"(이미지 4장)은 루프 전 0/4 + 3장마다(3/4) + 마지막(4/4) 발행돼
   # processed가 [0, 3, 4]로 단조 증가하고 total에 도달한다 (_PROGRESS_REPORT_EVERY=3).
