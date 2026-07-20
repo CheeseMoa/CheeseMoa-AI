@@ -73,6 +73,16 @@ class ClusterConfig:
   # 초기 근거(CHMO-269, 0.45 채택 시): 비활성 대비 child ARI 0.245→0.788, 성인·단일인물 무회귀,
   # 실 이벤트 분해(27·29·33·35) 적대적 검증 전부 GOOD(cross face평균 0.31~0.44).
   merge_facepair_floor: float = 0.475
+  # 파편병합 승인 검사 방식 (ADR-024) — True(기본)면 greedy 병합에서 두 컴포넌트를 '현재 전체
+  # 멤버'로 재평가한다(재계산 centroid ≥ merge_centroid_similarity AND 전체 얼굴 교차 face-pair
+  # 평균 ≥ merge_facepair_floor). False는 구 동작 — 병합 전 파편 스냅샷 쌍 전부의 완전 연결 요구.
+  # 구 방식은 2얼굴 파편의 centroid 노이즈에 취약하다: 같은 인물 파편 둘이 주 앨범과는 각각 게이트를
+  # 통과하는데 서로만 살짝 미달하면(event 90 실측 스냅샷 쌍 0.508/0.458) 나중 파편의 합류가 막혀
+  # 같은 인물 앨범이 쪼개진다. 컴포넌트 전체 재평가는 이를 붙이면서도(0.641/0.476 통과) 남남이
+  # 섞인 다리(bridge) 융합은 남남 얼굴 쌍이 전체 face-pair 평균을 끌어내려 여전히 차단한다(자가검증
+  # (m)). 실측: 이벤트 52개 중 event 90만 치유([15,9,8,2,2]→[17,9,8,2]), 라벨 코퍼스·나머지 51개
+  # ·합성 자가검증 전부 무변화. 회귀 시 .env(CLUSTER_MERGE_COMPONENT_LINKAGE=false)로 즉시 복귀.
+  merge_component_linkage: bool = True
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
   rescue_similarity: float = 0.6
@@ -511,16 +521,25 @@ def _merge_fragments(
   cannot_link: tuple[tuple[int, int], ...],
   threshold: float,
   facepair_floor: float = 0.0,
+  component_linkage: bool = True,
 ) -> None:
   """centroid 유사도(threshold) AND 파편 간 face-pair 평균(facepair_floor)이 동일 인물 수준인 클러스터끼리
   병합한다 (labels 제자리 수정).
 
   allow_single_cluster=False 특성상 한 인물 위주의 밀집이 파편화되는 케이스(ADR 005)와 일반적인
   과분할을 함께 교정한다. cannot-link로 연결된 클러스터 쌍은 병합하지 않는다(사용자 분리 결정 보존).
-  병합 조건은 완전 연결(complete linkage): 두 컴포넌트의 모든 구성 클러스터 쌍이 임계 이상이어야
-  한다 — 쌍별 검사만 하면 전이 체인(A~B, B~C)이 서로 타인인 A와 C(유사도 ~0.1)를 한 앨범으로
-  융합하는 것이 리뷰에서 재현됐다. 유사도 내림차순 greedy에 병합 컴포넌트의 대표 라벨을 최소 멤버
-  인덱스 클러스터로 고정해 결과가 결정적이다. 유사도는 병합 전 centroid 스냅샷 기준이다.
+  후보는 파편 쌍 게이트 통과 쌍이고, 유사도 내림차순 greedy에 병합 컴포넌트의 대표 라벨을 최소 멤버
+  인덱스 클러스터로 고정해 결과가 결정적이다. 후보 유사도는 병합 전 centroid 스냅샷 기준이다.
+
+  병합 승인 검사 — 쌍별 검사만 하면 전이 체인(A~B, B~C)이 서로 타인인 A와 C(유사도 ~0.1)를 한
+  앨범으로 융합하는 것이 리뷰에서 재현됐다. 융합 차단 방식은 component_linkage로 갈린다 (ADR-024):
+  - True(기본): 두 컴포넌트의 '현재 전체 멤버'로 재평가 — 재계산 centroid ≥ threshold AND 전체
+    얼굴 교차 face-pair 평균 ≥ facepair_floor. 남남이 섞인 다리(bridge) 컴포넌트는 남남 얼굴 쌍이
+    전체 평균을 끌어내려 바닥에 걸린다. 구 방식이 2얼굴 파편의 노이즈 centroid 쌍에 걸려 같은
+    인물 파편의 합류를 막던 문제(event 90: 스냅샷 쌍 0.508/0.458로 미달, 컴포넌트 전체로는
+    0.641/0.476 통과)를 해소한다.
+  - False(구 동작): 완전 연결(complete linkage) — 두 컴포넌트의 모든 구성 파편 쌍이 병합 전
+    스냅샷 기준으로 게이트 이상이어야 한다.
 
   facepair_floor > 0이면 centroid에 더해 face-level 응집을 요구한다 (ADR-016): centroid는 평균이라
   어린아이 얼굴을 뭉뚱그려 서로 다른 아이도 임계를 넘기는데, 판별 신호는 개별 얼굴 쌍에 남아 있어
@@ -564,15 +583,26 @@ def _merge_fragments(
       x = parent[x]
     return x
 
+  def component_mergeable(members_i: set[int], members_j: set[int]) -> bool:
+    a, b = sorted(members_i), sorted(members_j)
+    if float(_normalized_mean(embeddings, a) @ _normalized_mean(embeddings, b)) < threshold:
+      return False
+    if facepair_floor > 0.0 and float((embeddings[a] @ embeddings[b].T).mean()) < facepair_floor:
+      return False
+    return True
+
   merged_members = {pos: set(members) for pos, (_, members) in enumerate(ordered)}
-  merged_positions = {pos: {pos} for pos in range(len(ordered))}  # 완전 연결 검사용 구성 클러스터 위치
+  merged_positions = {pos: {pos} for pos in range(len(ordered))}  # 완전 연결 검사용 구성 클러스터 위치 (구 동작)
   for _, i, j in sorted(candidates):
     root_i, root_j = find(i), find(j)
     if root_i == root_j:
       continue
     if _sets_blocked(merged_members[root_i], merged_members[root_j], cannot_link):
       continue
-    if not all(mergeable(p, q) for p in merged_positions[root_i] for q in merged_positions[root_j]):
+    if component_linkage:
+      if not component_mergeable(merged_members[root_i], merged_members[root_j]):
+        continue  # 컴포넌트 전체 재평가 미달 — 남남이 섞였으면 전체 face-pair 평균이 바닥에 걸린다 (ADR-024)
+    elif not all(mergeable(p, q) for p in merged_positions[root_i] for q in merged_positions[root_j]):
       continue  # 완전 연결 위반 — 다리(bridge) 클러스터를 통한 타인/타아동 융합 차단
     if root_j < root_i:  # 작은 위치가 루트 — 컴포넌트 라벨이 최소 멤버 인덱스 클러스터로 수렴
       root_i, root_j = root_j, root_i
@@ -831,7 +861,12 @@ def recluster(
   # 구제까지 끝난 최종 멤버십에서 저신뢰를 가려낸다. 병합을 구제 뒤로 옮기면 구제가 파편난
   # 작은 centroid 기준이 되어 손해라, 시점 차이는 이동이 아니라 아래 2차 병합으로 보완한다)
   _merge_fragments(
-    labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity, resolved_config.merge_facepair_floor
+    labels,
+    emb,
+    blocking_cannot,
+    resolved_config.merge_centroid_similarity,
+    resolved_config.merge_facepair_floor,
+    resolved_config.merge_component_linkage,
   )
   _rescue_noise(labels, emb, blocking_cannot, resolved_config.rescue_similarity)
   protected = {idx for members in components.values() if len(members) >= 2 for idx in members}
@@ -847,7 +882,12 @@ def recluster(
   # 추가하면 최종 구성 기준으로는 임계를 넘는 파편 쌍이 남는다 (실 event 실측: 판정 시 0.688 →
   # 구제 후 0.705). 같은 임계·같은 cannot-link 가드를 최종 멤버십에서 한 번 더 적용한다.
   _merge_fragments(
-    labels, emb, blocking_cannot, resolved_config.merge_centroid_similarity, resolved_config.merge_facepair_floor
+    labels,
+    emb,
+    blocking_cannot,
+    resolved_config.merge_centroid_similarity,
+    resolved_config.merge_facepair_floor,
+    resolved_config.merge_component_linkage,
   )
 
   # ID 재조정
@@ -1134,6 +1174,62 @@ if __name__ == "__main__":
   check(
     "(l) 같은 인물 파편(cross 얼굴평균 0.65)은 face floor 0.55를 통과해 병합 유지 — 성인 무회귀",
     len(set(labels_same)) == 1,
+  )
+
+  # (m) 파편병합 컴포넌트 전체 재평가 (ADR-024) — 구 완전 연결은 병합 전 파편 '스냅샷 쌍'을 검사해
+  # 2얼굴 파편의 노이즈 centroid 쌍에 걸린다. event 90 기하의 합성 재현: 주 파편 M(4)·소형 파편
+  # P(2)·Q(2)가 같은 인물인데 P·Q 서로만 게이트를 살짝 미달(실측 0.508/0.458), 컴포넌트 전체
+  # (M∪P vs Q)로는 통과. base를 e0 기준 ±θ로 벌려 M-P·M-Q 통과 / P-Q 미달을 닫힌형식으로 만든다.
+  def merge_gate_stats(f1: np.ndarray, f2: np.ndarray) -> tuple[float, float]:
+    c1, c2 = f1.mean(axis=0), f2.mean(axis=0)
+    centroid_sim = float(c1 @ c2 / (np.linalg.norm(c1) * np.linalg.norm(c2)))
+    return centroid_sim, float((f1 @ f2.T).mean())
+
+  def three_frags(cos_t: float) -> np.ndarray:
+    sin_t = math.sqrt(1.0 - cos_t * cos_t)
+    return np.vstack(
+      [
+        spread_vectors((0.9, 0.9, 0.9, 0.9), axis(0), 10),
+        spread_vectors((0.9, 0.9), cos_t * axis(0) + sin_t * axis(1), 20),
+        spread_vectors((0.9, 0.9), cos_t * axis(0) - sin_t * axis(1), 30),
+      ]
+    ).astype(np.float32)
+
+  def run_merge(embs: np.ndarray, component: bool) -> np.ndarray:
+    labels = np.array([0, 0, 0, 0, 1, 1, 2, 2], dtype=np.int64)
+    _merge_fragments(labels, embs, (), 0.55, 0.475, component)
+    return labels
+
+  heal = three_frags(0.88)  # M-P·M-Q 0.809/0.713 통과, P-Q 0.491/0.445 미달, M∪P vs Q 전체는 통과
+  mp = merge_gate_stats(heal[0:4], heal[4:6])
+  pq = merge_gate_stats(heal[4:6], heal[6:8])
+  mq_comp = merge_gate_stats(heal[0:6], heal[6:8])
+  check(
+    "(m) 전제: M-P 게이트 통과 + P-Q 스냅샷 쌍 미달 + M∪P vs Q 컴포넌트 전체 통과 기하",
+    mp[0] >= 0.55 and mp[1] >= 0.475 and pq[0] < 0.55 and pq[1] < 0.475 and mq_comp[0] >= 0.55 and mq_comp[1] >= 0.475,
+  )
+  check(
+    "(m) 전제: 구 완전 연결은 P만 합류, Q는 P-Q 스냅샷 쌍에 걸려 잔류 (event 90 분리 재현)",
+    len(set(run_merge(heal, False).tolist())) == 2,
+  )
+  check(
+    "(m) 컴포넌트 전체 재평가는 같은 인물 파편 M·P·Q 전원 병합 (event 90 치유)",
+    len(set(run_merge(heal, True).tolist())) == 1,
+  )
+  # 다리(bridge) 차단 유지 — 완전 연결을 없애는 대신 남남 얼굴 쌍이 컴포넌트 전체 face-pair 평균을
+  # 끌어내리는 것이 융합 차단을 대행한다: 중간자 M이 남남 P·Q 둘 다와 게이트를 통과해도(cosθ=0.75)
+  # M∪P vs Q의 전체 face평균(0.44)이 바닥(0.475)에 걸려 Q가 합류하지 못한다.
+  bridge = three_frags(0.75)
+  bp = merge_gate_stats(bridge[0:4], bridge[4:6])
+  pq_bridge = merge_gate_stats(bridge[4:6], bridge[6:8])
+  labels_bridge = run_merge(bridge, True)
+  check(
+    "(m) 다리 기하 전제: M-P·M-Q 게이트 통과 + P·Q는 남남 수준(face평균 ~0.10)",
+    bp[0] >= 0.55 and bp[1] >= 0.475 and pq_bridge[1] < 0.2,
+  )
+  check(
+    "(m) 컴포넌트 재평가도 다리 융합 차단 — M∪P는 성립하되 남남 Q는 같은 앨범 불가",
+    labels_bridge[0] == labels_bridge[4] and labels_bridge[4] != labels_bridge[6],
   )
 
   # (f) 체이닝 차단 — A~B 0.5, B~C 0.5 간선으로 한 성분이지만 A~C가 0.3(floor 미만)이라
