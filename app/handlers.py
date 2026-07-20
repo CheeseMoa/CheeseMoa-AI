@@ -54,6 +54,7 @@ class ExtractedFaces(NamedTuple):
   embeddings: list[np.ndarray]  # 얼굴별 L2 정규화 (512,) float32. 빈 목록 = 얼굴 미검출/전부 퇴화
   eyes_closed: bool = False  # 얼굴 1개라도 양눈 감김 (quality.judge_faces 규칙)
   blurry: bool = False  # 얼굴 1개라도 Laplacian variance < 임계
+  face_widths: list[float] | None = None  # embeddings와 같은 순서의 bbox 폭 px — 주 인물 판정용. None = 미상
 
 
 # 디코딩된 BGR 이미지 → ExtractedFaces. embeddings 빈 목록이면 common_album 라우팅 (feature-spec §6.2).
@@ -258,7 +259,7 @@ class JobHandlers:
     eyes_closed_images: list[str] = []
     blurry_images: list[str] = []
     failed_images: list[FailedImage] = []
-    new_rows: list[tuple[str, str, np.ndarray]] = []
+    new_rows: list[tuple[str, str, np.ndarray, float]] = []
     # 진행률 발행 (CHMO-274): 이미지 루프가 job 비용의 사실상 전부라 여기서 처리 장수를 흘려보낸다.
     # 루프 진입 전 0/total 1회 — 백엔드가 즉시 QUEUED→PROCESSING으로 바를 띄우게 한다.
     total = len(request.images)
@@ -295,7 +296,10 @@ class JobHandlers:
       if request.options.exclude_eyes_closed and extracted.eyes_closed:
         eyes_closed_images.append(ref.image_id)
         continue
-      new_rows.extend((self._new_face_id(), ref.image_id, embedding) for embedding in extracted.embeddings)
+      widths = extracted.face_widths or [0.0] * len(extracted.embeddings)
+      new_rows.extend(
+        (self._new_face_id(), ref.image_id, embedding, width) for embedding, width in zip(extracted.embeddings, widths)
+      )
 
     event = stored.append_faces(new_rows)
     snapshot = self._recluster_and_save(request.event_id, event)
@@ -555,9 +559,20 @@ class JobHandlers:
         )
       )
 
-    # 미매칭 사진 라우팅 (feature-spec §6.2·§7). 얼굴 2명+ 사진은 단체 사진으로 보고 공용 앨범으로,
-    # 얼굴 1개(행인·미등록 1인) 미매칭은 uncertain으로 보낸다.
-    faces_per_photo = Counter(event.photo_ids)
+    # 미매칭 사진 라우팅 (feature-spec §6.2·§7). 주 인물 얼굴 2명+ 사진은 단체 사진으로 보고 공용 앨범으로,
+    # 주 인물 1명(초상·미등록 1인) 미매칭은 uncertain으로 보낸다.
+    # 주 인물 판정은 ADR 022와 같은 규칙 — 그 사진 최대 얼굴 폭의 ratio(0.5) 미만은 지나가는 행인으로
+    # 보고 세지 않는다: 1인 인물 사진 + 배경 행인이 단체 사진으로 오인돼 공용에 가는 것을 막는다.
+    # 폭 미상(0, v1 .npz 행)은 사진 단위로 전원 0이라 최대도 0 → 전원 주 인물 = 종전(전체 얼굴 수)과 동일.
+    ratio = self._cluster_config.common_main_face_ratio
+    max_width_of: dict[str, float] = {}
+    for photo_id, width in zip(event.photo_ids, event.face_widths):
+      max_width_of[photo_id] = max(max_width_of.get(photo_id, 0.0), width)
+    faces_per_photo = Counter(
+      photo_id
+      for photo_id, width in zip(event.photo_ids, event.face_widths)
+      if ratio <= 0 or width >= max_width_of[photo_id] * ratio
+    )
     uncertain: list[UncertainImage] = []
     group_common: list[str] = []
     routed: set[str] = set()
@@ -642,11 +657,13 @@ if __name__ == "__main__":
     return vector
 
   # confirm_distinct(⑬) 전용 — 같은 2D 부분공간에서 각도로 인물 간 유사도를 정밀 제어한다.
-  # 인물 40·41은 0°·50°(cos≈0.64 — 확실히 다른 사람)에 두고, 다리 사진(가상 인물 42)은 정확히
-  # 이등분각(25°, 각 대표와 cos≈0.906)에 둔다 — 실측(bridge_experiment) 검증 결과 이 기하에서는
-  # confirm_distinct 없이 다리 사진을 추가하면 두 인물이 실제로 하나의 클러스터로 오병합된다.
-  _CONFIRM_DISTINCT_ANGLES = {40: 0.0, 41: 50.0}
-  _CONFIRM_DISTINCT_BRIDGE_ANGLE = 25.0
+  # 인물 40·41은 0°·62°(cos≈0.47 — 병합 임계 0.55 아래라 사전조건에서 별개 앨범)에 두고, 다리 사진
+  # (가상 인물 42)은 이등분각(31°, 각 대표와 cos≈0.86)에 둔다 — 다리가 한쪽에 구제 편입되면 병합 판정이
+  # centroid cos≈0.62(≥0.55)·facepair 평균≈0.60(≥0.475)으로 넘어가, confirm_distinct 없이는 두 인물이
+  # 실제로 오병합된다(아래 인라인 재검증). 종전 0°·50°는 병합 임계 0.68 시절 기준 — ADR-012 재보정
+  # 0.55가 cos 0.64를 삼켜 사전조건이 항상 깨졌다. 현행 보정에 맞게 재배치.
+  _CONFIRM_DISTINCT_ANGLES = {40: 0.0, 41: 62.0}
+  _CONFIRM_DISTINCT_BRIDGE_ANGLE = 31.0
 
   def confirm_distinct_vector(person: int, step: int) -> np.ndarray:
     angle = _CONFIRM_DISTINCT_BRIDGE_ANGLE if person == 42 else _CONFIRM_DISTINCT_ANGLES[person]
@@ -656,29 +673,37 @@ if __name__ == "__main__":
     vector[401] = math.sin(theta)
     return vector
 
-  def fake_image(faces: list[tuple[int, int]], *, eyes_closed: bool = False, blurry: bool = False) -> np.ndarray:
-    """(인물 번호, step) 목록을 픽셀에 인코딩한 합성 BGR 이미지. 품질 플래그는 행 1에 인코딩한다."""
+  def fake_image(
+    faces: list[tuple[int, int]] | list[tuple[int, int, int]], *, eyes_closed: bool = False, blurry: bool = False
+  ) -> np.ndarray:
+    """(인물 번호, step[, 얼굴 폭 px]) 목록을 픽셀에 인코딩한 합성 BGR 이미지. 품질 플래그는 행 1에 인코딩한다.
+
+    폭 생략 시 100 — 전 얼굴 동일 폭이라 전원 주 인물이 되어 폭 도입 전 시나리오와 동작이 같다.
+    """
     image = np.zeros((2, 16, 3), dtype=np.uint8)
     image[0, 0, 0] = len(faces)
     image[1, 0, 0] = int(eyes_closed)  # fake_extractor가 ExtractedFaces 품질 판정으로 되읽는다
     image[1, 0, 1] = int(blurry)
-    for slot, (person, step) in enumerate(faces):
-      image[0, slot + 1, 0] = person
-      image[0, slot + 1, 1] = step
+    for slot, face in enumerate(faces):
+      image[0, slot + 1, 0] = face[0]
+      image[0, slot + 1, 1] = face[1]
+      image[0, slot + 1, 2] = face[2] if len(face) > 2 else 100
     return image
 
   def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
     vectors: list[np.ndarray] = []
+    widths: list[float] = []
     for slot in range(count):
       person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
+      widths.append(float(image[0, slot + 1, 2]))
       if person >= 40:
         vectors.append(confirm_distinct_vector(person, step))
       elif person >= 20:
         vectors.append(spread_person_vector(person, step))
       else:
         vectors.append(person_vector(person, step))
-    return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]))
+    return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]), widths)
 
   # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
   # 미매칭 단체 사진(낯선 2인), 같은 사진 속 닮은 얼굴 쌍(단일 사진 클러스터 강등 대상)
@@ -1133,6 +1158,16 @@ if __name__ == "__main__":
     and {cluster_40_id, cluster_41_id} == {c.cluster_id for c in bridged.clusters}
     and bridged.retired_cluster_ids == [],
   )
+  # 적대적 성질 재검증: 같은 기하를 제약 없이 재군집하면 실제로 오병합(1 클러스터)돼야 위 검증이
+  # 유의미하다 — 임계 재보정으로 기하가 무해해지면(2 클러스터) 여기서 즉시 표면화된다.
+  unconstrained = recluster(
+    np.stack([confirm_distinct_vector(p, s) for p, s in ((40, 0), (40, 1), (41, 0), (41, 1), (42, 0))]),
+    [None] * 5,
+    Constraints(),
+    handlers._cluster_config,
+    counter("검증"),
+  )
+  check("confirm_distinct 기하: 제약 없으면 오병합 재현 (검증의 적대적 성질 유지)", len(unconstrained.clusters) == 1)
 
   # ⑭ 같은 사진 자동 cannot-link 유도 (ADR-011): 다인 사진의 얼굴 쌍은 제약이 되고,
   # 임베딩이 사실상 동일(≥ _SAME_FACE_SIMILARITY)한 쌍은 YuNet 이중 검출로 보고 제외한다
@@ -1152,6 +1187,28 @@ if __name__ == "__main__":
   check(
     "같은사진 자동 cannot-link: 타인 쌍만 유도, 이중 검출 쌍·다른 사진 쌍은 제외",
     _same_photo_cannot_links(auto_event) == ((0, 2), (1, 2)),
+  )
+
+  # ⑮ 주 인물 카운트 라우팅 (CHMO-330): 얼굴 2개라도 하나가 행인(최대 폭의 50% 미만)이면 단체 사진이
+  # 아니다 — 미매칭 주 인물 1명이므로 공용이 아니라 uncertain. 폭이 대등한 2인 미매칭은 공용(①에서 검증).
+  image_source.images["img-walkin.jpg"] = fake_image([(9, 0, 120), (10, 0, 40)])  # 낯선 주 인물 + 행인
+  walkin_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c9",
+      "group_id": "group-1",
+      "event_id": "event-9",
+      "images": [{"image_id": "img-walkin", "s3_key": "img-walkin.jpg"}],
+    }
+  )
+  walkin = handlers.handle(parse_inbound_message(walkin_body))
+  check(
+    "주 인물 1명+행인: 공용 아님, uncertain(unmatched)",
+    walkin.common_album == [] and [(u.image_id, u.reason) for u in walkin.uncertain] == [("img-walkin", "unmatched")],
+  )
+  check(
+    "얼굴 폭이 .npz에 저장·왕복됨",
+    store.load("event-9").face_widths == (120.0, 40.0),
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

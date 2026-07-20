@@ -64,9 +64,11 @@ class Settings(BaseSettings):
   cluster_evict_facepair_floor: float = 0.45  # ADR-020: 회색지대 잔류 자격(최강 쌍) — 미만이면 남남 부착 축출
   cluster_blob_promote_similarity: float = 0.45
   cluster_blob_promote_floor: float = 0.4
-  # 라우팅 정책: 얼굴 2명+ 사진을 매칭 여부와 무관하게 공용 앨범에도 노출한다 (인물 앨범과 중복, feature-spec §6.2).
+  # 라우팅 정책: 주 인물 얼굴 2명+ 사진을 매칭 여부와 무관하게 공용 앨범에도 노출한다 (인물 앨범과 중복, feature-spec §6.2).
   # False면 구 정책(전원 미매칭 2+만 공용). Spring/앱이 새 common_album 의미를 감당할 때까지 끄는 롤아웃 스위치.
   cluster_group_photo_to_common: bool = True
+  # 주 인물 자격 — 사진 최대 얼굴 폭 대비 이 비율 미만은 행인으로 보고 위 카운트에서 제외 (ADR 022 규칙). 0=전체 카운트
+  cluster_common_main_face_ratio: float = 0.5
 
   # ── 입력 품질 교정 (2026-07-14 리뷰: 정렬 안티에일리어싱 + 랜드마크 2단계 정제) ──────────
   # 같은 얼굴 임베딩이 촬영·설정마다 흔들리던 노이즈(최저 유사도 0.43)를 잡는 두 교정의 토글.
@@ -143,6 +145,7 @@ class Settings(BaseSettings):
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
       group_photo_to_common=self.cluster_group_photo_to_common,
+      common_main_face_ratio=self.cluster_common_main_face_ratio,
     )
 
   def to_detector_config(self) -> "DetectorConfig":
