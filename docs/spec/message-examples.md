@@ -136,7 +136,7 @@
       "is_new": false,                            // 이번에 새로 생긴 인물인지
       "image_ids": ["img-1", "img-2", "img-7"],   // 한 사진이 여러 인물에 속할 수 있음 (N:M)
       "representative_vector": [0.0123, -0.0456 /* …총 512개 float (L2 정규화 평균, 표시용 파생값) */],
-      "thumbnail_s3_key": "thumbnails/{event_id}/person-A.jpg"  // 대표 얼굴 썸네일 (CHMO-335) — null 가능 (아래 註)
+      "thumbnail_s3_key": "thumbnails/events/{event_id}/person-A.jpg"  // 대표 얼굴 썸네일 (CHMO-335) — null 가능 (아래 註)
     }
   ],
   "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경·얼굴 미검출) — 뷰어 노출
@@ -157,7 +157,7 @@
 - `status: "failed"`일 때는 `job_id`·`status` 외 전 필드가 빈 리스트일 수 있다.
 - `representative_vector`는 항상 512-dim, NaN/inf 없음.
 - `thumbnail_s3_key`(CHMO-335): 대표 얼굴 crop JPEG의 S3 키 — AI 워커 소유 embeddings 버킷의
-  `thumbnails/{event_id}/{cluster_id}.jpg` 고정 키로, 재군집으로 대표가 바뀌면 같은 키에 덮어쓴다.
+  `thumbnails/events/{event_id}/{cluster_id}.jpg` 고정 키로, 재군집으로 대표가 바뀌면 같은 키에 덮어쓴다.
   Spring은 이 키로 presigned URL을 **매 조회 발급**해 서빙한다(장기 캐시하면 대표 교체가 반영되지 않는다).
   **null 가능**: 기능 비활성(`THUMBNAIL_MAX_SIDE=0`) / 렌더·업로드 실패(best-effort — job은 정상 진행) /
   구버전(.npz v2 이하) 데이터만으로 구성된 클러스터. null이면 썸네일 없음으로 처리한다.

@@ -127,11 +127,14 @@ class Settings(BaseSettings):
 
   # ── 인물 앨범 대표 얼굴 썸네일 (CHMO-335) ────────────────────────────────────
   # 재군집 후 클러스터마다 대표 얼굴을 crop해 embeddings_bucket의 {thumbnail_prefix}{event_id}/
-  # {cluster_id}.jpg에 덮어쓰고, 결과 메시지에 그 키를 싣는다 (Spring이 presigned URL 발급).
+  # {cluster_id}.jpg (= thumbnails/events/{event_id}/{cluster_id}.jpg)에 덮어쓰고, 결과 메시지에 그
+  # 키를 싣는다 (Spring이 presigned URL 발급).
   thumbnail_max_side: int = Field(default=256, ge=0)  # 썸네일 긴 변 상한 px. 0 = 기능 전체 비활성 (롤백 스위치)
   thumbnail_jpeg_quality: int = Field(default=85, ge=1, le=100)
   thumbnail_bbox_scale: float = Field(default=1.4, gt=0)  # 얼굴 bbox 확장 배율 — 여백 포함 crop
-  thumbnail_prefix: str = "thumbnails/"  # 썸네일 키 = {prefix}{event_id}/{cluster_id}.jpg
+  # 썸네일 키 = {prefix}{event_id}/{cluster_id}.jpg. 기본 prefix에 events/를 포함해 원본
+  # (originals/events/{id}/)·사진 썸네일(thumbnails/events/{id}/)과 같은 계층에 둔다 (버킷 레이아웃 통일).
+  thumbnail_prefix: str = "thumbnails/events/"
 
   log_level: str = "INFO"
 
