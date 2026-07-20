@@ -428,7 +428,7 @@ if __name__ == "__main__":
         is_new=False,
         image_ids=["img-1", "img-2", "img-7"],
         representative_vector=[0.0] * (EMBED_DIM - 1) + [1.0],
-        thumbnail_s3_key="thumbnails/event-1/person-A.jpg",
+        thumbnail_s3_key="thumbnails/events/event-1/person-A.jpg",
       )
     ],
     common_album=["img-9"],

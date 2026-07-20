@@ -286,7 +286,7 @@ def _run_smoke() -> None:
   check(
     "대표 얼굴 썸네일: 클러스터마다 키 동봉 + 업로드 (발행 경유 종단, CHMO-335)",
     all(
-      c.thumbnail_s3_key == f"thumbnails/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
+      c.thumbnail_s3_key == f"thumbnails/events/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
       for c in results["job-정상"].clusters
     ),
   )
