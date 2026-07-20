@@ -102,10 +102,13 @@ class ClusterConfig:
   # 한다 (__post_init__ 불변식).
   blob_promote_floor: float = 0.4
   # 미매칭이 아니라 라우팅 정책 토글이다 (군집 판단엔 영향 없음, 핸들러가 결과 조립 때 읽는다):
-  # 얼굴이 2명 이상 검출된 사진은 매칭 여부와 무관하게 공용 앨범에도 노출한다 (인물 앨범과 중복 노출,
+  # 주 인물 얼굴이 2명 이상인 사진은 매칭 여부와 무관하게 공용 앨범에도 노출한다 (인물 앨범과 중복 노출,
   # feature-spec §6.2). False면 구 정책 — 전원 미매칭인 2+ 사진만 공용으로 보낸다. Spring/앱이 새
   # common_album 의미(단체 사진 전부 포함)를 감당할 준비가 될 때까지 끄고 배포하는 롤아웃 스위치.
   group_photo_to_common: bool = True
+  # 위 얼굴 수 카운트의 주 인물 자격 — 그 사진 최대 얼굴 폭 대비 이 비율 미만이면 지나가는 행인으로 보고
+  # 세지 않는다 (quality의 blur/eye_main_face_ratio와 같은 논리·같은 값, ADR 022). 0이면 전체 얼굴을 센다.
+  common_main_face_ratio: float = 0.5
 
   def __post_init__(self) -> None:
     # 이식한 HDBSCAN이 min_cluster_size < 2에서 raise하므로 생성 시점에 같은 계약을 강제한다
@@ -126,6 +129,7 @@ class ClusterConfig:
       "evict_facepair_floor",
       "blob_promote_similarity",
       "blob_promote_floor",
+      "common_main_face_ratio",
     ):
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:

@@ -102,9 +102,16 @@ def build_face_extractor(
     if blurry and not gate_exempt and not shake_confirmed(image, quality_config):
       blurry = False
 
-    crops = [crop for crop in aligned_crops if crop is not None]
-    embeddings = [embedding for embedding in embedder.embed_batch(crops) if embedding is not None]
-    return ExtractedFaces(embeddings, eyes_closed, blurry)
+    # 퇴화 필터(정렬 실패·비유한 임베딩) 이후에도 임베딩↔얼굴 폭이 짝을 유지해야 한다 —
+    # 폭은 라우팅의 주 인물 판정(사진 최대 얼굴 폭 대비 비율) 입력이다 (CHMO-330).
+    kept = [(crop, float(face.bbox[2])) for face, crop in zip(detected, aligned_crops) if crop is not None]
+    embeddings: list = []
+    face_widths: list[float] = []
+    for embedding, (_, width) in zip(embedder.embed_batch([crop for crop, _ in kept]), kept):
+      if embedding is not None:
+        embeddings.append(embedding)
+        face_widths.append(width)
+    return ExtractedFaces(embeddings, eyes_closed, blurry, face_widths)
 
   return extract_faces
 
