@@ -19,7 +19,10 @@ EMBED_DIM = 512
 # v2: face_widths(얼굴 bbox 폭 px) 열 추가 — 라우팅의 주 인물 판정용 (CHMO-330). v1 파일은 폭 0(미상)으로
 # 로드된다: 한 사진의 행들은 같은 요청에서 함께 추가되므로 사진 내 세대 혼합이 없고, 전원 0이면 최대 폭도
 # 0이라 주 인물 판정(≥ 최대×비율)이 전원 통과 — 종전(전체 얼굴 수) 동작과 정확히 일치하는 안전 폴백.
-SCHEMA_VERSION = 2
+# v3: bboxes(x,y,w,h px)·s3_keys(원본 객체 키) 열 추가 — 대표 얼굴 썸네일 crop의 원천 (CHMO-335).
+# v2 이하 파일은 bbox 전부 0·s3_key ""로 로드된다: 폭 0/키 없음 행은 썸네일 대표 후보 자격이 없어
+# 해당 행만으로 구성된 클러스터는 썸네일 None — 종전(썸네일 없음) 동작과 일치하는 안전 폴백.
+SCHEMA_VERSION = 3
 # numpy 문자열 배열에는 null이 없어 "직전 배정 없음"을 빈 문자열로 인코딩한다 (ADR-007)
 _NO_CLUSTER = ""
 _ID_KEYS = ("face_ids", "photo_ids", "cluster_ids")
@@ -63,6 +66,10 @@ class EventEmbeddings:
   must_link_pairs: tuple[tuple[str, str], ...]  # face_id 쌍, 시간순
   cannot_link_pairs: tuple[tuple[str, str], ...]  # face_id 쌍, 시간순
   face_widths: tuple[float, ...] = ()  # 길이 N — 얼굴 bbox 폭 px (0 = 미상, v1 파일 폴백). 주 인물 판정용
+  bboxes: tuple[
+    tuple[float, float, float, float], ...
+  ] = ()  # 길이 N — (x, y, w, h) 원본 px (전부 0 = 미상, v2 이하 폴백)
+  s3_keys: tuple[str, ...] = ()  # 길이 N — 원본 이미지 S3 키 ("" = 미상, v2 이하 폴백). 썸네일 재fetch용
 
   def __post_init__(self) -> None:
     n = len(self.face_ids)
@@ -80,6 +87,21 @@ class EventEmbeddings:
       raise ValueError(f"face_widths 길이가 다릅니다. face_ids={n}, face_widths={len(self.face_widths)}")
     if any(not np.isfinite(width) or width < 0 for width in self.face_widths):
       raise ValueError("face_widths는 0 이상의 유한값이어야 합니다.")
+    if not self.bboxes and n:
+      object.__setattr__(
+        self, "bboxes", ((0.0, 0.0, 0.0, 0.0),) * n
+      )  # 생략 = 전부 미상 (v2 이하 로드·기존 생성처 호환)
+    if len(self.bboxes) != n:
+      raise ValueError(f"bboxes 길이가 다릅니다. face_ids={n}, bboxes={len(self.bboxes)}")
+    if any(
+      len(bbox) != 4 or any(not np.isfinite(v) for v in bbox) or bbox[2] < 0 or bbox[3] < 0 for bbox in self.bboxes
+    ):
+      raise ValueError("bboxes는 (x, y, w, h) 유한값이고 w·h는 0 이상이어야 합니다.")
+    if not self.s3_keys and n:
+      # face_ids/photo_ids와 달리 빈 문자열을 허용한다 — ""는 손상이 아니라 "원본 키 미상"(v2 이하 폴백)의 인코딩
+      object.__setattr__(self, "s3_keys", ("",) * n)
+    if len(self.s3_keys) != n:
+      raise ValueError(f"s3_keys 길이가 다릅니다. face_ids={n}, s3_keys={len(self.s3_keys)}")
     if len(set(self.face_ids)) != n:
       raise ValueError("face_ids에 중복이 있습니다.")
     if any(not face_id for face_id in self.face_ids) or any(not photo_id for photo_id in self.photo_ids):
@@ -117,12 +139,19 @@ class EventEmbeddings:
     )
 
   def append_faces(
-    self, rows: Sequence[tuple[str, str, np.ndarray] | tuple[str, str, np.ndarray, float]]
+    self,
+    rows: Sequence[
+      tuple[str, str, np.ndarray]
+      | tuple[str, str, np.ndarray, float]
+      | tuple[str, str, np.ndarray, float, tuple[float, float, float, float]]
+      | tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str]
+    ],
   ) -> "EventEmbeddings":
-    """(face_id, photo_id, 임베딩[, 얼굴 폭 px]) 행들을 cluster_id=None(신규)으로 뒤에 추가한 새 인스턴스를 만든다.
+    """(face_id, photo_id, 임베딩[, 얼굴 폭 px[, bbox[, s3_key]]]) 행들을 cluster_id=None(신규)으로 뒤에 추가한 새 인스턴스를 만든다.
 
     photo_id 기준 멱등 스킵(이미 저장된 사진 제외)은 호출자(classify 핸들러)의 책임이다 —
-    이 타입은 요청 메시지를 모르고 행 단위 정합성만 지킨다. 폭 생략 = 0(미상, 주 인물 취급).
+    이 타입은 요청 메시지를 모르고 행 단위 정합성만 지킨다. 폭 생략 = 0(미상, 주 인물 취급),
+    bbox·s3_key 생략 = 미상(썸네일 대표 후보 자격 없음).
     """
     if not rows:
       return self
@@ -134,6 +163,9 @@ class EventEmbeddings:
       photo_ids=self.photo_ids + tuple(row[1] for row in rows),
       cluster_ids=self.cluster_ids + (None,) * len(rows),
       face_widths=self.face_widths + tuple(float(row[3]) if len(row) > 3 else 0.0 for row in rows),
+      bboxes=self.bboxes
+      + tuple(tuple(float(v) for v in row[4]) if len(row) > 4 else (0.0, 0.0, 0.0, 0.0) for row in rows),
+      s3_keys=self.s3_keys + tuple(str(row[5]) if len(row) > 5 else "" for row in rows),
     )
 
   def masked_by_photo_ids(self, deleted: Collection[str]) -> "EventEmbeddings":
@@ -153,6 +185,8 @@ class EventEmbeddings:
       photo_ids=tuple(photo_id for photo_id, kept in zip(self.photo_ids, keep) if kept),
       cluster_ids=tuple(cluster_id for cluster_id, kept in zip(self.cluster_ids, keep) if kept),
       face_widths=tuple(width for width, kept in zip(self.face_widths, keep) if kept),
+      bboxes=tuple(bbox for bbox, kept in zip(self.bboxes, keep) if kept),
+      s3_keys=tuple(key for key, kept in zip(self.s3_keys, keep) if kept),
       must_link_pairs=tuple(pair for pair in self.must_link_pairs if pair[0] in kept_faces and pair[1] in kept_faces),
       cannot_link_pairs=tuple(
         pair for pair in self.cannot_link_pairs if pair[0] in kept_faces and pair[1] in kept_faces
@@ -192,6 +226,8 @@ class EventEmbeddings:
       must_link_pairs=_as_str_array(self.must_link_pairs, columns=2),
       cannot_link_pairs=_as_str_array(self.cannot_link_pairs, columns=2),
       face_widths=np.asarray(self.face_widths, dtype=np.float32),
+      bboxes=np.asarray(self.bboxes, dtype=np.float32).reshape(-1, 4),  # 빈 입력도 shape (0, 4) 보장
+      s3_keys=_as_str_array(self.s3_keys),
     )
     return buffer.getvalue()
 
@@ -204,16 +240,25 @@ class EventEmbeddings:
     try:
       with np.load(io.BytesIO(blob), allow_pickle=False) as archive:
         version = int(archive["schema_version"])
-        if version not in (1, SCHEMA_VERSION):
+        if version not in (1, 2, SCHEMA_VERSION):
           raise StoreCorruptionError(
             f"지원하지 않는 schema_version입니다. 받은 값: {version}, 지원: 1~{SCHEMA_VERSION}"
           )
         embeddings = np.asarray(archive["embeddings"], dtype=np.float32)
         ids = {key: tuple(str(value) for value in archive[key]) for key in _ID_KEYS}
+        n = len(ids["face_ids"])
         # v1에는 face_widths가 없다 — 폭 미상(0)으로 채우면 주 인물 판정이 전원 통과해 종전 동작과 같다
-        face_widths = (
-          tuple(float(width) for width in archive["face_widths"]) if version >= 2 else (0.0,) * len(ids["face_ids"])
-        )
+        face_widths = tuple(float(width) for width in archive["face_widths"]) if version >= 2 else (0.0,) * n
+        # v2 이하에는 bboxes·s3_keys가 없다 — 미상 폴백 행은 썸네일 대표 후보에서 빠질 뿐 나머지 동작 동일
+        if version >= 3:
+          bbox_array = archive["bboxes"]
+          if bbox_array.ndim != 2 or bbox_array.shape[1] != 4:
+            raise StoreCorruptionError(f"bboxes는 shape (N, 4)여야 합니다. 받은 shape: {bbox_array.shape}")
+          bboxes = tuple(tuple(float(v) for v in row) for row in bbox_array)
+          s3_keys = tuple(str(key) for key in archive["s3_keys"])
+        else:
+          bboxes = ((0.0, 0.0, 0.0, 0.0),) * n
+          s3_keys = ("",) * n
         pairs: dict[str, tuple[tuple[str, str], ...]] = {}
         for key in _PAIR_KEYS:
           array = archive[key]
@@ -234,6 +279,8 @@ class EventEmbeddings:
         must_link_pairs=pairs["must_link_pairs"],
         cannot_link_pairs=pairs["cannot_link_pairs"],
         face_widths=face_widths,
+        bboxes=bboxes,
+        s3_keys=s3_keys,
       )
     except ValueError as exc:  # __post_init__ 불변식 위반 (길이 정합·face_id 유일·제약 참조 존재 등)
       raise StoreCorruptionError(f".npz 불변식 위반: {exc}") from exc
@@ -261,12 +308,17 @@ if __name__ == "__main__":
 
   event = empty.append_faces(
     [
-      ("face-1", "img-1", unit(0), 120.0),
-      ("face-2", "img-1", unit(1), 40.0),  # 한 image_id에 얼굴 여러 개 (N:M) — 폭이 다른 행인 모사
-      ("face-3", "img-2", unit(2)),  # 폭 생략 = 0 (미상)
+      ("face-1", "img-1", unit(0), 120.0, (10.0, 20.0, 120.0, 150.0), "photos/img-1.jpg"),
+      ("face-2", "img-1", unit(1), 40.0, (300.0, 5.0, 40.0, 50.0)),  # 한 image_id에 얼굴 여러 개 (N:M), s3_key 생략
+      ("face-3", "img-2", unit(2)),  # 폭·bbox·s3_key 생략 = 미상
     ]
   )
   check("append_faces 폭 기록 (생략 = 0)", event.face_widths == (120.0, 40.0, 0.0))
+  check(
+    "append_faces bbox·s3_key 기록 (생략 = 미상)",
+    event.bboxes == ((10.0, 20.0, 120.0, 150.0), (300.0, 5.0, 40.0, 50.0), (0.0, 0.0, 0.0, 0.0))
+    and event.s3_keys == ("photos/img-1.jpg", "", ""),
+  )
   event = event.with_cluster_ids(["person-A", None, "person-B"])
   event = event.with_constraints([("face-1", "face-3")], [("face-2", "face-3")])
   restored = EventEmbeddings.from_npz_bytes(event.to_npz_bytes())
@@ -288,6 +340,10 @@ if __name__ == "__main__":
     and masked.cannot_link_pairs == (),
   )
   check("삭제 마스킹이 폭도 함께 마스킹", masked.face_widths == (0.0,))
+  check(
+    "삭제 마스킹이 bbox·s3_key도 함께 마스킹",
+    masked.bboxes == ((0.0, 0.0, 0.0, 0.0),) and masked.s3_keys == ("",),
+  )
   check("삭제 대상 없음이면 동일 인스턴스", event.masked_by_photo_ids(["img-없음"]) is event)
   check("전체 삭제 → 빈 event", event.masked_by_photo_ids(["img-1", "img-2"]) == empty)
 
@@ -308,6 +364,28 @@ if __name__ == "__main__":
   check(
     "v1 .npz 로드: 폭 미상(0) 폴백 + 나머지 필드 보존",
     from_v1.face_widths == (0.0, 0.0, 0.0) and from_v1.face_ids == event.face_ids,
+  )
+
+  # v2 하위호환: bboxes·s3_keys 열이 없는 .npz는 미상(전부 0·"")으로 로드된다 — 해당 행은 썸네일
+  # 대표 후보 자격이 없을 뿐 폭·라우팅 동작은 보존된다 (SCHEMA_VERSION 주석).
+  v2_buffer = io.BytesIO()
+  np.savez_compressed(
+    v2_buffer,
+    schema_version=np.int64(2),
+    embeddings=event.embeddings,
+    face_ids=_as_str_array(event.face_ids),
+    photo_ids=_as_str_array(event.photo_ids),
+    cluster_ids=_as_str_array([cid if cid is not None else _NO_CLUSTER for cid in event.cluster_ids]),
+    must_link_pairs=_as_str_array(event.must_link_pairs, columns=2),
+    cannot_link_pairs=_as_str_array(event.cannot_link_pairs, columns=2),
+    face_widths=np.asarray(event.face_widths, dtype=np.float32),
+  )
+  from_v2 = EventEmbeddings.from_npz_bytes(v2_buffer.getvalue())
+  check(
+    "v2 .npz 로드: bbox·s3_key 미상 폴백 + 폭 보존",
+    from_v2.bboxes == ((0.0, 0.0, 0.0, 0.0),) * 3
+    and from_v2.s3_keys == ("", "", "")
+    and from_v2.face_widths == event.face_widths,
   )
 
   invalid_cases = [
@@ -375,6 +453,30 @@ if __name__ == "__main__":
         cluster_ids=(None,),
         must_link_pairs=(),
         cannot_link_pairs=(),
+      ),
+    ),
+    (
+      "bboxes 길이 불일치",
+      dict(
+        embeddings=np.stack([unit(0)]),
+        face_ids=("face-1",),
+        photo_ids=("img-1",),
+        cluster_ids=(None,),
+        must_link_pairs=(),
+        cannot_link_pairs=(),
+        bboxes=((0.0, 0.0, 10.0, 10.0), (0.0, 0.0, 5.0, 5.0)),
+      ),
+    ),
+    (
+      "bbox NaN",
+      dict(
+        embeddings=np.stack([unit(0)]),
+        face_ids=("face-1",),
+        photo_ids=("img-1",),
+        cluster_ids=(None,),
+        must_link_pairs=(),
+        cannot_link_pairs=(),
+        bboxes=((float("nan"), 0.0, 10.0, 10.0),),
       ),
     ),
   ]

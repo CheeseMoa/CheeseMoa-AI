@@ -40,6 +40,7 @@ from app.schemas.messages import (
 from app.storage.embedding_store import EmbeddingStore
 from app.storage.event_embeddings import EventEmbeddings
 from app.storage.image_source import ImageSource
+from app.storage.thumbnail_store import ThumbnailStore
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ class ExtractedFaces(NamedTuple):
   eyes_closed: bool = False  # 얼굴 1개라도 양눈 감김 (quality.judge_faces 규칙)
   blurry: bool = False  # 얼굴 1개라도 Laplacian variance < 임계
   face_widths: list[float] | None = None  # embeddings와 같은 순서의 bbox 폭 px — 주 인물 판정용. None = 미상
+  bboxes: list[tuple[int, int, int, int]] | None = None  # 같은 순서의 (x, y, w, h) 원본 px — 썸네일 crop용. None = 미상
 
 
 # 디코딩된 BGR 이미지 → ExtractedFaces. embeddings 빈 목록이면 common_album 라우팅 (feature-spec §6.2).
@@ -64,6 +66,10 @@ FaceExtractor = Callable[[np.ndarray], ExtractedFaces]
 # classify 처리 중 진행률 보고 콜백 (job_id, event_id, processed, total) → None (CHMO-274).
 # 핸들러는 ProgressUpdate 스키마·SQS를 모른다 — 발행 배선은 core.deps가 클로저로 주입한다 (관심사 분리).
 ProgressReporter = Callable[[str, str, int, int], None]
+
+# 디코딩된 BGR 원본 + 얼굴 bbox(x, y, w, h) → 썸네일 JPEG bytes (CHMO-335). 실패는 예외로 던진다.
+# 핸들러는 cv2를 모른다 — pipeline.thumbnail과의 합성은 core.deps의 책임이다 (FaceExtractor와 같은 구도).
+ThumbnailRenderer = Callable[[np.ndarray, tuple[float, float, float, float]], bytes]
 
 # 진행률 발행 간격 — 처리 이미지 이 장수마다 1회 발행한다(루프 진입 시 0/total, 마지막 total/total은
 # 별도로 항상 발행). 진행바를 더 촘촘히/성기게 하려면 이 값을 내리/올린다 (트래픽은 반비례).
@@ -216,11 +222,16 @@ class JobHandlers:
     new_cluster_id: Callable[[], str] | None = None,
     new_face_id: Callable[[], str] | None = None,
     report_progress: ProgressReporter | None = None,
+    render_thumbnail: ThumbnailRenderer | None = None,
+    thumbnails: ThumbnailStore | None = None,
   ) -> None:
     self._store = store
     self._images = images
     self._extract_faces = extract_faces
     self._cluster_config = cluster_config if cluster_config is not None else ClusterConfig()
+    # 둘 다 주입돼야 썸네일 활성 (CHMO-335) — 하나라도 None이면 전 경로에서 생략 = 종전 동작 (롤백 경로)
+    self._render_thumbnail = render_thumbnail
+    self._thumbnails = thumbnails
     # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
     self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
     self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
@@ -259,7 +270,7 @@ class JobHandlers:
     eyes_closed_images: list[str] = []
     blurry_images: list[str] = []
     failed_images: list[FailedImage] = []
-    new_rows: list[tuple[str, str, np.ndarray, float]] = []
+    new_rows: list[tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str]] = []
     # 진행률 발행 (CHMO-274): 이미지 루프가 job 비용의 사실상 전부라 여기서 처리 장수를 흘려보낸다.
     # 루프 진입 전 0/total 1회 — 백엔드가 즉시 QUEUED→PROCESSING으로 바를 띄우게 한다.
     total = len(request.images)
@@ -297,14 +308,17 @@ class JobHandlers:
         eyes_closed_images.append(ref.image_id)
         continue
       widths = extracted.face_widths or [0.0] * len(extracted.embeddings)
+      bboxes = extracted.bboxes or [(0, 0, 0, 0)] * len(extracted.embeddings)
       new_rows.extend(
-        (self._new_face_id(), ref.image_id, embedding, width) for embedding, width in zip(extracted.embeddings, widths)
+        (self._new_face_id(), ref.image_id, embedding, width, tuple(float(v) for v in bbox), ref.s3_key)
+        for embedding, width, bbox in zip(extracted.embeddings, widths, bboxes)
       )
 
     event = stored.append_faces(new_rows)
     snapshot = self._recluster_and_save(request.event_id, event)
     return self._assemble_result(
       request.job_id,
+      request.event_id,
       snapshot,
       common_album=common_album,
       failed_images=failed_images,
@@ -334,7 +348,7 @@ class JobHandlers:
     must, cannot = _reconcile_constraints(old_must, stored.cannot_link_pairs, new_must, new_cannot)
     event = stored.with_constraints(must, cannot)
     snapshot = self._recluster_and_save(message.event_id, event)
-    return self._assemble_result(message.job_id, snapshot)
+    return self._assemble_result(message.job_id, message.event_id, snapshot)
 
   def _translate_feedback(
     self,
@@ -468,7 +482,7 @@ class JobHandlers:
     vanished = sorted({cluster_id for cluster_id in stored.cluster_ids if cluster_id is not None} - survivors)
 
     snapshot = self._recluster_and_save(request.event_id, masked)
-    return self._assemble_result(request.job_id, snapshot, extra_retired=vanished)
+    return self._assemble_result(request.job_id, request.event_id, snapshot, extra_retired=vanished)
 
   # ── 공통 꼬리: 재군집 + .npz rewrite + 결과 조립 ─────────────────────────────
 
@@ -525,9 +539,62 @@ class JobHandlers:
       retired_cluster_ids=tuple(dict.fromkeys([*result.retired_cluster_ids, *demoted_retired])),
     )
 
+  # ── 대표 얼굴 썸네일 (CHMO-335) ──────────────────────────────────────────────
+
+  @staticmethod
+  def _select_representative(person: PersonCluster, event: EventEmbeddings) -> int | None:
+    """썸네일 대표 얼굴 행을 고른다 — LOO centroid 유사도(membership) 최대 = 그 인물다움이 가장 확실한 얼굴.
+
+    bbox·원본 키 미상 행(v2 이하 .npz 폴백)은 crop이 불가능해 후보에서 뺀다. strict 비교라 동률은
+    가장 앞 행이 이긴다(member_indices 오름차순 계약) — 같은 멤버십이면 항상 같은 대표(결정성).
+    """
+    best: int | None = None
+    best_similarity = float("-inf")
+    for index, similarity in zip(person.member_indices, person.membership_similarities):
+      if event.bboxes[index][2] <= 0 or not event.s3_keys[index]:
+        continue
+      if similarity > best_similarity:
+        best, best_similarity = index, similarity
+    return best
+
+  def _make_thumbnail(self, event_id: str, person: PersonCluster, event: EventEmbeddings) -> str | None:
+    """대표 얼굴을 원본에서 crop·업로드하고 저장 키를 반환한다 — best-effort (실패가 job을 죽이지 않는다).
+
+    원본은 대표 1장만 재fetch한다 — 요청 전체의 디코딩 이미지를 쥐고 있는 설계는 공유 호스트
+    (t4g.small) 메모리를 위협해 금지. 키는 (event_id, cluster_id) 고정이라 재군집으로 대표가
+    바뀌면 같은 키에 덮어써진다(멱등 — Spring은 presigned URL 발급 시점의 최신 객체를 서빙).
+    """
+    if self._render_thumbnail is None or self._thumbnails is None:
+      return None  # 비활성 (미주입) — 종전 동작
+    try:
+      representative = self._select_representative(person, event)
+      if representative is None:
+        return None  # v2 이하 데이터만으로 구성된 클러스터 — 새 사진이 classify되면 자연 회복
+      image = self._images.fetch(event.s3_keys[representative])
+      jpeg = self._render_thumbnail(image, event.bboxes[representative])
+      return self._thumbnails.put(event_id, person.cluster_id, jpeg)
+    except Exception:
+      logger.warning(
+        "썸네일 생성 실패 event_id=%s cluster_id=%s — 무시하고 진행", event_id, person.cluster_id, exc_info=True
+      )
+      return None
+
+  def _delete_retired_thumbnails(self, event_id: str, cluster_ids: Sequence[str]) -> None:
+    """은퇴 클러스터의 썸네일을 정리한다 — best-effort (실패해도 고아 객체일 뿐 계약상 무해)."""
+    if self._thumbnails is None:
+      return
+    for cluster_id in cluster_ids:
+      try:
+        self._thumbnails.delete(event_id, cluster_id)
+      except Exception:
+        logger.warning(
+          "은퇴 썸네일 삭제 실패 event_id=%s cluster_id=%s — 무시하고 진행", event_id, cluster_id, exc_info=True
+        )
+
   def _assemble_result(
     self,
     job_id: str,
+    event_id: str,
     snapshot: _ClusterSnapshot,
     *,
     common_album: Sequence[str] = (),
@@ -556,6 +623,7 @@ class JobHandlers:
           is_new=person.is_new,
           image_ids=image_ids,
           representative_vector=[float(value) for value in person.centroid],
+          thumbnail_s3_key=self._make_thumbnail(event_id, person, event),
         )
       )
 
@@ -565,13 +633,15 @@ class JobHandlers:
     # 보고 세지 않는다: 1인 인물 사진 + 배경 행인이 단체 사진으로 오인돼 공용에 가는 것을 막는다.
     # 폭 미상(0, v1 .npz 행)은 사진 단위로 전원 0이라 최대도 0 → 전원 주 인물 = 종전(전체 얼굴 수)과 동일.
     ratio = self._cluster_config.common_main_face_ratio
+    counted = self._headcount_eligible(event)
     max_width_of: dict[str, float] = {}
-    for photo_id, width in zip(event.photo_ids, event.face_widths):
-      max_width_of[photo_id] = max(max_width_of.get(photo_id, 0.0), width)
+    for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths)):
+      if counted[index]:
+        max_width_of[photo_id] = max(max_width_of.get(photo_id, 0.0), width)
     faces_per_photo = Counter(
       photo_id
-      for photo_id, width in zip(event.photo_ids, event.face_widths)
-      if ratio <= 0 or width >= max_width_of[photo_id] * ratio
+      for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths))
+      if counted[index] and (ratio <= 0 or width >= max_width_of[photo_id] * ratio)
     )
     uncertain: list[UncertainImage] = []
     group_common: list[str] = []
@@ -602,6 +672,8 @@ class JobHandlers:
         else:
           uncertain.append(UncertainImage(image_id=photo_id, reason=reason))
 
+    retired_cluster_ids = list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired]))
+    self._delete_retired_thumbnails(event_id, retired_cluster_ids)
     return ClassifyResult(
       job_id=job_id,
       status="partial" if failed_images else "succeeded",
@@ -612,8 +684,27 @@ class JobHandlers:
       eyes_closed=list(dict.fromkeys(eyes_closed)),
       blurry=list(dict.fromkeys(blurry)),
       failed_images=list(failed_images),
-      retired_cluster_ids=list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired])),
+      retired_cluster_ids=retired_cluster_ids,
     )
+
+  def _headcount_eligible(self, event: EventEmbeddings) -> list[bool]:
+    """단체 판정 머릿수 자격 — 미배정 얼굴이 event 내 어떤 얼굴과도 유사도 바닥 미만이면 오검출로 보고 뺀다.
+
+    털·사물 오검출은 쓰레기 임베딩이라 모든 얼굴과 바닥 유사도인데(event 93 퍼 후드 0.183), 주 인물
+    크기로 검출되면 1인 사진이 "주 인물 2명 단체"로 오판돼 공용 앨범에 노출된다 (ADR 025). 클러스터
+    배정 얼굴(실측 전역 최근접 최저 0.407)과, 비교 상대가 없는 단독 얼굴은 판단 근거가 없어 항상 센다.
+    """
+    floor = self._cluster_config.common_face_min_similarity
+    total = len(event.face_ids)
+    if floor <= 0 or total < 2:
+      return [True] * total
+    embeddings = np.asarray(event.embeddings, dtype=np.float32)
+    similarities = embeddings @ embeddings.T
+    np.fill_diagonal(similarities, -1.0)
+    nearest = similarities.max(axis=1)
+    return [
+      cluster_id is not None or float(nearest[index]) >= floor for index, cluster_id in enumerate(event.cluster_ids)
+    ]
 
 
 if __name__ == "__main__":
@@ -627,6 +718,7 @@ if __name__ == "__main__":
   from app.storage.embedding_store import InMemoryEmbeddingStore
   from app.storage.image_source import InMemoryImageSource
   from app.storage.event_embeddings import EMBED_DIM
+  from app.storage.thumbnail_store import InMemoryThumbnailStore
 
   passed = 0
 
@@ -711,7 +803,9 @@ if __name__ == "__main__":
         vectors.append(spread_person_vector(person, step))
       else:
         vectors.append(person_vector(person, step))
-    return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]), widths)
+    # 합성 bbox: 폭을 정사각 (0, 0, w, w)로 — 썸네일 대표 선정(w>0)·페이크 렌더러 경로를 태운다
+    bboxes = [(0, 0, int(width), int(width)) for width in widths]
+    return ExtractedFaces(vectors, bool(image[1, 0, 0]), bool(image[1, 0, 1]), widths, bboxes)
 
   # 인물 0(A): a1·a2·a3, 인물 1(B): b1·b2, 얼굴 없는 사진, 가져올 수 없는 사진,
   # 미매칭 단체 사진(낯선 2인), 같은 사진 속 닮은 얼굴 쌍(단일 사진 클러스터 강등 대상)
@@ -756,12 +850,16 @@ if __name__ == "__main__":
 
     return next_id
 
+  thumb_store = InMemoryThumbnailStore()
   handlers = JobHandlers(
     store=store,
     images=image_source,
     extract_faces=fake_extractor,
     new_cluster_id=counter("person"),
     new_face_id=counter("face"),
+    # 페이크 렌더러 — 픽셀 처리 없이 결정적 bytes만 만든다 (실렌더는 pipeline.thumbnail __main__이 검증)
+    render_thumbnail=lambda image, bbox: b"jpeg:" + repr(bbox).encode(),
+    thumbnails=thumb_store,
   )
 
   def image_ids_of(result: ClassifyResult, *, containing: str) -> set[str]:
@@ -827,6 +925,17 @@ if __name__ == "__main__":
   cluster_a_id = next(c.cluster_id for c in result.clusters if "img-a1" in c.image_ids)
   cluster_b_id = next(c.cluster_id for c in result.clusters if "img-b1" in c.image_ids)
   check("classify: .npz 저장 (행 9개 — 인물 5 + 단체 2 + 강등 쌍 2)", len(store.load("event-1").face_ids) == 9)
+  check(
+    "classify: bbox·s3_key가 .npz에 저장됨 (v3)",
+    all(bbox[2] > 0 for bbox in store.load("event-1").bboxes) and store.load("event-1").s3_keys[0] == "img-a1.jpg",
+  )
+  check(
+    "classify: 클러스터마다 대표 얼굴 썸네일 업로드 + 키 동봉 (CHMO-335)",
+    all(
+      c.thumbnail_s3_key == f"thumbnails/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
+      for c in result.clusters
+    ),
+  )
 
   # ② 같은 job 재전달(재시도 모사): 저장된 사진은 스킵되고 결과는 동일해야 한다 (멱등)
   retry = handlers.handle(parse_inbound_message(classify_body))
@@ -856,6 +965,11 @@ if __name__ == "__main__":
     and {merged.clusters[0].cluster_id, *merged.retired_cluster_ids} == {cluster_a_id, cluster_b_id},
   )
   check("merge: must-link 체인 저장 (4쌍)", len(store.load("event-1").must_link_pairs) == 4)
+  check(
+    "merge: 생존 앨범 썸네일 유지(덮어쓰기) + 은퇴 앨범 썸네일 삭제",
+    merged.clusters[0].thumbnail_s3_key in thumb_store.blobs
+    and all(f"thumbnails/event-1/{cid}.jpg" not in thumb_store.blobs for cid in merged.retired_cluster_ids),
+  )
   merged_id = merged.clusters[0].cluster_id
 
   # ④ split: 병합을 다시 원래 두 그룹으로 분리 — later-wins가 그룹 간 옛 must-link를 폐기해야 한다
@@ -923,6 +1037,7 @@ if __name__ == "__main__":
     [u.image_id for u in deleted.uncertain if u.reason == "unmatched"] == ["img-b1"]
     and cluster_b_id in deleted.retired_cluster_ids,
   )
+  check("delete: 은퇴 앨범 썸네일 삭제", f"thumbnails/event-1/{cluster_b_id}.jpg" not in thumb_store.blobs)
 
   # ⑦ 전체 삭제 → 빈 .npz, 남은 인물 id 전부 은퇴 (recluster 없이 vanished 경로)
   delete_all_body = json.dumps(
@@ -1253,6 +1368,50 @@ if __name__ == "__main__":
   check(
     "인물 앨범 2개+ 사진은 주 인물 1명이어도 공용에 노출",
     mixed.common_album == ["img-mix"],
+  )
+
+  # ⑰ 썸네일 best-effort (CHMO-335): 대표 원본 fetch 실패는 job을 죽이지 않고 해당 키만 None,
+  # 렌더러 미주입(비활성)이면 전 클러스터 None — 종전 동작과 동일한 롤백 경로.
+  image_source.images["img-t1.jpg"] = fake_image([(14, 0)])
+  image_source.images["img-t2.jpg"] = fake_image([(14, 1)])
+  thumb_setup_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c11",
+      "group_id": "group-1",
+      "event_id": "event-11",
+      "images": [
+        {"image_id": "img-t1", "s3_key": "img-t1.jpg"},
+        {"image_id": "img-t2", "s3_key": "img-t2.jpg"},
+      ],
+    }
+  )
+  thumb_setup = handlers.handle(parse_inbound_message(thumb_setup_body))
+  check(
+    "썸네일: 신규 event에도 정상 생성",
+    len(thumb_setup.clusters) == 1
+    and thumb_setup.clusters[0].thumbnail_s3_key == f"thumbnails/event-11/{thumb_setup.clusters[0].cluster_id}.jpg"
+    and thumb_setup.clusters[0].thumbnail_s3_key in thumb_store.blobs,
+  )
+  del image_source.images["img-t1.jpg"], image_source.images["img-t2.jpg"]  # 원본 소실 모사
+  refetch_fail = handlers.handle(
+    parse_inbound_message(
+      json.dumps({"type": "delete_request", "job_id": "job-d11", "event_id": "event-11", "image_ids": ["img-없음"]})
+    )
+  )
+  check(
+    "썸네일 best-effort: 대표 원본 fetch 실패 → job은 성공, 해당 키만 None",
+    refetch_fail.status == "succeeded"
+    and len(refetch_fail.clusters) == 1
+    and refetch_fail.clusters[0].thumbnail_s3_key is None,
+  )
+  image_source.images["img-t1.jpg"] = fake_image([(14, 0)])
+  image_source.images["img-t2.jpg"] = fake_image([(14, 1)])
+  plain_handlers = JobHandlers(store=InMemoryEmbeddingStore(), images=image_source, extract_faces=fake_extractor)
+  plain = plain_handlers.handle(parse_inbound_message(thumb_setup_body))
+  check(
+    "썸네일 비활성 (렌더러·스토어 미주입): 전 클러스터 None — 종전 동작",
+    len(plain.clusters) == 1 and plain.clusters[0].thumbnail_s3_key is None,
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
