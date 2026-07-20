@@ -576,11 +576,19 @@ class JobHandlers:
     uncertain: list[UncertainImage] = []
     group_common: list[str] = []
     routed: set[str] = set()
-    # 새 정책(group_photo_to_common=True): 얼굴 2명+ 사진은 매칭 여부와 무관하게 공용 앨범에도 노출한다
-    # — 인물 앨범과 중복 노출(N:M). 단체 사진은 그 자리에 함께 있던 모두의 사진이라는 제품 결정.
+    # 새 정책(group_photo_to_common=True): 주 인물 얼굴 2명+ 사진은 매칭 여부와 무관하게 공용 앨범에도
+    # 노출한다 — 인물 앨범과 중복 노출(N:M). 단체 사진은 그 자리에 함께 있던 모두의 사진이라는 제품 결정.
+    # OR 서로 다른 인물 앨범 2개+에 속한 사진도 단체다 — 뒤에 작게 찍혔어도 인식된 일행이면 행인이 아니라서
+    # 크기 게이트(주 인물 카운트)가 놓친다. 이 조건이 Spring의 종전 "중복 사진 공용 복제" 규칙과 정확히
+    # 같아, 이 정책이 켜져 있는 한 AI 결과가 그 규칙의 상위집합이다(백엔드 복제 로직 제거 가능 근거).
     # event 등장 순서로 안정 정렬. (구 정책은 아래 루프에서 '전원 미매칭'인 2+ 사진만 공용으로 보냈다.)
     if self._cluster_config.group_photo_to_common:
-      group_common = [photo_id for photo_id in dict.fromkeys(event.photo_ids) if faces_per_photo[photo_id] >= 2]
+      albums_per_photo = Counter(photo_id for person in clusters for photo_id in person.image_ids)
+      group_common = [
+        photo_id
+        for photo_id in dict.fromkeys(event.photo_ids)
+        if faces_per_photo[photo_id] >= 2 or albums_per_photo[photo_id] >= 2
+      ]
     # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
@@ -1209,6 +1217,42 @@ if __name__ == "__main__":
   check(
     "얼굴 폭이 .npz에 저장·왕복됨",
     store.load("event-9").face_widths == (120.0, 40.0),
+  )
+
+  # ⑯ 인물 앨범 2개+ 사진 = 단체 (CHMO-330): 뒤에 작게 찍혀 주 인물 카운트에서 빠져도, 인식된 일행이면
+  # 행인이 아니다 — 서로 다른 두 인물 앨범에 속한 사진은 공용에도 노출된다 (Spring 종전 복제 규칙의 이식).
+  image_source.images.update(
+    {
+      "img-m1.jpg": fake_image([(11, 0)]),
+      "img-m2.jpg": fake_image([(11, 1)]),
+      "img-s1.jpg": fake_image([(12, 0)]),
+      "img-s2.jpg": fake_image([(12, 1)]),
+      "img-mix.jpg": fake_image([(11, 2, 200), (12, 2, 60)]),  # 주 인물 11 + 작게 찍힌 일행 12(매칭)
+    }
+  )
+  mix_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c10",
+      "group_id": "group-1",
+      "event_id": "event-10",
+      "images": [
+        {"image_id": "img-m1", "s3_key": "img-m1.jpg"},
+        {"image_id": "img-m2", "s3_key": "img-m2.jpg"},
+        {"image_id": "img-s1", "s3_key": "img-s1.jpg"},
+        {"image_id": "img-s2", "s3_key": "img-s2.jpg"},
+        {"image_id": "img-mix", "s3_key": "img-mix.jpg"},
+      ],
+    }
+  )
+  mixed = handlers.handle(parse_inbound_message(mix_body))
+  check(
+    "작게 찍힌 일행 매칭: 사진이 두 인물 앨범 모두에 소속",
+    sum("img-mix" in c.image_ids for c in mixed.clusters) == 2,
+  )
+  check(
+    "인물 앨범 2개+ 사진은 주 인물 1명이어도 공용에 노출",
+    mixed.common_album == ["img-mix"],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
