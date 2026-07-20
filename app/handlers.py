@@ -940,7 +940,7 @@ if __name__ == "__main__":
   check(
     "classify: 클러스터마다 대표 얼굴 썸네일 업로드 + 키 동봉 (CHMO-335)",
     all(
-      c.thumbnail_s3_key == f"thumbnails/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
+      c.thumbnail_s3_key == f"thumbnails/events/event-1/{c.cluster_id}.jpg" and c.thumbnail_s3_key in thumb_store.blobs
       for c in result.clusters
     ),
   )
@@ -976,7 +976,7 @@ if __name__ == "__main__":
   check(
     "merge: 생존 앨범 썸네일 유지(덮어쓰기) + 은퇴 앨범 썸네일 삭제",
     merged.clusters[0].thumbnail_s3_key in thumb_store.blobs
-    and all(f"thumbnails/event-1/{cid}.jpg" not in thumb_store.blobs for cid in merged.retired_cluster_ids),
+    and all(f"thumbnails/events/event-1/{cid}.jpg" not in thumb_store.blobs for cid in merged.retired_cluster_ids),
   )
   merged_id = merged.clusters[0].cluster_id
 
@@ -1045,7 +1045,7 @@ if __name__ == "__main__":
     [u.image_id for u in deleted.uncertain if u.reason == "unmatched"] == ["img-b1"]
     and cluster_b_id in deleted.retired_cluster_ids,
   )
-  check("delete: 은퇴 앨범 썸네일 삭제", f"thumbnails/event-1/{cluster_b_id}.jpg" not in thumb_store.blobs)
+  check("delete: 은퇴 앨범 썸네일 삭제", f"thumbnails/events/event-1/{cluster_b_id}.jpg" not in thumb_store.blobs)
 
   # ⑦ 전체 삭제 → 빈 .npz, 남은 인물 id 전부 은퇴 (recluster 없이 vanished 경로)
   delete_all_body = json.dumps(
@@ -1398,7 +1398,8 @@ if __name__ == "__main__":
   check(
     "썸네일: 신규 event에도 정상 생성",
     len(thumb_setup.clusters) == 1
-    and thumb_setup.clusters[0].thumbnail_s3_key == f"thumbnails/event-11/{thumb_setup.clusters[0].cluster_id}.jpg"
+    and thumb_setup.clusters[0].thumbnail_s3_key
+    == f"thumbnails/events/event-11/{thumb_setup.clusters[0].cluster_id}.jpg"
     and thumb_setup.clusters[0].thumbnail_s3_key in thumb_store.blobs,
   )
   del image_source.images["img-t1.jpg"], image_source.images["img-t2.jpg"]  # 원본 소실 모사

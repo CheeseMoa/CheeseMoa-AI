@@ -161,7 +161,7 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
       "is_new": true,            // 이번에 새로 생긴 인물인지
       "image_ids": ["uuid"],     // 한 image_id가 여러 클러스터에 속할 수 있음(사진↔앨범 N:M)
       "representative_vector": [0.01],  // 512-dim 대표벡터 (§4 ⑤, L2 정규화 평균) — Spring 표시용 사본
-      "thumbnail_s3_key": "thumbnails/{event_id}/{cluster_id}.jpg"  // 대표 얼굴 썸네일 키 (CHMO-335) — null 가능
+      "thumbnail_s3_key": "thumbnails/events/{event_id}/{cluster_id}.jpg"  // 대표 얼굴 썸네일 키 (CHMO-335) — null 가능
     }
   ],
   "common_album": ["uuid"],     // common 앨범 — 단체 사진(얼굴 2명+)·배경·얼굴 미검출. 뷰어 노출
@@ -218,7 +218,7 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
 - `representative_vector`·`retired_cluster_ids`: 대표벡터는 표시용 파생값 사본(AI는 저장하지 않음, [ADR 007](../decisions/007-embedding-storage-s3.md)), 은퇴 id는 Spring이 해당 인물 앨범을 정리하는 데 쓴다.
 - `thumbnail_s3_key`(계약 확장, CHMO-335): 인물 앨범 목록용 **대표 얼굴 썸네일**의 S3 키. 워커가 재군집
   직후 클러스터마다 대표 얼굴(LOO centroid 유사도 최고 멤버)을 원본에서 crop(bbox 1.4배 여백)·다운스케일
-  (긴 변 256px)·JPEG 인코딩해 **워커 소유 embeddings 버킷**의 `thumbnails/{event_id}/{cluster_id}.jpg`
+  (긴 변 256px)·JPEG 인코딩해 **워커 소유 embeddings 버킷**의 `thumbnails/events/{event_id}/{cluster_id}.jpg`
   고정 키에 덮어쓴다 — Spring은 이 키로 presigned URL을 매 조회 발급해 서빙만 한다(이미지 처리 없음).
   대표 교체는 같은 키 덮어쓰기이므로 URL 장기 캐시 금지. 은퇴 클러스터의 썸네일은 워커가 best-effort로
   삭제한다. null = 기능 비활성(`THUMBNAIL_MAX_SIDE=0`) / 렌더·업로드 실패(job은 정상 진행) / 구버전
