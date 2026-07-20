@@ -57,6 +57,8 @@ class Settings(BaseSettings):
   cluster_min_match_jaccard: float = 0.0
   cluster_merge_centroid_similarity: float = 0.55  # ADR-012: 분포 측정 기반 재보정 0.68 → 0.55
   cluster_merge_facepair_floor: float = 0.475  # ADR-016(+재보정): 파편병합 face-level 응집 바닥 (0 = 비활성)
+  # ADR-024: 병합 승인을 컴포넌트 '현재 전체 멤버' 재평가로 판정 (false = 구 파편 스냅샷 완전 연결)
+  cluster_merge_component_linkage: bool = True
   cluster_rescue_similarity: float = 0.6
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
@@ -137,6 +139,7 @@ class Settings(BaseSettings):
       min_match_jaccard=self.cluster_min_match_jaccard,
       merge_centroid_similarity=self.cluster_merge_centroid_similarity,
       merge_facepair_floor=self.cluster_merge_facepair_floor,
+      merge_component_linkage=self.cluster_merge_component_linkage,
       rescue_similarity=self.cluster_rescue_similarity,
       min_membership_similarity=self.cluster_min_membership_similarity,
       min_membership_margin=self.cluster_min_membership_margin,
