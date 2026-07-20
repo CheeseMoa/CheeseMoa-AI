@@ -119,6 +119,12 @@ class ClusterConfig:
   # 위 얼굴 수 카운트의 주 인물 자격 — 그 사진 최대 얼굴 폭 대비 이 비율 미만이면 지나가는 행인으로 보고
   # 세지 않는다 (quality의 blur/eye_main_face_ratio와 같은 논리·같은 값, ADR 022). 0이면 전체 얼굴을 센다.
   common_main_face_ratio: float = 0.5
+  # 위 카운트의 실인물 자격 — 미배정(노이즈·저신뢰) 얼굴이 event 내 어떤 얼굴과도 유사도가 이 값 미만이면
+  # 오검출(털·사물)의 쓰레기 임베딩으로 보고 세지 않는다. 주 인물 크기의 오검출이 머릿수에 들어가면
+  # 1인 사진이 "주 인물 2명 단체"로 오판돼 공용 앨범에 노출된다 (event 93 퍼 후드, ADR 025).
+  # 실측 빈 구간 (0.183, 0.191)에서 실인물 보호 쪽(하단)으로 채택 — 오검출 최고 0.183(퍼 후드) vs
+  # 주 인물 크기 실인물 미배정 최저 0.191(고개 숙인 옆얼굴), 클러스터 배정 얼굴 최저 0.407. 0이면 비활성.
+  common_face_min_similarity: float = 0.185
 
   def __post_init__(self) -> None:
     # 이식한 HDBSCAN이 min_cluster_size < 2에서 raise하므로 생성 시점에 같은 계약을 강제한다
@@ -140,6 +146,7 @@ class ClusterConfig:
       "blob_promote_similarity",
       "blob_promote_floor",
       "common_main_face_ratio",
+      "common_face_min_similarity",
     ):
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
