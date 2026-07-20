@@ -555,12 +555,17 @@ class JobHandlers:
         )
       )
 
-    # 미매칭 사진 라우팅 (feature-spec §6.2·§7): 얼굴이 여러 개인데 아무도 인물에 매칭되지 않은
-    # 사진은 단체·배경 사진으로 보고 공용 앨범으로, 얼굴 1개(행인·미등록 1인)는 uncertain으로 보낸다.
+    # 미매칭 사진 라우팅 (feature-spec §6.2·§7). 얼굴 2명+ 사진은 단체 사진으로 보고 공용 앨범으로,
+    # 얼굴 1개(행인·미등록 1인) 미매칭은 uncertain으로 보낸다.
     faces_per_photo = Counter(event.photo_ids)
     uncertain: list[UncertainImage] = []
     group_common: list[str] = []
     routed: set[str] = set()
+    # 새 정책(group_photo_to_common=True): 얼굴 2명+ 사진은 매칭 여부와 무관하게 공용 앨범에도 노출한다
+    # — 인물 앨범과 중복 노출(N:M). 단체 사진은 그 자리에 함께 있던 모두의 사진이라는 제품 결정.
+    # event 등장 순서로 안정 정렬. (구 정책은 아래 루프에서 '전원 미매칭'인 2+ 사진만 공용으로 보냈다.)
+    if self._cluster_config.group_photo_to_common:
+      group_common = [photo_id for photo_id in dict.fromkeys(event.photo_ids) if faces_per_photo[photo_id] >= 2]
     # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
@@ -569,7 +574,8 @@ class JobHandlers:
           continue  # 같은 사진의 다른 얼굴이 인물에 배정됐으면 인물 앨범이 우선한다
         routed.add(photo_id)
         if faces_per_photo[photo_id] >= 2:
-          group_common.append(photo_id)
+          if not self._cluster_config.group_photo_to_common:
+            group_common.append(photo_id)  # 구 정책: 전원 미매칭인 단체 사진만 공용
         else:
           uncertain.append(UncertainImage(image_id=photo_id, reason=reason))
 
