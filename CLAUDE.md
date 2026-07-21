@@ -35,7 +35,11 @@ score<0.78 AND 종횡비(w/h)<0.70 제거, [ADR 015](docs/decisions/015-detectio
 + 재검출 랜드마크 신뢰 — 재검출 score≥0.80이면 랜드마크 이동량 가드를 무시하고 재검출 랜드마크 채택,
 가드 기준이 파편 bbox 폭이라 초대형 얼굴의 올바른 교정을 오매칭으로 오판해 깨진 랜드마크가 유지되고
 그 쓰레기 임베딩이 공통첩 유출·유령 앨범을 만들던 문제(event 73),
-[ADR 023](docs/decisions/023-refine-trust-redetect-landmarks.md)) →
+[ADR 023](docs/decisions/023-refine-trust-redetect-landmarks.md)
++ confident 파편 디둡 — 초대형 얼굴의 파편 박스 2개가 둘 다 score 게이트를 통과하면(YuNet NMS도
+IoU 0.297<0.3으로 미발동) 한 사람이 두 명으로 검출됨, 정제 랜드마크 중심거리 < 0.1×얼굴폭인 대형
+(>224px) 쌍은 score 최상 박스만 남김 — 1인 셀피가 "주 인물 2명 단체"로 공용 앨범에 노출되던 문제
+(event 105), [ADR 027](docs/decisions/027-duplicate-face-fragment-dedup.md)) →
 face_align(직접 구현 Umeyama, 112×112 ArcFace 기준점) →
 AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Laplacian, 토글 ON시 eyes_closed/blurry로 분리·
 재군집 제외) → HDBSCAN(PoC numpy 이식본, cosine, epsilon=0.15, event 전체 임베딩 재군집) → cluster_id 재조정
@@ -316,6 +320,23 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **초대형 얼굴 파편 이중 검출 디둡 — 1인 사진 공용 앨범 오노출 해소** (2026-07-21,
+  [ADR 027](docs/decisions/027-duplicate-face-fragment-dedup.md)) — group 37 / event 105에서 혼자
+  찍힌 셀피가 공용 앨범에도 노출되던 문제. YuNet이 초대형 얼굴에 그린 파편 박스 2개가 둘 다 score
+  게이트를 통과(0.769/0.638)했고, YuNet NMS(쌍 IoU 0.297<0.3)·ADR-017 디둡(회복 경로 전용)·이중
+  검출 안전판 0.95(cannot-link 면제 전용이라 인물 앨범은 무사)를 전부 비껴가 머릿수만 2명으로
+  세어졌다. 두 층 수정: ① 검출 — confident 얼굴도 정제 후 디둡(양쪽 폭>224px AND 랜드마크 중심거리
+  <0.1×얼굴폭이면 score 최상만, 원본 1,081장 실측 파편 쌍 0.019·0.024 vs 실제 타인 겹침 최저 0.436,
+  최초 후보 0.5는 실제 타인 쌍을 삼켜 기각), ② 라우팅 — 머릿수에 이중 검출 붕괴 이식(같은사진 근중복
+  ≥0.95 그룹은 폭 최대 행만 카운트, 같은사진 쌍 758개 실측 이중 검출 0.978~0.979 vs 타인 최고 0.756
+  — ①만으로는 .npz에 저장된 파편 행이 안 고쳐진다) + ADR-025 최근접에서 같은사진 근중복 제외(파편
+  쌍끼리 바닥을 뚫는 구멍, 전면 제외는 그 사진에만 있는 낯선 단체를 오판해 기각). 검증: 검출 diff
+  1,081장 중 파편 15장(유니크 2)만 정리, 라우팅 diff 24개 이벤트 중 이중 검출 6장만 공용→인물앨범,
+  자가검증 46건(신규 ⑲)·스모크 통과. 의미 변화: 미배정 근중복만 있는 사진은 공용이 아니라 uncertain.
+  `DETECT_CONFIDENT_DEDUP_LANDMARK_RATIO`·`CLUSTER_COMMON_DUPLICATE_FACE_SIMILARITY`(각 0=비활성),
+  도구 `scripts/survey_confident_dup.py`·`scripts/verify_dup_dedup.py`. 잔여: .npz 파편 행 자체는
+  남음(P0 중복 정리와 동류), 저장 이벤트 치유는 다음 재군집 트리거 때(즉시 치유는 85·90·91·104·105
+  재트리거).
 - **눈감음 상대 크기 게이트 — 원거리 "아래 쳐다봄" 오탐 제외** (2026-07-21,
   [ADR 026](docs/decisions/026-eye-closed-relative-size-gate.md)) — group 35 / event 99에서 아래를
   쳐다보는 얼굴이 눈감음으로 오탐되던 문제. blink blendshape는 "윗눈꺼풀 내려옴"을 재서 내려뜬 뜬
