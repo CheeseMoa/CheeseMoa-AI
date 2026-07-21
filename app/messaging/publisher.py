@@ -37,7 +37,23 @@ class SqsPublisher:
     if body_bytes > _SQS_BODY_LIMIT_BYTES:
       # TODO(CHMO-165): 초과가 실제로 관측되면 payload-on-S3 포인터 패턴으로 전환
       logger.warning("결과 메시지가 SQS 상한을 초과합니다. job_id=%s, %d bytes", result.job_id, body_bytes)
-    logger.info("결과 발행 job_id=%s %d bytes body=%s", result.job_id, body_bytes, body)
+    # 전문(body)은 event 사진 수에 비례해 자라(관측 68KB/job) CloudWatch 수집 요금을 지배한다 —
+    # INFO에는 요약만 남기고, 전문이 필요하면 LOG_LEVEL=DEBUG로 잠깐 올려서 본다.
+    logger.info(
+      "결과 발행 job_id=%s status=%s %d bytes clusters=%d common=%d uncertain=%d eyes_closed=%d blurry=%d "
+      "failed=%d retired=%d",
+      result.job_id,
+      result.status,
+      body_bytes,
+      len(result.clusters),
+      len(result.common_album),
+      len(result.uncertain),
+      len(result.eyes_closed),
+      len(result.blurry),
+      len(result.failed_images),
+      len(result.retired_cluster_ids),
+    )
+    logger.debug("결과 발행 body job_id=%s %s", result.job_id, body)
     kwargs = {"QueueUrl": self._queue_url, "MessageBody": body}
     if self._queue_url.endswith(".fifo"):
       # 결과 큐 유형은 미정 — FIFO로 확정될 경우를 대비한 분기. 그룹/중복제거 키는 job_id:
