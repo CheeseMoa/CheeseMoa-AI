@@ -169,6 +169,16 @@ class QualityConfig:
   # (blink 0.017~0.024, 뜸)이 선명한 사진이 프레임 끝에 걸린 행인 얼굴(최대 얼굴의 15% 폭, blink
   # 0.426)로 eyes_closed 오탐. blink·CNN 롤백 경로 공통 적용. 0 = 비활성(모든 얼굴 판정 — 종전 동작).
   eye_main_face_ratio: float = 0.5
+  # 눈감음 판정 자격의 이미지 대비 크기 하한 (ADR 026) — bbox 폭이 이미지 긴 변의 이 비율 미만이면
+  # 눈감음 미판정. eye_main_face_ratio(최대 얼굴 대비)와 달리 denominator가 이미지라, 프레임에서
+  # 작게 찍힌 주 피사체(솔로 사진의 원거리 얼굴)를 거른다. blink가 "아래를 쳐다보는 눈"을 감은 눈으로
+  # 오탐하는 문제(event 99)는 절대 px로는 정탐과 겹쳐 못 가르나(오탐 식물 188·210px vs 정탐 함성
+  # 182px), 상대 크기로는 갈린다 — 전 이벤트 961장 실측(ADR 026)에서 내려뜸 오탐 전부 ≤5.2% vs
+  # 진짜 감음 전부 ≥11.3%, 빈 구간 [5.2%, 11.3%]에서 0.08 채택(양측 ~1.5배 마진). 검출 rel 하한
+  # (DETECT_MIN_FACE_REL_WIDTH 2.5%)은 앨범 편입용이라 더 낮다 — 얼굴은 넣되 눈감음만 더 엄격히
+  # 요구. 0 = 비활성. 한계: 프레임에서 큰 내려뜸(event 103 32.8%)은 못 거름, 원거리 진짜 감음은
+  # 미판정(주 피사체 아님 — ADR 013 원리상 허용).
+  eye_min_rel_width: float = 0.08
 
   def __post_init__(self) -> None:
     # DetectorConfig/ClusterConfig와 같은 정책: 무의미한 값은 생성 시점에 거부한다.
@@ -210,6 +220,8 @@ class QualityConfig:
       raise ValueError(f"blink_presence_floor는 [0, 1] 범위여야 합니다. 받은 값: {self.blink_presence_floor}")
     if not 0.0 <= self.eye_main_face_ratio <= 1.0:
       raise ValueError(f"eye_main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.eye_main_face_ratio}")
+    if not 0.0 <= self.eye_min_rel_width < 1.0:
+      raise ValueError(f"eye_min_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.eye_min_rel_width}")
 
 
 @dataclass(frozen=True)
@@ -442,6 +454,7 @@ def judge_faces(
   classifier: EyeStateClassifier,
   config: QualityConfig,
   blink_scores: Sequence[tuple[float, float, float] | None] | None = None,
+  image_long_side: int = 0,
 ) -> tuple[bool, bool | None, int, float]:
   """얼굴별 (정렬 crop, bbox crop) 목록 → 이미지 단위 (eyes_closed, blurry, blurry 얼굴 최대 폭, 최저 face_var) 판정.
 
@@ -451,8 +464,9 @@ def judge_faces(
   — presence ≥ blink_presence_floor인 얼굴만 min(blinkL, blinkR) ≥ blink_threshold, presence 미달은
   미판정(CNN 폴백 없음 — 실측에서 폴백의 정탐 기여 0, 유아 오탐만 재생산). blendshape는 가림·유아·
   보정 이미지에서 CNN보다 강건해 ADR-019 자격 게이트도 필요 없다 (A/B 실측).
-  눈감음도 blurry처럼 주 인물 얼굴만 본다(eye_main_face_ratio, blink·CNN 경로 공통) — 배경 행인의
-  감은 눈은 사진을 눈감음첩으로 보낼 이유가 아니다 (event 69: 프레임 끝 행인 오탐).
+  눈감음도 blurry처럼 주 인물 얼굴만 본다(eye_main_face_ratio + 이미지 긴 변 대비 eye_min_rel_width,
+  blink·CNN 경로 공통, 후자는 image_long_side 필요) — 배경 행인·원거리 얼굴의 감은/내려뜬 눈은 사진을
+  눈감음첩으로 보낼 이유가 아니다 (event 69 프레임 끝 행인 오탐, event 99 원거리 내려뜸 오탐 — ADR 026).
   blink 비활성(blink_scores=None 또는 blink_threshold=0)이면 종전 CNN 경로로 판정한다:
   양눈이 모두 잡히는 얼굴만 눈감음 후보(옆얼굴 등 한쪽 눈만 잡히면 보수적으로 미판정) +
   눈감음 판정 자격 게이트(ADR 019 — bbox 짧은 변 ≥ min_eye_face_px AND 눈/볼 밝기 비 ≤
@@ -486,7 +500,19 @@ def judge_faces(
     eye_main = config.eye_main_face_ratio <= 0 or (
       bbox_crop is not None and bbox_crop.size > 0 and bbox_crop.shape[1] >= min_eye_main_width
     )
-    if not eyes_closed and eye_main:
+    # 이미지 대비 상대 크기 게이트 (ADR 026): 프레임에서 작게 찍힌 얼굴은 눈감음 미판정 — blink가
+    # 원거리 얼굴의 "아래 쳐다봄"을 감은 눈으로 오탐한다(event 99). eye_main(최대 얼굴 대비)과 달리
+    # 이미지 긴 변 대비라, 최대 얼굴이어도 프레임에서 작으면 제외한다. image_long_side 미상(0)이면 무시.
+    eye_rel_ok = (
+      config.eye_min_rel_width <= 0
+      or image_long_side <= 0
+      or (
+        bbox_crop is not None
+        and bbox_crop.size > 0
+        and bbox_crop.shape[1] >= config.eye_min_rel_width * image_long_side
+      )
+    )
+    if not eyes_closed and eye_main and eye_rel_ok:
       if blink_active:
         # presence 미달·RoI 퇴화는 미판정이다 — CNN 폴백은 실측(871 얼굴)에서 정탐 기여 0에
         # 유아 오탐만 재생산했다(랜드마커가 얼굴이 아니라는 RoI에서 눈 패치 CNN의 확신은
@@ -573,7 +599,7 @@ if __name__ == "__main__":
       print(f"  {path} face{i} bbox={bw}x{bh}: {blink_str} cnn_closed=[{probs_str}]{eye_note} blur_var={var:.1f}{note}")
 
     eyes_closed, blurry, blurry_face_w, min_blurry_face_var = judge_faces(
-      faces, classifier, config, blink_scores=blinks
+      faces, classifier, config, blink_scores=blinks, image_long_side=max(image.shape[:2])
     )
     gate_exempt = False
     if blurry and face_collapse_exempt(image, blurry_face_w, config):

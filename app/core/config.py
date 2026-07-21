@@ -127,6 +127,9 @@ class Settings(BaseSettings):
   quality_blink_threshold: float = 0.40
   quality_blink_presence_floor: float = 0.5  # 랜드마크 presence가 미만이면 blink를 버리고 CNN 폴백 (ADR 021)
   quality_eye_main_face_ratio: float = 0.5  # 최대 얼굴 폭 대비 이 비율 미만은 배경 얼굴로 보고 눈감음 판정 제외
+  quality_eye_min_rel_width: float = (
+    0.08  # bbox 폭이 이미지 긴 변의 이 비율 미만은 눈감음 판정 제외 (원거리 내려뜸 오탐, ADR 026). 0 = 비활성
+  )
 
   # ── 인물 앨범 대표 얼굴 썸네일 (CHMO-335) ────────────────────────────────────
   # 재군집 후 클러스터마다 대표 얼굴을 crop해 embeddings_bucket의 {thumbnail_prefix}{event_id}/
@@ -228,4 +231,5 @@ class Settings(BaseSettings):
       blink_threshold=self.quality_blink_threshold,
       blink_presence_floor=self.quality_blink_presence_floor,
       eye_main_face_ratio=self.quality_eye_main_face_ratio,
+      eye_min_rel_width=self.quality_eye_min_rel_width,
     )

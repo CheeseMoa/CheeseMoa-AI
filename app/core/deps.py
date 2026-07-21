@@ -73,7 +73,7 @@ def build_face_extractor(
       face_pairs.append((aligned, image[y : y + h, x : x + w]))
     blinks = [blink_scorer.blink_scores(image, face.landmarks) for face in detected] if blink_scorer else None
     eyes_closed, blurry, blurry_face_w, min_blurry_face_var = judge_faces(
-      face_pairs, eye_classifier, quality_config, blink_scores=blinks
+      face_pairs, eye_classifier, quality_config, blink_scores=blinks, image_long_side=max(image.shape[:2])
     )
 
     # 얼굴 경로 붕괴 면제 (ADR 018 §보강 2): blurry 얼굴이 대형 주 인물이고 전체 variance가 붕괴
