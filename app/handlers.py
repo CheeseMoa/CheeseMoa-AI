@@ -176,7 +176,9 @@ def _reconcile_constraints(
 # 같은 사진 자동 cannot-link의 이중 검출 안전판 — 같은 사진 두 행의 임베딩이 이 이상 닮으면
 # 타인 두 명이 아니라 YuNet이 한 얼굴을 두 박스로 이중 검출한 것으로 보고 제약에서 뺀다
 # (잘못된 cannot-link는 같은 사람을 강제로 찢는다). 실 event 실측 같은사진 쌍 최대 0.61,
-# 근중복 판정 관례 0.985(ADR-005 burst)와 큰 마진.
+# 근중복 판정 관례 0.985(ADR-005 burst)와 큰 마진. 재실측(2026-07-21, 24개 event 758쌍):
+# 이중 검출 0.978~0.979 vs 타인 최고 0.756 — 여전히 빈 구간 안. 같은 원리·같은 기본값을 머릿수
+# 붕괴(ClusterConfig.common_duplicate_face_similarity, ADR-027)도 쓴다.
 _SAME_FACE_SIMILARITY = 0.95
 
 
@@ -688,23 +690,68 @@ class JobHandlers:
     )
 
   def _headcount_eligible(self, event: EventEmbeddings) -> list[bool]:
-    """단체 판정 머릿수 자격 — 미배정 얼굴이 event 내 어떤 얼굴과도 유사도 바닥 미만이면 오검출로 보고 뺀다.
+    """단체 판정 머릿수 자격 — 이중 검출(ADR 027)과 오검출(ADR 025)을 머릿수에서 뺀다.
 
+    ① 이중 검출 붕괴: 같은 사진의 행들이 common_duplicate_face_similarity 이상으로 닮으면 타인이
+    아니라 YuNet이 한 얼굴에 그린 파편 박스들이다(같은사진 자동 cannot-link의 _SAME_FACE_SIMILARITY
+    안전판과 같은 원리 — 그 안전판 덕에 파편 행들은 같은 인물 앨범에 얌전히 들어가지만, 머릿수가
+    행 수를 그대로 세면 1인 셀피가 "주 인물 2명 단체"로 공용 앨범에 노출된다. event 105 실측 파편 쌍
+    0.978~0.979 vs 같은사진 타인 최고 0.756). 근중복 연결 그룹마다 폭 최대 행만 자격을 유지한다.
+    ② 실인물 자격: 미배정 얼굴이 event 내 어떤 얼굴과도 유사도 바닥 미만이면 오검출로 보고 뺀다.
     털·사물 오검출은 쓰레기 임베딩이라 모든 얼굴과 바닥 유사도인데(event 93 퍼 후드 0.183), 주 인물
-    크기로 검출되면 1인 사진이 "주 인물 2명 단체"로 오판돼 공용 앨범에 노출된다 (ADR 025). 클러스터
-    배정 얼굴(실측 전역 최근접 최저 0.407)과, 비교 상대가 없는 단독 얼굴은 판단 근거가 없어 항상 센다.
+    크기로 검출되면 역시 단체로 오판된다 (ADR 025). 최근접 비교 상대에서 같은 사진의 근중복 행만
+    뺀다 — 파편은 독립 증거가 아니라서, 넣으면 오검출이 이중 검출됐을 때 파편끼리 ~0.98로 바닥을
+    뚫는다(ADR 027). 근중복이 아닌 같은사진 타인은 종전대로 증거다(전면 제외는 그 사진에만 등장하는
+    낯선 단체를 오검출로 오판한다). 클러스터 배정 얼굴(실측 전역 최근접 최저 0.407)과, 비교 상대가
+    없는 단독 얼굴은 판단 근거가 없어 항상 센다.
     """
     floor = self._cluster_config.common_face_min_similarity
+    duplicate_floor = self._cluster_config.common_duplicate_face_similarity
     total = len(event.face_ids)
-    if floor <= 0 or total < 2:
+    if (floor <= 0 and duplicate_floor <= 0) or total < 2:
       return [True] * total
     embeddings = np.asarray(event.embeddings, dtype=np.float32)
     similarities = embeddings @ embeddings.T
-    np.fill_diagonal(similarities, -1.0)
-    nearest = similarities.max(axis=1)
-    return [
-      cluster_id is not None or float(nearest[index]) >= floor for index, cluster_id in enumerate(event.cluster_ids)
-    ]
+    rows_by_photo: dict[str, list[int]] = {}
+    for index, photo_id in enumerate(event.photo_ids):
+      rows_by_photo.setdefault(photo_id, []).append(index)
+    eligible = [True] * total
+
+    if duplicate_floor > 0:
+      for rows in rows_by_photo.values():
+        remaining = list(rows)
+        while remaining:
+          # 시드에서 근중복(≥ duplicate_floor)으로 이어지는 연결 그룹을 모은다 — 파편 3개+도 한 명
+          group = [remaining.pop(0)]
+          frontier = list(group)
+          while frontier:
+            current = frontier.pop()
+            linked = [row for row in remaining if similarities[current, row] >= duplicate_floor]
+            for row in linked:
+              remaining.remove(row)
+            group.extend(linked)
+            frontier.extend(linked)
+          if len(group) > 1:
+            keep = max(group, key=lambda row: event.face_widths[row])
+            for row in group:
+              eligible[row] = row == keep
+
+    if floor > 0:
+      comparator_sim = similarities.copy()
+      np.fill_diagonal(comparator_sim, -np.inf)
+      if duplicate_floor > 0:
+        for rows in rows_by_photo.values():
+          for position, row_a in enumerate(rows):
+            for row_b in rows[position + 1 :]:
+              if similarities[row_a, row_b] >= duplicate_floor:
+                comparator_sim[row_a, row_b] = comparator_sim[row_b, row_a] = -np.inf
+      for index, cluster_id in enumerate(event.cluster_ids):
+        if cluster_id is not None or not eligible[index]:
+          continue
+        best = float(comparator_sim[index].max())
+        if np.isfinite(best) and best < floor:
+          eligible[index] = False
+    return eligible
 
 
 if __name__ == "__main__":
@@ -909,14 +956,17 @@ if __name__ == "__main__":
   )
   check(
     "classify: 공용 앨범(미검출+미매칭 단체)·실패·부분 성공",
-    set(result.common_album) == {"img-none", "img-group", "img-twins"}
+    set(result.common_album) == {"img-none", "img-group"}
     and [failed.image_id for failed in result.failed_images] == ["img-broken"]
     and result.status == "partial",
   )
+  # img-twins(사실상 동일 임베딩 쌍 0.996)는 cannot-link 안전판과 같은 원리로 머릿수도 1명(ADR 027) —
+  # 이중 검출 1인 사진이므로 공용(단체)이 아니라 uncertain(미매칭 1인)이다.
   check(
-    "단일 사진 클러스터 강등: 같은 사진 속 닮은 쌍은 인물 승격 안 함, uncertain도 아님",
+    "단일 사진 클러스터 강등: 같은 사진 속 닮은 쌍은 인물 승격 안 함, 근중복 쌍은 단체도 아님(uncertain)",
     all("img-group" not in c.image_ids and "img-twins" not in c.image_ids for c in result.clusters)
-    and all(u.image_id not in {"img-group", "img-twins"} for u in result.uncertain),
+    and all(u.image_id != "img-group" for u in result.uncertain)
+    and any(u.image_id == "img-twins" and u.reason == "unmatched" for u in result.uncertain),
   )
   twins_assignments = [
     cid for pid, cid in zip(store.load("event-1").photo_ids, store.load("event-1").cluster_ids) if pid == "img-twins"
@@ -1042,7 +1092,8 @@ if __name__ == "__main__":
   )
   check(
     "delete: 홀로 남은 b1은 unmatched, B id 은퇴",
-    [u.image_id for u in deleted.uncertain if u.reason == "unmatched"] == ["img-b1"]
+    # img-twins(근중복 쌍 = 1인, ADR 027)는 ①과 동일하게 unmatched로 계속 표류한다
+    [u.image_id for u in deleted.uncertain if u.reason == "unmatched"] == ["img-b1", "img-twins"]
     and cluster_b_id in deleted.retired_cluster_ids,
   )
   check("delete: 은퇴 앨범 썸네일 삭제", f"thumbnails/events/event-1/{cluster_b_id}.jpg" not in thumb_store.blobs)
@@ -1460,6 +1511,49 @@ if __name__ == "__main__":
   check(
     "오검출 머릿수 게이트 비활성(0): 오검출이 주 인물로 세어져 공용 노출 재현 (검증의 적대적 성질 유지)",
     gate_off.common_album == ["img-fur"],
+  )
+
+  # ⑲ 이중 검출 머릿수 붕괴 (ADR 027): 초대형 얼굴의 파편 박스 2행은 cannot-link 안전판 덕에 인물
+  # 앨범에는 한 사람으로 들어가면서, 머릿수로는 2명으로 세어져 1인 셀피가 공용에 노출되던 회귀 고정
+  # (event 105). 붕괴는 라우팅 전용 — .npz 행·군집은 불변이다.
+  image_source.images.update(
+    {
+      "img-dd1.jpg": fake_image([(3, 0)]),
+      "img-dd2.jpg": fake_image([(3, 3)]),
+      "img-ddup.jpg": fake_image([(3, 1, 120), (3, 2, 110)]),  # 같은 인물 파편 2박스 — 유사도 ≈0.996
+    }
+  )
+  dup_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c13",
+      "group_id": "group-1",
+      "event_id": "event-13",
+      "images": [
+        {"image_id": "img-dd1", "s3_key": "img-dd1.jpg"},
+        {"image_id": "img-dd2", "s3_key": "img-dd2.jpg"},
+        {"image_id": "img-ddup", "s3_key": "img-ddup.jpg"},
+      ],
+    }
+  )
+  dup = handlers.handle(parse_inbound_message(dup_body))
+  check(
+    "이중 검출 붕괴: 파편 2행 사진은 단체 아님 — 인물 앨범만, 공용·uncertain 없음, .npz 행은 2개 유지",
+    sum("img-ddup" in c.image_ids for c in dup.clusters) == 1
+    and dup.common_album == []
+    and dup.uncertain == []
+    and store.load("event-13").photo_ids.count("img-ddup") == 2,
+  )
+  dup_off_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    cluster_config=ClusterConfig(common_duplicate_face_similarity=0.0),
+  )
+  dup_off = dup_off_handlers.handle(parse_inbound_message(dup_body))
+  check(
+    "이중 검출 붕괴 비활성(0): 파편 2행이 2명으로 세어져 공용 노출 재현 (검증의 적대적 성질 유지)",
+    dup_off.common_album == ["img-ddup"],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

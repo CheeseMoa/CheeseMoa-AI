@@ -125,6 +125,14 @@ class ClusterConfig:
   # 실측 빈 구간 (0.183, 0.191)에서 실인물 보호 쪽(하단)으로 채택 — 오검출 최고 0.183(퍼 후드) vs
   # 주 인물 크기 실인물 미배정 최저 0.191(고개 숙인 옆얼굴), 클러스터 배정 얼굴 최저 0.407. 0이면 비활성.
   common_face_min_similarity: float = 0.185
+  # 위 카운트의 이중 검출 붕괴 (ADR-027) — 같은 사진의 두 얼굴 행이 이 값 이상 닮으면 타인 두 명이
+  # 아니라 YuNet이 한 얼굴을 두 박스로 그린 것으로 보고 한 명으로 센다(폭 최대 행만 자격 유지).
+  # 같은사진 자동 cannot-link의 이중 검출 안전판(handlers._SAME_FACE_SIMILARITY)과 같은 원리·같은
+  # 기본값 — 그 안전판 덕에 파편 행 2개가 같은 인물 앨범에 얌전히 들어가고도, 머릿수에는 이 붕괴가
+  # 없어 1인 셀피가 "주 인물 2명 단체"로 공용 앨범에 노출됐다(event 105). 실측(24개 event 같은사진
+  # 쌍 758개): 이중 검출 전부 0.978~0.979 vs 같은사진 타인 쌍 최고 0.756 — 0.95가 빈 구간 안.
+  # 0이면 비활성(기존 동작 — 행 수 그대로 센다).
+  common_duplicate_face_similarity: float = 0.95
 
   def __post_init__(self) -> None:
     # 이식한 HDBSCAN이 min_cluster_size < 2에서 raise하므로 생성 시점에 같은 계약을 강제한다
@@ -147,6 +155,7 @@ class ClusterConfig:
       "blob_promote_floor",
       "common_main_face_ratio",
       "common_face_min_similarity",
+      "common_duplicate_face_similarity",
     ):
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
