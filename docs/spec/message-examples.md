@@ -168,6 +168,9 @@
   w·h 폭·높이, 전부 정수)라 앱이 상세 화면에 띄운 원본 위에 그대로 오려 그리면 된다. 가장자리 얼굴은
   bbox가 이미지 경계를 벗어날 수 있으니 표시 측에서 클램프한다. **null 가능**(구버전 `.npz` 행 — bbox
   미상): crop 없이 사진만 표시한다. 상세는 [feature-spec §6.2](feature-spec.md).
+- `uncertain`은 `clusters`·`common_album`과 **중복 노출될 수 있다**(계약 확장, 결정 2026-07-21): 인물
+  앨범에 배정된 사진이라도 주 인물 크기의 미매칭 얼굴이 남아 있으면 uncertain에도 실린다 — 미등록
+  인물을 `__uncertain__` reassign으로 수동 편입할 진입점. 상세는 [feature-spec §6.2](feature-spec.md).
 - 실패 케이스를 포함한 계약 검증 전체는 `python -m app.schemas.messages`로 실행할 수 있다.
 
 ## ⑤ 분류 진행률 — `progress` (AI → Spring, progress 큐, CHMO-274)

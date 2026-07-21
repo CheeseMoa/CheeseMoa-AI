@@ -649,11 +649,11 @@ class JobHandlers:
     for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths)):
       if counted[index]:
         max_width_of[photo_id] = max(max_width_of.get(photo_id, 0.0), width)
-    faces_per_photo = Counter(
-      photo_id
+    main_face = [
+      counted[index] and (ratio <= 0 or width >= max_width_of[photo_id] * ratio)
       for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths))
-      if counted[index] and (ratio <= 0 or width >= max_width_of[photo_id] * ratio)
-    )
+    ]
+    faces_per_photo = Counter(photo_id for index, photo_id in enumerate(event.photo_ids) if main_face[index])
     uncertain: list[UncertainImage] = []
     group_common: list[str] = []
     routed: set[str] = set()
@@ -682,18 +682,23 @@ class JobHandlers:
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
         photo_id = event.photo_ids[index]
-        if photo_id in clustered_images or photo_id in routed:
-          continue  # 같은 사진의 다른 얼굴이 인물에 배정됐으면 인물 앨범이 우선한다
-        routed.add(photo_id)
-        if faces_per_photo[photo_id] >= 2:
+        if photo_id in routed:
+          continue
+        if photo_id in clustered_images:
+          # 계약 확장(결정 2026-07-21): 인물 앨범에 배정된 사진이라도 주 인물 미매칭 얼굴이 남아 있으면
+          # uncertain에도 싣는다 — 미등록 인물의 수동 편입(__uncertain__ reassign) 진입점. 행인·오검출·
+          # 파편(main_face 미달) 미매칭은 종전대로 인물 앨범이 우선한다(숨김).
+          if not (self._cluster_config.unmatched_main_to_uncertain and main_face[index]):
+            continue
+        elif faces_per_photo[photo_id] >= 2:
+          routed.add(photo_id)
           if not self._cluster_config.group_photo_to_common:
             group_common.append(photo_id)  # 구 정책: 전원 미매칭인 단체 사진만 공용
-        else:
-          uncertain.append(
-            UncertainImage(
-              image_id=photo_id, reason=reason, face_bbox=_uncertain_face_box(event, crop_face_of[photo_id])
-            )
-          )
+          continue
+        routed.add(photo_id)
+        uncertain.append(
+          UncertainImage(image_id=photo_id, reason=reason, face_bbox=_uncertain_face_box(event, crop_face_of[photo_id]))
+        )
 
     retired_cluster_ids = list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired]))
     self._delete_retired_thumbnails(event_id, retired_cluster_ids)
@@ -847,6 +852,19 @@ if __name__ == "__main__":
     vector[450 + step] = 1.0
     return vector
 
+  def stranger_vector(person: int, step: int) -> np.ndarray:
+    """미등록 실인물(낯선 일행) 모사 — 인물 16 평면에 0.3 성분을 실어 인물 16 얼굴과 유사도 ≈0.28.
+
+    실인물 자격 바닥(0.185, ADR 025)은 넘되(오검출과의 판별축 — 실인물 미배정 실측 최저 0.191 대역)
+    구제(0.6)·소속(0.4)·blob 승격(0.45)에는 전부 못 미쳐 미매칭 노이즈로 남는다. person_vector의
+    교차 인물 유사도(≈0.16)는 바닥 미달이라 오검출로 오인돼 이 대역을 모사할 수 없다."""
+    theta = math.radians(5.0 * step)
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[2 * 16] = 0.3 * math.cos(theta)
+    vector[2 * 16 + 1] = 0.3 * math.sin(theta)
+    vector[460 + 8 * (person - 17) + step] = math.sqrt(1.0 - 0.09)
+    return vector
+
   def fake_image(
     faces: list[tuple[int, int]] | list[tuple[int, int, int]], *, eyes_closed: bool = False, blurry: bool = False
   ) -> np.ndarray:
@@ -877,6 +895,8 @@ if __name__ == "__main__":
         vectors.append(confirm_distinct_vector(person, step))
       elif person >= 20:
         vectors.append(spread_person_vector(person, step))
+      elif person >= 17:
+        vectors.append(stranger_vector(person, step))
       else:
         vectors.append(person_vector(person, step))
     # 합성 bbox: 폭을 정사각 (0, 0, w, w)로 — 썸네일 대표 선정(w>0)·페이크 렌더러 경로를 태운다
@@ -1583,6 +1603,58 @@ if __name__ == "__main__":
   check(
     "이중 검출 붕괴 비활성(0): 파편 2행이 2명으로 세어져 공용 노출 재현 (검증의 적대적 성질 유지)",
     dup_off.common_album == ["img-ddup"],
+  )
+
+  # ⑳ 매칭 사진의 미매칭 주 인물 → uncertain 동시 노출 (계약 확장, 결정 2026-07-21): 2명 인식 사진에서
+  # 한 명만 매칭되면 종전엔 인물 앨범(+공용)에만 실려, 미등록 인물을 "분류가 어려워요 → 인물 앨범 편입"
+  # (__uncertain__ reassign)으로 수동 구제할 진입점이 없었다. 주 인물 미매칭 얼굴이 남은 사진은 인물·공용과
+  # 중복으로 uncertain에도 싣는다 — 행인(주 인물 크기 미달) 미매칭은 종전대로 숨긴다.
+  image_source.images.update(
+    {
+      "img-x1.jpg": fake_image([(16, 0)]),
+      "img-x2.jpg": fake_image([(16, 1)]),
+      "img-mixu.jpg": fake_image([(16, 2, 200), (17, 0, 180)]),  # 인물 16 + 미등록 주 인물 17(미매칭)
+      "img-mixw.jpg": fake_image([(16, 3, 200), (18, 0, 60)]),  # 인물 16 + 행인 18(60 < 200×0.5)
+    }
+  )
+  mixu_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c14",
+      "group_id": "group-1",
+      "event_id": "event-14",
+      "images": [
+        {"image_id": "img-x1", "s3_key": "img-x1.jpg"},
+        {"image_id": "img-x2", "s3_key": "img-x2.jpg"},
+        {"image_id": "img-mixu", "s3_key": "img-mixu.jpg"},
+        {"image_id": "img-mixw", "s3_key": "img-mixw.jpg"},
+      ],
+    }
+  )
+  mixu = handlers.handle(parse_inbound_message(mixu_body))
+  check(
+    "미매칭 주 인물 동시 노출: 인물 앨범 + 공용 + uncertain(unmatched), bbox는 미매칭 얼굴",
+    sum("img-mixu" in c.image_ids for c in mixu.clusters) == 1
+    and "img-mixu" in mixu.common_album
+    and [(u.image_id, u.reason) for u in mixu.uncertain] == [("img-mixu", "unmatched")]
+    and mixu.uncertain[0].face_bbox == FaceBox(x=0, y=0, w=180, h=180),
+  )
+  check(
+    "미매칭 행인은 종전대로 숨김: 인물 앨범만 — 공용·uncertain 없음",
+    sum("img-mixw" in c.image_ids for c in mixu.clusters) == 1
+    and "img-mixw" not in mixu.common_album
+    and all(u.image_id != "img-mixw" for u in mixu.uncertain),
+  )
+  legacy_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    cluster_config=ClusterConfig(unmatched_main_to_uncertain=False),
+  )
+  legacy = legacy_handlers.handle(parse_inbound_message(mixu_body))
+  check(
+    "동시 노출 비활성(False): 매칭 얼굴 있는 사진은 uncertain 제외 — 구 정책 재현 (검증의 적대적 성질 유지)",
+    legacy.uncertain == [],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
