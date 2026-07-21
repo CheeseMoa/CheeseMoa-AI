@@ -70,6 +70,9 @@ class Settings(BaseSettings):
   # 라우팅 정책: 주 인물 얼굴 2명+ 사진을 매칭 여부와 무관하게 공용 앨범에도 노출한다 (인물 앨범과 중복, feature-spec §6.2).
   # False면 구 정책(전원 미매칭 2+만 공용). Spring/앱이 새 common_album 의미를 감당할 때까지 끄는 롤아웃 스위치.
   cluster_group_photo_to_common: bool = True
+  # 매칭 사진의 주 인물 미매칭 얼굴을 uncertain에도 노출 — 미등록 인물의 수동 편입 진입점 (feature-spec §6.2).
+  # False면 구 정책(매칭 얼굴이 하나라도 있으면 uncertain 제외 — 인물 앨범 우선 배타)
+  cluster_unmatched_main_to_uncertain: bool = True
   # 주 인물 자격 — 사진 최대 얼굴 폭 대비 이 비율 미만은 행인으로 보고 위 카운트에서 제외 (ADR 022 규칙). 0=전체 카운트
   cluster_common_main_face_ratio: float = 0.5
   # 실인물 자격 — 미배정 얼굴이 event 내 어떤 얼굴과도 유사도가 이 값 미만이면 오검출로 보고 카운트에서 제외 (ADR 025). 0=비활성
@@ -174,6 +177,7 @@ class Settings(BaseSettings):
       blob_promote_similarity=self.cluster_blob_promote_similarity,
       blob_promote_floor=self.cluster_blob_promote_floor,
       group_photo_to_common=self.cluster_group_photo_to_common,
+      unmatched_main_to_uncertain=self.cluster_unmatched_main_to_uncertain,
       common_main_face_ratio=self.cluster_common_main_face_ratio,
       common_face_min_similarity=self.cluster_common_face_min_similarity,
       common_duplicate_face_similarity=self.cluster_common_duplicate_face_similarity,

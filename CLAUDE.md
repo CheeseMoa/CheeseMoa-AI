@@ -321,6 +321,15 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **매칭 사진의 미매칭 주 인물 얼굴 uncertain 동시 노출 — 미등록 인물 수동 구제 진입점** (2026-07-21,
+  feature-spec §6.2 결정) — 2명이 인식된 사진에서 한 명만 매칭되면 사진이 인물 앨범(+공용)에만 실려,
+  미매칭 인물을 "분류가 어려워요 → 인물 앨범 편입"(`__uncertain__` reassign)으로 수동 구제할 진입점이
+  없던 문제. 백엔드 합의로 계약 확장: `_assemble_result` 라우팅의 "매칭 얼굴 있으면 uncertain 제외"를
+  주 인물 미매칭 얼굴에 한해 해제(인물·공용·uncertain 중복 노출 허용). 행인(크기 게이트)·오검출
+  (ADR 025)·파편(ADR 027)은 종전대로 숨김 — 주 인물 자격(counted+크기)이 그대로 노이즈 방어를 겸한다.
+  face_bbox는 미매칭 주 얼굴(CHMO-388 crop_face_of 재사용), 편입 reassign은 원래 `cluster_id=None`
+  얼굴만 must-link라 수정 없이 그대로 동작. `CLUSTER_UNMATCHED_MAIN_TO_UNCERTAIN`(false=구 정책 롤백),
+  자가검증 51건(신규 ⑳ 3건 — 동시 노출·행인 숨김·토글 OFF 재현).
 - **uncertain 주 얼굴 face_bbox 계약 확장 — 상세 화면 얼굴 crop** (2026-07-21, CHMO-388) —
   "분류가 어려워요" 사진 상세 화면에서 어느 얼굴이 분류가 어려웠는지 보여주기 위해
   `uncertain[].face_bbox`(`FaceBox` — 원본 픽셀 x·y 좌상단, w·h 폭·높이, 정수)를 결과 계약에 추가.

@@ -116,6 +116,11 @@ class ClusterConfig:
   # feature-spec §6.2). False면 구 정책 — 전원 미매칭인 2+ 사진만 공용으로 보낸다. Spring/앱이 새
   # common_album 의미(단체 사진 전부 포함)를 감당할 준비가 될 때까지 끄고 배포하는 롤아웃 스위치.
   group_photo_to_common: bool = True
+  # 위와 같은 라우팅 정책 토글: 인물 앨범에 배정된 사진이라도 주 인물 미매칭 얼굴이 남아 있으면
+  # uncertain("분류가 어려워요")에도 노출한다 — 미등록 인물을 수동 편입(__uncertain__ reassign)할 진입점을
+  # 연다 (인물·공용과 중복 노출, feature-spec §6.2 결정 2026-07-21). 행인·오검출·파편(주 인물 자격 미달)은
+  # 종전대로 싣지 않는다. False면 구 정책 — 매칭 얼굴이 하나라도 있는 사진은 uncertain에서 제외.
+  unmatched_main_to_uncertain: bool = True
   # 위 얼굴 수 카운트의 주 인물 자격 — 그 사진 최대 얼굴 폭 대비 이 비율 미만이면 지나가는 행인으로 보고
   # 세지 않는다 (quality의 blur/eye_main_face_ratio와 같은 논리·같은 값, ADR 022). 0이면 전체 얼굴을 센다.
   common_main_face_ratio: float = 0.5
