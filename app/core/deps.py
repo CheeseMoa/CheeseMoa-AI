@@ -23,6 +23,7 @@ from app.pipeline.quality import (
   QualityConfig,
   blur_variance,
   face_collapse_exempt,
+  face_var_collapse_exempt,
   judge_faces,
   shake_confirmed,
   shake_signals,
@@ -71,12 +72,19 @@ def build_face_extractor(
       x, y, w, h = face.bbox
       face_pairs.append((aligned, image[y : y + h, x : x + w]))
     blinks = [blink_scorer.blink_scores(image, face.landmarks) for face in detected] if blink_scorer else None
-    eyes_closed, blurry, blurry_face_w = judge_faces(face_pairs, eye_classifier, quality_config, blink_scores=blinks)
+    eyes_closed, blurry, blurry_face_w, min_blurry_face_var = judge_faces(
+      face_pairs, eye_classifier, quality_config, blink_scores=blinks
+    )
 
     # 얼굴 경로 붕괴 면제 (ADR 018 §보강 2): blurry 얼굴이 대형 주 인물이고 전체 variance가 붕괴
     # 수준이면 고스팅형 손떨림(쏠림 낮음)으로 보고 재확인 게이트를 건너뛴다 — 얼굴이 화면 대부분이면
     # whole_var가 얼굴 자체를 재는 것이라 fallback 붕괴 면제와 같은 논리가 성립한다 (event 64).
     gate_exempt = bool(blurry) and face_collapse_exempt(image, blurry_face_w, quality_config)
+    # face_var 붕괴 면제 (ADR 018 §보강 3): 소형 얼굴 하나가 얼굴 경로로 새면 fallback의 whole_var
+    # 붕괴 면제를 못 받는데, 얼굴 자신의 face_var가 붕괴 수준(<floor)이고 전체 이미지도 붕괴(whole_var
+    # <임계)면 소프트 원판이 아니라 등방성 손떨림이다 — 쏠림 재확인을 면제하고 흔들림을 확정한다
+    # (test9 흔들린 단체샷 미탐). whole_var 조건은 선명 사진의 어둡거나 배경인 얼굴 오탐 방어(event 51).
+    gate_exempt = gate_exempt or (bool(blurry) and face_var_collapse_exempt(image, min_blurry_face_var, quality_config))
 
     # 흔들림 fallback: blurry=None = 판정 자격 얼굴이 없음(미검출이거나 전부 극소 얼굴) —
     # 완전 흔들린 사진은 얼굴 검출 자체가 실패하고, 검출됐어도 극소 얼굴은 variance를 신뢰할 수 없다.

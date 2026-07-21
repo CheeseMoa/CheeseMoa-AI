@@ -129,10 +129,14 @@ variance 기반 blurry 판정(얼굴·fallback 공통)은 최종적으로 흔들
 낮게 나온다(event 55 실측, ADR 018 보강). 면제는 fallback + **대형 주 인물 얼굴 경로**(blurry 얼굴
 rel_w ≥ 0.22 — 얼굴이 화면 대부분이면 whole_var가 얼굴 자체를 재므로 fallback 논리가 이식되고,
 옛날 인화 오탐은 얼굴이 작거나 whole_var 미붕괴로 걸러진다. 고스팅 셀피가 대형 얼굴 회복 검출로
-얼굴 경로에 빠져 uncertain으로 새던 event 64 해소, ADR 018 §보강 2)에 적용된다.
+얼굴 경로에 빠져 uncertain으로 새던 event 64 해소, ADR 018 §보강 2) + **소형 얼굴 face_var 붕괴**
+(blurry 얼굴 최저 face_var<7 AND whole_var<40이면 얼굴·이미지 잔결이 둘 다 붕괴 = 소프트 원판을
+넘어선 흔들림 확정 — 소형 얼굴 하나가 얼굴 경로로 새서 fallback 붕괴 면제를 못 받던 test9 흔들린
+단체샷 미탐 해소, whole_var 결합은 선명 사진의 어둡거나 배경인 얼굴 오탐 방어(실 이벤트 event 51),
+`QUALITY_FACE_VAR_COLLAPSE_FLOOR`, ADR 018 §보강 3)에 적용된다.
 임계는 `QualityConfig`. 한계: 부분 모션블러+선명 배경 사각지대, 소형 얼굴(rel_w<0.22)의 고스팅·
-회전 손떨림(전역 쏠림 낮음 — ADR 018 게이트가 해제하는 방향, 소형 얼굴은 whole_var 붕괴가 얼굴
-상태의 증거가 못 돼 원리적 사각지대), 아웃포커스 주 인물(등방이라 동일), 눈감음 presence 미달
+회전 손떨림·등방 블러 중 face_var 10~25 구간(전역 쏠림 낮음 — ADR 018 게이트가 해제하는 방향,
+옛날 인화 face_var와 겹쳐 §보강 3 붕괴 면제로도 못 가름), 아웃포커스 주 인물(등방이라 동일), 눈감음 presence 미달
 ~9% 미판정(실측 감음 손실 0 — 코퍼스 한정, ADR 021 §한계), blendshape는 눈 감김을 문자 그대로
 재서 웃으며 감은 캔디드도 잡힘(의미론 — 임계로 조정), 최대 얼굴의 절반 미만 크기 얼굴은 눈감음
 미판정이라 그런 구도의 일행 감음은 놓침(ADR 022 트레이드오프 — blur와 동일). CNN 시절 한계였던 유아 오탐·보정 이미지
@@ -293,9 +297,10 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    Spring API까지 함께 스로틀된다 ([ec2-deployment.md](docs/guides/ec2-deployment.md) §리스크)
 2. pytest 도입 — 각 모듈 `__main__` 스모크를 tests/로 승격 (`# TODO(CHMO-165)` 표시 지점)
 3. (후속) 품질 게이트 개선 — 눈/흔들림 임계 라벨셋 튜닝(현재 라벨 부재), 부분 블러 대응, 실물 대형
-   선글라스·유아 눈 오탐(ADR 019 §한계 — 리포트 축적 시), 소형 얼굴(rel_w<0.22) 등방성 블러
-   (ADR 018 §보강 2 한계 — 고스팅 정탐 표본도 유니크 1장이라 미탐 리포트 축적 시 재실측,
-   도구 `scripts/survey_face_collapse.py`). 웃음 예외용 표정 CNN은 2026-07-17 실측에서
+   선글라스·유아 눈 오탐(ADR 019 §한계 — 리포트 축적 시), 소형 얼굴(rel_w<0.22) 등방성 블러의
+   face_var 10~25 잔존 구간(face_var<7 붕괴분은 ADR 018 §보강 3으로 회복 — 옛날 인화와 겹치는
+   구간만 남음, 고스팅 정탐 표본도 유니크 1장이라 미탐 리포트 축적 시 재실측, 도구
+   `scripts/survey_face_collapse.py`·`scripts/sim_facevar_floor.py`). 웃음 예외용 표정 CNN은 2026-07-17 실측에서
    오탐 0건으로 착수 근거 상실([survey](docs/reviews/2026-07-17-smile-eyes-geometry-survey.md)).
    원본 해상도 눈 crop도 실측 기각 — 이중 리샘플링의 소프트한 입력이 오히려 CNN 학습 분포(운전자
    모니터링 저해상도)에 정합해, 원본 직접 crop은 기존 정탐을 붕괴시키고 웃음 실눈 오탐을 새로
@@ -406,9 +411,15 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
   옛날 인화 오탐은 얼굴이 작거나(붕괴 6장 rel_w≤0.172) whole_var 미붕괴(113.1)로 걸러진다.
   검증: 고스팅 blurry 복원, event 50 재점화 0, 라벨셋·event 64 나머지 무회귀, 스윕 발동 고스팅뿐.
   `quality.face_collapse_exempt` + `QUALITY_COLLAPSE_FACE_REL_WIDTH`(0=비활성),
-  도구 `scripts/survey_face_collapse.py`. 남은 한계: 소형 얼굴(rel_w<0.22) 등방성 블러(원리적 —
-  소형 얼굴은 whole_var 붕괴가 얼굴 상태의 증거가 못 됨), 고스팅 정탐 표본 유니크 1장(재보정 대상),
-  미탐 리포트 축적 시 라벨셋 추가 후 재보정.
+  도구 `scripts/survey_face_collapse.py`. **보강 3(2026-07-21, CHMO-380, §보강 3)**: 소형 얼굴
+  등방성 손떨림(test9 dcb66942 단체샷)이 소형 얼굴 검출 하나로 fallback 붕괴 면제를 비켜가 미탐 →
+  blurry 얼굴 최저 face_var<7(빈 구간 [5.4, 10.0]) AND whole_var<40이면 게이트 면제·흔들림 확정.
+  로컬 142장 중 대상 1장만 전환·회귀 0, 실 이벤트 58개 diff에서 정탐 8장(dcb 재업로드)만 전환.
+  whole_var 결합은 실 이벤트 검증에서 추가 — face_var 단독은 선명 사진의 배경 얼굴을 오탐(event 51
+  배경 사진기자 face_var 4.1·whole_var 1133). `quality.face_var_collapse_exempt` +
+  `QUALITY_FACE_VAR_COLLAPSE_FLOOR`(0=비활성), 도구 `scripts/sim_facevar_floor.py`. 남은 한계: 소형
+  얼굴 face_var 10~25 구간 등방성 블러(옛날 인화와 겹침), 어두운 선명 사진(event 16 암실 전시 —
+  whole_var도 어둠으로 붕괴, 밝기 게이트는 저조도 흔들림 놓쳐 미도입·수용), 정탐 표본 유니크 1장.
 - **대형 근접 얼굴 재검출 회복 — 초근접 얼굴 미검출 해소** (2026-07-16,
   [ADR 017](docs/decisions/017-size-aware-detection-score-threshold.md)) — event 36에서 얼굴이 크게 나온
   아이(0010=`6acd1055`)가 공통 사진첩으로 빠지던 문제. 원인은 YuNet(WIDER FACE 학습)이 초근접 대형
