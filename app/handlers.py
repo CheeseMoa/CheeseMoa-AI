@@ -30,6 +30,7 @@ from app.schemas.messages import (
   ClassifyResult,
   ConfirmDistinctFeedback,
   DeleteRequest,
+  FaceBox,
   FailedImage,
   MergeFeedback,
   ReassignFeedback,
@@ -199,6 +200,14 @@ def _same_photo_cannot_links(event: EventEmbeddings) -> tuple[tuple[int, int], .
         continue  # 이중 검출 의심 — 안전판 (_SAME_FACE_SIMILARITY)
       pairs.append((a, b))
   return tuple(pairs)
+
+
+def _uncertain_face_box(event: EventEmbeddings, index: int) -> FaceBox | None:
+  """uncertain 사진의 상세 화면 얼굴 crop용 bbox (계약 확장, feature-spec §6.2). bbox 미상(v2 이하)은 None."""
+  x, y, w, h = event.bboxes[index]
+  if round(w) <= 0 or round(h) <= 0:
+    return None
+  return FaceBox(x=round(x), y=round(y), w=round(w), h=round(h))
 
 
 @dataclass(frozen=True)
@@ -661,6 +670,14 @@ class JobHandlers:
         for photo_id in dict.fromkeys(event.photo_ids)
         if faces_per_photo[photo_id] >= 2 or albums_per_photo[photo_id] >= 2
       ]
+    # 상세 화면 얼굴 crop용 bbox (계약 확장): 그 사진의 uncertain 얼굴 중 주 얼굴을 고른다 — 머릿수
+    # 자격(counted, 오검출·파편 제외 — ADR 025·027) 우선, 다음 최대 폭. 행인·파편이 섞여도 주 피사체를 가리킨다.
+    crop_face_of: dict[str, int] = {}
+    for index in (*snapshot.ambiguous_indices, *snapshot.unmatched_indices):
+      photo_id = event.photo_ids[index]
+      best = crop_face_of.get(photo_id)
+      if best is None or (counted[index], event.bboxes[index][2]) > (counted[best], event.bboxes[best][2]):
+        crop_face_of[photo_id] = index
     # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
@@ -672,7 +689,11 @@ class JobHandlers:
           if not self._cluster_config.group_photo_to_common:
             group_common.append(photo_id)  # 구 정책: 전원 미매칭인 단체 사진만 공용
         else:
-          uncertain.append(UncertainImage(image_id=photo_id, reason=reason))
+          uncertain.append(
+            UncertainImage(
+              image_id=photo_id, reason=reason, face_bbox=_uncertain_face_box(event, crop_face_of[photo_id])
+            )
+          )
 
     retired_cluster_ids = list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired]))
     self._delete_retired_thumbnails(event_id, retired_cluster_ids)
@@ -1370,6 +1391,10 @@ if __name__ == "__main__":
     "같은사진 자동 cannot-link: 타인 쌍만 유도, 이중 검출 쌍·다른 사진 쌍은 제외",
     _same_photo_cannot_links(auto_event) == ((0, 2), (1, 2)),
   )
+  check(
+    "uncertain face_bbox: bbox 미상 행(v2 이하 .npz)은 None",
+    _uncertain_face_box(auto_event, 0) is None,
+  )
 
   # ⑮ 주 인물 카운트 라우팅 (CHMO-330): 얼굴 2개라도 하나가 행인(최대 폭의 50% 미만)이면 단체 사진이
   # 아니다 — 미매칭 주 인물 1명이므로 공용이 아니라 uncertain. 폭이 대등한 2인 미매칭은 공용(①에서 검증).
@@ -1387,6 +1412,10 @@ if __name__ == "__main__":
   check(
     "주 인물 1명+행인: 공용 아님, uncertain(unmatched)",
     walkin.common_album == [] and [(u.image_id, u.reason) for u in walkin.uncertain] == [("img-walkin", "unmatched")],
+  )
+  check(
+    "uncertain face_bbox: 행인이 아니라 주 얼굴(최대 폭)의 bbox를 싣는다",
+    walkin.uncertain[0].face_bbox == FaceBox(x=0, y=0, w=120, h=120),
   )
   check(
     "얼굴 폭이 .npz에 저장·왕복됨",

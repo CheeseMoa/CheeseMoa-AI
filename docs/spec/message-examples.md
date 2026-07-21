@@ -142,8 +142,11 @@
   "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경·얼굴 미검출) — 뷰어 노출
   "uncertain": [                                  // "분류가 어려워요" — 뷰어 비노출
     // album_id: 이 사진을 인물 앨범으로 옮길 때 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id
-    { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__" },  // 두 인물 사이 저신뢰
-    { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__" }   // 얼굴은 있으나 인물 미매칭 (예: 행인)
+    // face_bbox: 주 얼굴 bbox(원본 px, x·y=좌상단) — 앱 상세 화면 얼굴 crop용 (아래 註)
+    { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__",    // 두 인물 사이 저신뢰
+      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 } },
+    { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__",    // 얼굴은 있으나 인물 미매칭 (예: 행인)
+      "face_bbox": null }                          // null = bbox 미상(구버전 .npz 행) — crop 없이 사진만 표시
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
   "blurry": ["img-4"],                            // exclude_blurry=ON일 때만 — 뷰어 비노출
@@ -161,6 +164,10 @@
   Spring은 이 키로 presigned URL을 **매 조회 발급**해 서빙한다(장기 캐시하면 대표 교체가 반영되지 않는다).
   **null 가능**: 기능 비활성(`THUMBNAIL_MAX_SIDE=0`) / 렌더·업로드 실패(best-effort — job은 정상 진행) /
   구버전(.npz v2 이하) 데이터만으로 구성된 클러스터. null이면 썸네일 없음으로 처리한다.
+- `face_bbox`(계약 확장, 2026-07-21): uncertain 항목의 주 얼굴 bbox — 원본 이미지 픽셀 좌표(x·y 좌상단,
+  w·h 폭·높이, 전부 정수)라 앱이 상세 화면에 띄운 원본 위에 그대로 오려 그리면 된다. 가장자리 얼굴은
+  bbox가 이미지 경계를 벗어날 수 있으니 표시 측에서 클램프한다. **null 가능**(구버전 `.npz` 행 — bbox
+  미상): crop 없이 사진만 표시한다. 상세는 [feature-spec §6.2](feature-spec.md).
 - 실패 케이스를 포함한 계약 검증 전체는 `python -m app.schemas.messages`로 실행할 수 있다.
 
 ## ⑤ 분류 진행률 — `progress` (AI → Spring, progress 큐, CHMO-274)
