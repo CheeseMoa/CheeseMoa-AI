@@ -1,3 +1,5 @@
+# FastAPI 학습용 샘플 — 실제 프로젝트 코드 아님. 의존성은 requirements.txt에 없다(워커는 HTTP 미제공):
+# 실행하려면 별도로 `pip install fastapi uvicorn` 후 `uvicorn healthcare_api:app`.
 import datetime
 from typing import List, Optional
 
