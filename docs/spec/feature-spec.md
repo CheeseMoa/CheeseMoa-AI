@@ -167,7 +167,9 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
   "common_album": ["uuid"],     // common 앨범 — 단체 사진(얼굴 2명+)·배경·얼굴 미검출. 뷰어 노출
   "uncertain": [                // uncertain("분류가 어려워요") — 뷰어 비노출
     // album_id: 인물 앨범 편입 시 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id ("__uncertain__")
-    { "image_id": "uuid", "reason": "ambiguous", "album_id": "__uncertain__" }  // "ambiguous"(저신뢰) | "unmatched"
+    // face_bbox: 주 얼굴 bbox(원본 px) — 앱 상세 화면 얼굴 crop용. null 가능(v2 이하 .npz 행)
+    { "image_id": "uuid", "reason": "ambiguous", "album_id": "__uncertain__",  // "ambiguous"(저신뢰) | "unmatched"
+      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 } }
   ],
   "eyes_closed": ["uuid"],      // eyes_closed 앨범 — exclude_eyes_closed=ON일 때만. 뷰어 비노출
   "blurry": ["uuid"],           // blurry 앨범 — exclude_blurry=ON일 때만. 뷰어 비노출
@@ -212,6 +214,14 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
     사용자가 이 사진을 인물 앨범으로 옮기면 Spring이 `reassign(from_cluster_id=이 값)`으로 되돌려주고(6.3),
     워커가 해당 사진의 미매칭 얼굴을 must-link해 편입한다 — uncertain 얼굴은 실 `cluster_id`가 없어(`.npz`엔
     `None`) 일반 reassign 대상이 못 되므로 이 가상 앨범을 출처로 인정한다.
+  - **상세 화면 얼굴 crop — `face_bbox`**(계약 확장, 2026-07-21): 각 uncertain 항목은 그 사진을
+    uncertain으로 만든 주 얼굴의 bbox(`{x, y, w, h}`, 원본 픽셀 좌표)를 함께 싣는다. 사진 상세 화면은
+    원본을 이미 띄워놓은 상태라 앱이 이 영역을 직접 오려 "어느 얼굴이 분류가 어려웠는지"를 보여준다 —
+    워커 crop→S3 업로드(인물 앨범 썸네일 방식)는 uncertain 목록이 매 재군집 event 전체 스냅샷으로 다시
+    나와 원본 재fetch·디코드가 반복되고 고아 썸네일 정리도 필요해, 원본이 이미 손에 있는 상세 화면
+    용도에는 과잉이라 기각. 사진에 uncertain 얼굴이 여럿이면(주 얼굴+행인 등) 머릿수 자격(ADR 025·027
+    통과) 우선, 다음 최대 폭 얼굴을 고른다. **null 가능**: bbox 미상(v2 이하 `.npz` 행) — crop 없이
+    사진만 표시. 가장자리 얼굴은 bbox가 이미지 경계를 벗어날 수 있다(클램프는 표시 측 몫).
   - (TBD: `back`(뒷모습)·`duplicate`(중복)를 `uncertain` 사유로 추가할지는 백엔드와 합의)
 - `eyes_closed` / `blurry`: **눈감음·흔들림은 "분류가 어려워요"와 별개의 독립 앨범**이다(제품 명세 정정 반영). 업로드 토글(6.1 `options`)이 ON일 때만 인물 앨범 대신 이 앨범으로 라우팅하고, OFF면 분리하지 않는다.
 - `failed_images`: 타임아웃 등 **기술적 실패**. 화질·매칭 문제인 위 앨범들과 구분한다(재시도 대상).

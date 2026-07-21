@@ -253,6 +253,20 @@ class ResultCluster(_MessageBase):
   thumbnail_s3_key: Id | None = None
 
 
+class FaceBox(_MessageBase):
+  """얼굴 bbox — 원본 이미지 픽셀 좌표 (x·y = 좌상단, w·h = 폭·높이).
+
+  .npz v3 bboxes 열과 같은 좌표계다(검출은 리사이즈 프레임에서 돌아도 저장은 원본 px 환산 — CHMO-335).
+  앱은 원본 사진 위에 이 영역을 그대로 오려 그리면 된다. 가장자리 얼굴은 x·y가 음수이거나 x+w·y+h가
+  이미지 밖일 수 있다 — 클램프는 표시 측 몫.
+  """
+
+  x: int
+  y: int
+  w: int = Field(gt=0)
+  h: int = Field(gt=0)
+
+
 class UncertainImage(_MessageBase):
   """인물에 자신 있게 붙이지 못한 사진 ("분류가 어려워요" 앨범, 뷰어 비노출).
 
@@ -267,6 +281,9 @@ class UncertainImage(_MessageBase):
   image_id: Id
   reason: Literal["ambiguous", "unmatched"]  # TBD #2: back·duplicate 추가 합의 시 Literal 확장
   album_id: Id = UNCERTAIN_ALBUM_ID  # reassign의 from_cluster_id로 되돌려줄 출처 앨범 id (예약 리터럴)
+  # 이 사진을 uncertain으로 만든 주 얼굴의 bbox — 앱 사진 상세 화면의 얼굴 crop용 (계약 확장,
+  # feature-spec §6.2). None = bbox 미상(v2 이하 .npz 행) — 앱은 crop 없이 사진만 보여준다.
+  face_bbox: FaceBox | None = None
 
 
 class FailedImage(_MessageBase):
@@ -433,7 +450,7 @@ if __name__ == "__main__":
     ],
     common_album=["img-9"],
     uncertain=[
-      UncertainImage(image_id="img-5", reason="ambiguous"),
+      UncertainImage(image_id="img-5", reason="ambiguous", face_bbox=FaceBox(x=120, y=48, w=260, h=300)),
       UncertainImage(image_id="img-6", reason="unmatched"),
     ],
     eyes_closed=["img-3"],
@@ -453,6 +470,11 @@ if __name__ == "__main__":
     "uncertain 항목은 예약 앨범 id 기본 부여 (reassign 출처)",
     all(uncertain.album_id == UNCERTAIN_ALBUM_ID for uncertain in result.uncertain)
     and '"album_id":"__uncertain__"' in result.model_dump_json().replace(" ", ""),
+  )
+  check(
+    "uncertain face_bbox — 동봉 시 직렬화 포함, 생략 시 None (구버전 하위호환)",
+    '"face_bbox":{"x":120,"y":48,"w":260,"h":300}' in result.model_dump_json().replace(" ", "")
+    and result.uncertain[1].face_bbox is None,
   )
   check("failed 결과 최소 구성", ClassifyResult(job_id="job-9", status="failed").clusters == [])
 
