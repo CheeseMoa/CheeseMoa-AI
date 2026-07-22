@@ -142,13 +142,14 @@
   "common_album": ["img-9"],                      // 인물 귀속 불가 (단체·배경·얼굴 미검출) — 뷰어 노출
   "uncertain": [                                  // "분류가 어려워요" — 뷰어 비노출
     // album_id: 이 사진을 인물 앨범으로 옮길 때 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id
-    // face_bbox: 주 얼굴 bbox(원본 px, x·y=좌상단) — 앱 상세 화면 얼굴 crop용 (아래 註)
+    // face_bboxes: 주 인물 얼굴 bbox 배열(원본 px, x·y=좌상단, 폭 내림차순) — 앱 상세 화면 얼굴 crop용 (아래 註)
     // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거 (아래 註)
     { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__",    // 두 인물 사이 저신뢰
-      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },
+      "face_bboxes": [ { "x": 120, "y": 48, "w": 260, "h": 300 },
+                       { "x": 400, "y": 60, "w": 180, "h": 200 } ],
       "causes": ["low_resolution", "small_faces"] },  // 저해상도라 얼굴이 작게 잡힘 → "원본으로 다시"
     { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__",    // 얼굴은 있으나 인물 미매칭 (예: 행인)
-      "face_bbox": null,                           // null = bbox 미상(구버전 .npz 행) — crop 없이 사진만 표시
+      "face_bboxes": [],                           // 빈 배열 = 자격 얼굴 없음·bbox 미상 — crop 없이 사진만 표시
       "causes": [] }                               // 빈 배열 = 품질 문제 아님(예: 고해상도 미등록 인물)
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
@@ -167,10 +168,14 @@
   Spring은 이 키로 presigned URL을 **매 조회 발급**해 서빙한다(장기 캐시하면 대표 교체가 반영되지 않는다).
   **null 가능**: 기능 비활성(`THUMBNAIL_MAX_SIDE=0`) / 렌더·업로드 실패(best-effort — job은 정상 진행) /
   구버전(.npz v2 이하) 데이터만으로 구성된 클러스터. null이면 썸네일 없음으로 처리한다.
-- `face_bbox`(계약 확장, 2026-07-21): uncertain 항목의 주 얼굴 bbox — 원본 이미지 픽셀 좌표(x·y 좌상단,
-  w·h 폭·높이, 전부 정수)라 앱이 상세 화면에 띄운 원본 위에 그대로 오려 그리면 된다. 가장자리 얼굴은
-  bbox가 이미지 경계를 벗어날 수 있으니 표시 측에서 클램프한다. **null 가능**(구버전 `.npz` 행 — bbox
-  미상): crop 없이 사진만 표시한다. 상세는 [feature-spec §6.2](feature-spec.md).
+- `face_bboxes`(계약 교체 CHMO-407, BE#107 합의 — 종전 단일 `face_bbox`를 대체): 그 사진을 uncertain으로
+  만든 **주 인물 얼굴 전부**의 bbox 배열. 원본 이미지 픽셀 좌표(x·y 좌상단, w·h 폭·높이, 전부 정수)라
+  앱이 상세 화면에 띄운 원본 위에 그대로 오려 그리면 된다. 가장자리 얼굴은 bbox가 이미지 경계를 벗어날
+  수 있으니 표시 측에서 클램프한다. 정렬은 폭 내림차순(주 얼굴 먼저), 동률은 event 행 순. 주 인물
+  자격(counted AND 폭 게이트 — 행인·오검출·파편 제외) 통과 얼굴만 실리며, **빈 배열 가능**(자격 얼굴
+  없음 — 오검출 전용 사진, 또는 구버전 `.npz` 행 — bbox 미상): crop 없이 사진만 표시한다. null은 오지
+  않는다(항상 배열). 요소 2개+는 매칭 사진에 미매칭 주 인물이 여럿 남은 경우다.
+  상세는 [feature-spec §6.2](feature-spec.md).
 - `uncertain`은 `clusters`·`common_album`과 **중복 노출될 수 있다**(계약 확장, 결정 2026-07-21): 인물
   앨범에 배정된 사진이라도 주 인물 크기의 미매칭 얼굴이 남아 있으면 uncertain에도 실린다 — 미등록
   인물을 `__uncertain__` reassign으로 수동 편입할 진입점. 상세는 [feature-spec §6.2](feature-spec.md).

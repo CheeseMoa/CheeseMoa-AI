@@ -202,12 +202,18 @@ def _same_photo_cannot_links(event: EventEmbeddings) -> tuple[tuple[int, int], .
   return tuple(pairs)
 
 
-def _uncertain_face_box(event: EventEmbeddings, index: int) -> FaceBox | None:
-  """uncertain 사진의 상세 화면 얼굴 crop용 bbox (계약 확장, feature-spec §6.2). bbox 미상(v2 이하)은 None."""
-  x, y, w, h = event.bboxes[index]
-  if round(w) <= 0 or round(h) <= 0:
-    return None
-  return FaceBox(x=round(x), y=round(y), w=round(w), h=round(h))
+def _uncertain_face_boxes(event: EventEmbeddings, indices: Iterable[int]) -> list[FaceBox]:
+  """uncertain 사진의 상세 화면 얼굴 crop용 bbox 목록 (계약 교체 CHMO-407, feature-spec §6.2).
+
+  폭 내림차순(주 얼굴 먼저), 동률은 event 행 순. bbox 미상(w·h≤0 — v2 이하 .npz 행)은 제외한다.
+  """
+  boxes: list[FaceBox] = []
+  for index in sorted(indices, key=lambda i: (-event.bboxes[i][2], i)):
+    x, y, w, h = event.bboxes[index]
+    if round(w) <= 0 or round(h) <= 0:
+      continue
+    boxes.append(FaceBox(x=round(x), y=round(y), w=round(w), h=round(h)))
+  return boxes
 
 
 @dataclass(frozen=True)
@@ -678,14 +684,13 @@ class JobHandlers:
         for photo_id in dict.fromkeys(event.photo_ids)
         if faces_per_photo[photo_id] >= 2 or albums_per_photo[photo_id] >= 2
       ]
-    # 상세 화면 얼굴 crop용 bbox (계약 확장): 그 사진의 uncertain 얼굴 중 주 얼굴을 고른다 — 머릿수
-    # 자격(counted, 오검출·파편 제외 — ADR 025·027) 우선, 다음 최대 폭. 행인·파편이 섞여도 주 피사체를 가리킨다.
-    crop_face_of: dict[str, int] = {}
+    # 상세 화면 얼굴 crop용 bbox (계약 교체 CHMO-407, BE#107): 그 사진의 uncertain 얼굴 중 주 인물
+    # 자격(counted — ADR 025·027 AND 폭 게이트 — ADR 022) 통과 얼굴 전부. 행인·오검출·파편은 싣지 않는다
+    # — 자격 얼굴이 없으면(오검출 전용 사진) 빈 배열: 박스를 그릴 주 인물이 없다.
+    crop_faces_of: dict[str, list[int]] = {}
     for index in (*snapshot.ambiguous_indices, *snapshot.unmatched_indices):
-      photo_id = event.photo_ids[index]
-      best = crop_face_of.get(photo_id)
-      if best is None or (counted[index], event.bboxes[index][2]) > (counted[best], event.bboxes[best][2]):
-        crop_face_of[photo_id] = index
+      if main_face[index]:
+        crop_faces_of.setdefault(event.photo_ids[index], []).append(index)
     # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
@@ -708,7 +713,7 @@ class JobHandlers:
           UncertainImage(
             image_id=photo_id,
             reason=reason,
-            face_bbox=_uncertain_face_box(event, crop_face_of[photo_id]),
+            face_bboxes=_uncertain_face_boxes(event, crop_faces_of.get(photo_id, ())),
             causes=self._uncertain_causes(max_width_of.get(photo_id, 0.0), long_side_of.get(photo_id, 0.0), reason),
           )
         )
@@ -1449,8 +1454,8 @@ if __name__ == "__main__":
     _same_photo_cannot_links(auto_event) == ((0, 2), (1, 2)),
   )
   check(
-    "uncertain face_bbox: bbox 미상 행(v2 이하 .npz)은 None",
-    _uncertain_face_box(auto_event, 0) is None,
+    "uncertain face_bboxes: bbox 미상 행(v2 이하 .npz)은 배열에서 제외",
+    _uncertain_face_boxes(auto_event, [0]) == [],
   )
 
   # ⑮ 주 인물 카운트 라우팅 (CHMO-330): 얼굴 2개라도 하나가 행인(최대 폭의 50% 미만)이면 단체 사진이
@@ -1471,8 +1476,10 @@ if __name__ == "__main__":
     walkin.common_album == [] and [(u.image_id, u.reason) for u in walkin.uncertain] == [("img-walkin", "unmatched")],
   )
   check(
-    "uncertain face_bbox: 행인이 아니라 주 얼굴(최대 폭)의 bbox를 싣는다",
-    walkin.uncertain[0].face_bbox == FaceBox(x=0, y=0, w=120, h=120),
+    # 합성 orthogonal 벡터는 두 얼굴 다 ADR-025 FP 게이트에 걸려 counted가 없다(아래 causes 체크와 같은
+    # 성질) → 주 인물 자격 얼굴 0 = 빈 배열. 오검출·행인에 박스를 그리지 않는다는 CHMO-407 의도 그 자체.
+    "uncertain face_bboxes: 주 인물 자격 얼굴 없는 사진(FP 게이트 전원 탈락)은 빈 배열",
+    walkin.uncertain[0].face_bboxes == [],
   )
   check(
     # single_appearance는 counted(실인물) 얼굴에만 붙는다 — 합성 orthogonal 벡터는 최근접 유사도 0이라
@@ -1681,7 +1688,7 @@ if __name__ == "__main__":
     sum("img-mixu" in c.image_ids for c in mixu.clusters) == 1
     and "img-mixu" in mixu.common_album
     and [(u.image_id, u.reason) for u in mixu.uncertain] == [("img-mixu", "unmatched")]
-    and mixu.uncertain[0].face_bbox == FaceBox(x=0, y=0, w=180, h=180),
+    and mixu.uncertain[0].face_bboxes == [FaceBox(x=0, y=0, w=180, h=180)],
   )
   check(
     "미매칭 행인은 종전대로 숨김: 인물 앨범만 — 공용·uncertain 없음",
@@ -1765,6 +1772,50 @@ if __name__ == "__main__":
   check(
     "single_appearance 종단: 선명한 대형 얼굴 1인(한 번 등장) → causes=[single_appearance]",
     [(u.image_id, u.reason, u.causes) for u in solo.uncertain] == [("img-solo", "unmatched", ["single_appearance"])],
+  )
+
+  # ㉒ uncertain face_bboxes 배열 (계약 교체 CHMO-407, BE#107): 주 인물 자격 uncertain 얼굴이 여럿이면
+  # 전부 싣는다(폭 내림차순). 자격 2개+가 나오는 유일한 경로는 "매칭 사진 + 미매칭 주 인물 복수"다 —
+  # 비매칭 사진은 주 인물 2명+이면 단체 규칙으로 공용에 빠져 uncertain에 못 들어온다(⑳ 경로 재사용).
+  image_source.images.update(
+    {
+      "img-y1.jpg": fake_image([(16, 4)]),
+      "img-y2.jpg": fake_image([(16, 5)]),
+      # 인물 16(매칭, 220) + 미등록 주 인물 17·18(180·150 ≥ 220×0.5=110) + 행인 19(60 < 110, counted지만 폭 미달)
+      "img-multi.jpg": fake_image([(16, 6, 220), (17, 2, 180), (18, 1, 150), (19, 0, 60)]),
+    }
+  )
+  multi_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-c15",
+      "group_id": "group-1",
+      "event_id": "event-15",
+      "images": [
+        {"image_id": "img-y1", "s3_key": "img-y1.jpg"},
+        {"image_id": "img-y2", "s3_key": "img-y2.jpg"},
+        {"image_id": "img-multi", "s3_key": "img-multi.jpg"},
+      ],
+    }
+  )
+  multi = handlers.handle(parse_inbound_message(multi_body))
+  check(
+    # 배열 길이 2가 곧 행인 제외 검증이다 — 19도 counted(stranger 유사도 ≈0.3 > FP 바닥)라 크기 게이트만이 거른다
+    "uncertain face_bboxes: 미매칭 주 인물 2명 전부, 폭 내림차순 — 행인은 제외",
+    [(u.image_id, u.reason) for u in multi.uncertain] == [("img-multi", "unmatched")]
+    and multi.uncertain[0].face_bboxes == [FaceBox(x=0, y=0, w=180, h=180), FaceBox(x=0, y=0, w=150, h=150)],
+  )
+  tie_event = EventEmbeddings.empty().append_faces(
+    [
+      ("f-t1", "p-tie", base_vec, 100.0, (0.0, 0.0, 100.0, 100.0)),
+      ("f-t2", "p-tie", other_vec, 100.0, (10.0, 0.0, 100.0, 100.0)),
+    ]
+  )
+  check(
+    # 입력을 역순으로 줘 정렬이 실제로 개입함을 보장 — 폭 동률은 event 행 순이 계약이다
+    "uncertain face_bboxes: 폭 동률은 event 행 순 — 입력 순서 무관",
+    _uncertain_face_boxes(tie_event, (1, 0))
+    == [FaceBox(x=0, y=0, w=100, h=100), FaceBox(x=10, y=0, w=100, h=100)],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

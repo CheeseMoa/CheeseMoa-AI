@@ -281,9 +281,12 @@ class UncertainImage(_MessageBase):
   image_id: Id
   reason: Literal["ambiguous", "unmatched"]  # TBD #2: back·duplicate 추가 합의 시 Literal 확장
   album_id: Id = UNCERTAIN_ALBUM_ID  # reassign의 from_cluster_id로 되돌려줄 출처 앨범 id (예약 리터럴)
-  # 이 사진을 uncertain으로 만든 주 얼굴의 bbox — 앱 사진 상세 화면의 얼굴 crop용 (계약 확장,
-  # feature-spec §6.2). None = bbox 미상(v2 이하 .npz 행) — 앱은 crop 없이 사진만 보여준다.
-  face_bbox: FaceBox | None = None
+  # 이 사진을 uncertain으로 만든 주 인물 얼굴들의 bbox — 앱 사진 상세 화면의 얼굴 crop용 (계약 교체
+  # CHMO-407, BE#107 합의: 단일 face_bbox → 배열). 폭 내림차순(주 얼굴 먼저), 동률은 event 행 순.
+  # 주 인물 자격(counted AND 폭 게이트, feature-spec §6.2) 통과 얼굴만 싣는다 — 행인·오검출·파편 제외.
+  # 빈 배열 = 자격 얼굴 없음(오검출 전용 사진) 또는 bbox 미상(v2 이하 .npz 행) — 앱은 crop 없이 사진만
+  # 보여준다(BE는 빈 배열이면 응답에서 필드 생략).
+  face_bboxes: list[FaceBox] = Field(default_factory=list)
   # 이 사진이 왜 분류가 어려웠는지 — 앱이 "분류가 어려워요" 화면에 설명·안내 문구를 띄우는 근거 (계약 확장,
   # CHMO-404). reason(군집에서 무슨 일)과 직교하는 '왜' 축이다:
   #   low_resolution    = 원본 해상도가 낮아 얼굴이 작게 잡힘 (원본으로 다시 올리면 개선 — 유일한 actionable 신호)
@@ -463,7 +466,7 @@ if __name__ == "__main__":
       UncertainImage(
         image_id="img-5",
         reason="ambiguous",
-        face_bbox=FaceBox(x=120, y=48, w=260, h=300),
+        face_bboxes=[FaceBox(x=120, y=48, w=260, h=300), FaceBox(x=400, y=60, w=180, h=200)],
         causes=["low_resolution", "small_faces"],
       ),
       UncertainImage(image_id="img-6", reason="unmatched"),  # causes 생략 = 품질 문제 아님(빈 배열)
@@ -487,9 +490,10 @@ if __name__ == "__main__":
     and '"album_id":"__uncertain__"' in result.model_dump_json().replace(" ", ""),
   )
   check(
-    "uncertain face_bbox — 동봉 시 직렬화 포함, 생략 시 None (구버전 하위호환)",
-    '"face_bbox":{"x":120,"y":48,"w":260,"h":300}' in result.model_dump_json().replace(" ", "")
-    and result.uncertain[1].face_bbox is None,
+    "uncertain face_bboxes — 동봉 시 배열 직렬화, 생략 시 빈 배열 (CHMO-407 계약 교체, BE#107)",
+    '"face_bboxes":[{"x":120,"y":48,"w":260,"h":300},{"x":400,"y":60,"w":180,"h":200}]'
+    in result.model_dump_json().replace(" ", "")
+    and result.uncertain[1].face_bboxes == [],
   )
   check(
     "uncertain causes — 동봉 시 직렬화 포함, 생략 시 빈 배열 (CHMO-404 계약 확장)",

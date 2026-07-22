@@ -167,10 +167,10 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
   "common_album": ["uuid"],     // common 앨범 — 단체 사진(얼굴 2명+)·배경·얼굴 미검출. 뷰어 노출
   "uncertain": [                // uncertain("분류가 어려워요") — 뷰어 비노출
     // album_id: 인물 앨범 편입 시 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id ("__uncertain__")
-    // face_bbox: 주 얼굴 bbox(원본 px) — 앱 상세 화면 얼굴 crop용. null 가능(v2 이하 .npz 행)
+    // face_bboxes: 주 인물 얼굴 bbox 배열(원본 px, 폭 내림차순) — 앱 상세 화면 얼굴 crop용. 빈 배열 가능
     // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거. 빈 배열 = 품질 문제 아님
     { "image_id": "uuid", "reason": "ambiguous", "album_id": "__uncertain__",  // "ambiguous"(저신뢰) | "unmatched"
-      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },
+      "face_bboxes": [ { "x": 120, "y": 48, "w": 260, "h": 300 } ],
       "causes": ["low_resolution", "small_faces"] }  // "low_resolution" | "small_faces"
   ],
   "eyes_closed": ["uuid"],      // eyes_closed 앨범 — exclude_eyes_closed=ON일 때만. 뷰어 비노출
@@ -216,7 +216,7 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
   - **매칭 사진의 미매칭 주 인물 얼굴도 uncertain**(결정 2026-07-21, `CLUSTER_UNMATCHED_MAIN_TO_UNCERTAIN=true`
     기본): 인물 앨범에 배정된 사진이라도 **주 인물 크기의 미매칭 얼굴이 남아 있으면 `uncertain`에도 노출**한다
     (인물·공용과 중복 노출 가능) — 2명이 인식됐는데 한 명만 매칭된 사진에서, 미등록 인물을 아래 "인물 앨범
-    편입"으로 수동 구제할 진입점을 연다. `face_bbox`는 그 미매칭 주 얼굴을 가리키고, 편입 reassign은 그 사진의
+    편입"으로 수동 구제할 진입점을 연다. `face_bboxes`는 그 미매칭 주 인물 얼굴들을 가리키고, 편입 reassign은 그 사진의
     미매칭(`cluster_id=None`) 얼굴만 must-link하므로 매칭된 얼굴은 건드리지 않는다. 행인(주 인물 크기 미달)·
     오검출(ADR 025)·파편(ADR 027) 미매칭은 종전대로 싣지 않는다. false면 구 정책(매칭 얼굴이 하나라도 있으면
     uncertain 제외 — 인물 앨범 우선 배타)으로 롤백.
@@ -224,14 +224,18 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
     사용자가 이 사진을 인물 앨범으로 옮기면 Spring이 `reassign(from_cluster_id=이 값)`으로 되돌려주고(6.3),
     워커가 해당 사진의 미매칭 얼굴을 must-link해 편입한다 — uncertain 얼굴은 실 `cluster_id`가 없어(`.npz`엔
     `None`) 일반 reassign 대상이 못 되므로 이 가상 앨범을 출처로 인정한다.
-  - **상세 화면 얼굴 crop — `face_bbox`**(계약 확장, 2026-07-21): 각 uncertain 항목은 그 사진을
-    uncertain으로 만든 주 얼굴의 bbox(`{x, y, w, h}`, 원본 픽셀 좌표)를 함께 싣는다. 사진 상세 화면은
-    원본을 이미 띄워놓은 상태라 앱이 이 영역을 직접 오려 "어느 얼굴이 분류가 어려웠는지"를 보여준다 —
-    워커 crop→S3 업로드(인물 앨범 썸네일 방식)는 uncertain 목록이 매 재군집 event 전체 스냅샷으로 다시
-    나와 원본 재fetch·디코드가 반복되고 고아 썸네일 정리도 필요해, 원본이 이미 손에 있는 상세 화면
-    용도에는 과잉이라 기각. 사진에 uncertain 얼굴이 여럿이면(주 얼굴+행인 등) 머릿수 자격(ADR 025·027
-    통과) 우선, 다음 최대 폭 얼굴을 고른다. **null 가능**: bbox 미상(v2 이하 `.npz` 행) — crop 없이
-    사진만 표시. 가장자리 얼굴은 bbox가 이미지 경계를 벗어날 수 있다(클램프는 표시 측 몫).
+  - **상세 화면 얼굴 crop — `face_bboxes`**(계약 교체 CHMO-407, BE#107 합의 — 종전 단일 `face_bbox`를
+    대체): 각 uncertain 항목은 그 사진을 uncertain으로 만든 **주 인물 얼굴 전부**의 bbox 배열
+    (`[{x, y, w, h}, …]`, 원본 픽셀 좌표, 폭 내림차순 — 동률은 event 행 순)을 함께 싣는다. 사진 상세
+    화면은 원본을 이미 띄워놓은 상태라 앱이 이 영역들을 직접 오려 "어느 얼굴이 분류가 어려웠는지"를
+    보여준다 — 워커 crop→S3 업로드(인물 앨범 썸네일 방식)는 uncertain 목록이 매 재군집 event 전체
+    스냅샷으로 다시 나와 원본 재fetch·디코드가 반복되고 고아 썸네일 정리도 필요해, 원본이 이미 손에
+    있는 상세 화면 용도에는 과잉이라 기각. 배열에는 주 인물 자격(머릿수 자격 ADR 025·027 통과 AND 폭
+    게이트 — 위 주 인물 판정) 얼굴만 싣는다 — 행인·오검출·파편에는 박스를 그리지 않는다. **빈 배열
+    가능**: 자격 얼굴 없음(오검출 전용 사진) 또는 bbox 미상(v2 이하 `.npz` 행) — crop 없이 사진만 표시
+    (null은 오지 않는다). 요소 2개 이상은 매칭 사진에 미매칭 주 인물이 여럿 남은 경우다(위 결정
+    2026-07-21 — 비매칭 사진은 주 인물 2명+이면 단체 규칙으로 공용에 가서 uncertain에 안 온다).
+    가장자리 얼굴은 bbox가 이미지 경계를 벗어날 수 있다(클램프는 표시 측 몫).
   - **분류가 어려운 이유 — `causes`**(계약 확장, CHMO-404): 각 uncertain 항목은 **왜** 분류가 어려웠는지
     코드 배열을 함께 싣는다 — 앱이 "분류가 어려워요" 화면에 설명·안내를 띄우는 근거다. `reason`(군집에서
     무슨 일이 있었나: ambiguous/unmatched)과 **직교하는 '왜' 축**이다. 값 3종:
