@@ -103,6 +103,11 @@ class Settings(BaseSettings):
   # 얼굴은 bbox 파편이 rel_w 0.28대로 나와 게이트 미달 — 스윕 실측 FP 0·손실 0.
   detect_big_face_rel_width: float = 0.20
   detect_big_face_redetect_score: float = 0.80
+  # 크기 인지형 confident 게이트 (ADR-028): 대형 얼굴(rel_w ≥ BIG_FACE_REL_WIDTH)은 confident 게이트를
+  # 이 값으로 올려 저score 구간을 회복 재검출로 재판정한다 — 손·종이 등 대형 오검출이 게이트 0.6을
+  # 턱걸이로 통과해 유령 앨범을 만들던 문제(event 115). 대형은 재검출이 실얼굴/오검출을 가르므로 손실
+  # 없이 FP만 떨어진다. 소형은 회복이 없어 미적용. 기본 게이트(0.6)와 같게 두면 비활성(구 동작).
+  detect_big_face_confident_score: float = 0.70
   # 재검출 랜드마크 신뢰 임계 (survey_refine_shift.py 실측): 재검출 score가 이 값 이상이면 이동량
   # 가드를 무시하고 재검출 랜드마크를 채택 — 초대형 얼굴은 bbox가 파편이라 올바른 교정도 파편 폭
   # 기준 가드에 걸려 깨진 랜드마크가 유지되던 문제(event 73 공통첩 유출·유령 앨범). 0 = 비활성.
@@ -200,6 +205,7 @@ class Settings(BaseSettings):
       fp_aspect_threshold=self.detect_fp_aspect_threshold,
       big_face_rel_width=self.detect_big_face_rel_width,
       big_face_redetect_score=self.detect_big_face_redetect_score,
+      big_face_confident_score=self.detect_big_face_confident_score,
       refine_trust_redetect_score=self.detect_refine_trust_redetect_score,
       confident_dedup_landmark_ratio=self.detect_confident_dedup_landmark_ratio,
     )

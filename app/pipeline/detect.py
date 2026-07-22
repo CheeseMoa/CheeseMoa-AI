@@ -44,6 +44,16 @@ DEFAULT_FP_ASPECT_THRESHOLD = 0.70  # 종횡비 = bbox 폭/높이 (w/h)
 # 게이트 스윕 실측(783장): 0.20으로 내려도 오검출 통과 0·기존 검출 손실 0 — 판별은 재검출 score가 한다.
 DEFAULT_BIG_FACE_REL_WIDTH = 0.20  # 이 rel_w(bbox폭/긴변) 이상의 저score 얼굴만 재검출 회복 대상
 DEFAULT_BIG_FACE_REDETECT_SCORE = 0.80  # 정규 스케일 재검출 score가 이 이상이면 실얼굴로 보고 회복
+# 크기 인지형 confident 게이트 (ADR-028, sweep_score_gate.py 실측 2026-07-22): 대형 얼굴(rel_w ≥
+# big_face_rel_width)은 confident 게이트를 이 값으로 올려 [score_threshold, 이 값) 구간을 회복 재검출로
+# 재판정한다. YuNet이 손·종이·인형 같은 대형 오검출에 저score(0.60~0.66)를 줘 게이트 0.6을 턱걸이로
+# 통과하던 문제(event 115: 손 브이포즈가 유령 앨범 생성). 대형은 재검출이 실얼굴(≥0.86)/오검출(재검출
+# 실패)을 깨끗이 가르므로(ADR-017 빈 구간) 손실 없이 FP만 떨어진다 — 전 코퍼스 1,181장에서 [0.60,0.70)
+# 대형 실얼굴 41개 전원 회복, 오검출 2개(손·종이)만 폐기. 소형(rel_w<0.20)은 회복 백스톱이 없고 실얼굴이
+# 같은 score 구간에 겹쳐(유아 0.605 vs 그림 0.686, 빈 구간 없음) score_threshold를 유지한다. 0.70 위로
+# 올려도 제거되는 대형 FP는 그대로 2개(재검출을 더 거칠 뿐)라 0.70이 최소비용 최적점. big_face 회복이
+# 꺼져 있으면 백스톱이 없어 무의미하므로 __init__에서 무시한다.
+DEFAULT_BIG_FACE_CONFIDENT_SCORE = 0.70
 # 재검출 랜드마크 신뢰 임계 (survey_refine_shift.py, 2026-07-17): 이동량 가드(_REFINE_MAX_SHIFT_RATIO)의
 # 기준이 원 bbox 폭인데, 초대형 얼굴은 YuNet이 bbox를 파편으로 그려 진짜 얼굴이 파편보다 훨씬 크다 —
 # 올바른 교정도 "파편 폭 × 0.5"를 넘어 가드에 걸리고, 깨진 원 랜드마크가 유지돼 쓰레기 임베딩이 된다
@@ -116,6 +126,10 @@ class DetectorConfig:
   # 정규 스케일 재검출해 score가 big_face_redetect_score 이상이면 되살린다. 둘 중 하나라도 0이면 비활성.
   big_face_rel_width: float = DEFAULT_BIG_FACE_REL_WIDTH
   big_face_redetect_score: float = DEFAULT_BIG_FACE_REDETECT_SCORE
+  # 크기 인지형 confident 게이트 (ADR-028): 대형 얼굴(rel_w ≥ big_face_rel_width)은 이 값 이상이어야
+  # confident로 채택하고, [score_threshold, 이 값) 저score 대형은 회복 재검출로 재판정한다 (DEFAULT
+  # 주석 참고). big_face 회복이 꺼져 있으면 무시. score_threshold와 같게 두면 비활성(구 동작).
+  big_face_confident_score: float = DEFAULT_BIG_FACE_CONFIDENT_SCORE
   # 재검출 랜드마크 신뢰 임계: 재검출 score가 이 값 이상이면 이동량 가드를 무시하고 재검출
   # 랜드마크를 채택한다 — 파편 bbox의 초대형 얼굴 교정 (DEFAULT 주석 참고). 0 = 비활성.
   refine_trust_redetect_score: float = DEFAULT_REFINE_TRUST_REDETECT_SCORE
@@ -144,6 +158,12 @@ class DetectorConfig:
       raise ValueError(f"big_face_rel_width는 [0, 1) 범위여야 합니다. 받은 값: {self.big_face_rel_width}")
     if not 0.0 <= self.big_face_redetect_score <= 1.0:
       raise ValueError(f"big_face_redetect_score는 [0, 1] 범위여야 합니다. 받은 값: {self.big_face_redetect_score}")
+    # score_threshold보다 낮으면 대형 FP를 오히려 더 통과시키는 설정 실수라 거부한다 (같게 두면 비활성).
+    if not self.score_threshold <= self.big_face_confident_score <= 1.0:
+      raise ValueError(
+        f"big_face_confident_score는 [score_threshold({self.score_threshold}), 1] 범위여야 합니다. "
+        f"받은 값: {self.big_face_confident_score}"
+      )
     if not 0.0 <= self.refine_trust_redetect_score <= 1.0:
       raise ValueError(
         f"refine_trust_redetect_score는 [0, 1] 범위여야 합니다. 받은 값: {self.refine_trust_redetect_score}"
@@ -208,6 +228,13 @@ class FaceDetector:
     self._big_face_enabled = resolved_config.big_face_rel_width > 0.0 and resolved_config.big_face_redetect_score > 0.0
     self._big_face_rel_width = resolved_config.big_face_rel_width
     self._big_face_redetect_score = resolved_config.big_face_redetect_score
+    # 대형 얼굴 confident 게이트 (ADR-028): 회복이 켜져 있을 때만 상향한다 — 회복 백스톱이 없으면
+    # 상향은 대형 실얼굴을 회복 없이 잃으므로 기본 게이트를 그대로 쓴다. score_threshold와 같으면 구 동작.
+    self._large_gate = (
+      max(self._score_threshold, resolved_config.big_face_confident_score)
+      if self._big_face_enabled
+      else self._score_threshold
+    )
     model_score_threshold = (
       min(resolved_config.score_threshold, _BIG_FACE_MODEL_FLOOR)
       if self._big_face_enabled
@@ -252,17 +279,21 @@ class FaceDetector:
     # 배경 인물 필터의 기준은 원본 좌표계 bbox 폭 — 검출용 축소(max_side)와 무관하게 동작한다
     long_side = max(h, w)
     min_face_w_px = self._min_face_rel_width * long_side
+    big_face_w_px = self._big_face_rel_width * long_side  # 회복·대형 게이트 경계 (big_face 비활성 시 미사용)
     confident: list[DetectedFace] = []
     pending: list[DetectedFace] = []  # 저score 대형 후보 — 정규 스케일 재검출로 keep/drop 판정 (ADR-017)
     for row in raw:
       face = self._to_detected_face(row, inv, w, h)
       if face is None or face.bbox[2] < min_face_w_px or self._is_large_false_positive(face):
         continue
-      if face.score >= self._score_threshold:
+      # 대형 얼굴은 상향 게이트(_large_gate), 소형은 기본 게이트 — 대형 저score는 회복 재검출로 재판정한다
+      # (ADR-028). 손·종이 등 대형 오검출이 게이트 0.6을 턱걸이로 넘어 유령 앨범을 만들던 문제.
+      is_big = self._big_face_enabled and face.bbox[2] >= big_face_w_px
+      if face.score >= (self._large_gate if is_big else self._score_threshold):
         confident.append(face)
-      elif self._big_face_enabled and face.bbox[2] >= self._big_face_rel_width * long_side:
+      elif is_big:
         pending.append(face)
-      # else: 정상 크기 저score → 폐기 (모델 gate가 회복 활성 시 바닥까지 내려가 여기 도달)
+      # else: 소형 저score → 폐기 (회복 대상 아님, 모델 gate가 회복 활성 시 바닥까지 내려가 여기 도달)
 
     # 정제·회복은 raw 순회 종료 후에 시작한다 — _refine_face/_recover_large_face의 setInputSize/detect
     # 재호출이 위 검출 상태를 덮어쓰므로 순서를 바꾸면 안 된다. 축소본 frame이 아니라 원본 image를 넘겨

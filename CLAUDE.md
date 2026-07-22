@@ -39,7 +39,11 @@ score<0.78 AND 종횡비(w/h)<0.70 제거, [ADR 015](docs/decisions/015-detectio
 + confident 파편 디둡 — 초대형 얼굴의 파편 박스 2개가 둘 다 score 게이트를 통과하면(YuNet NMS도
 IoU 0.297<0.3으로 미발동) 한 사람이 두 명으로 검출됨, 정제 랜드마크 중심거리 < 0.1×얼굴폭인 대형
 (>224px) 쌍은 score 최상 박스만 남김 — 1인 셀피가 "주 인물 2명 단체"로 공용 앨범에 노출되던 문제
-(event 105), [ADR 027](docs/decisions/027-duplicate-face-fragment-dedup.md)) →
+(event 105), [ADR 027](docs/decisions/027-duplicate-face-fragment-dedup.md)
++ 크기 인지형 confident 게이트 — 대형 얼굴(rel_w≥0.20)은 confident 게이트를 0.70으로 올려 저score
+[0.6,0.70) 구간을 회복 재검출로 재판정(재검출이 실얼굴 살리고 오검출 폐기), 소형은 회복 백스톱이 없고
+실얼굴이 같은 score 구간에 겹쳐 0.6 유지 — 손·종이 등 대형 오검출이 게이트 0.6을 턱걸이로 통과해
+유령 앨범을 만들던 문제(event 115 손 브이포즈), [ADR 028](docs/decisions/028-size-aware-confident-score-gate.md)) →
 face_align(직접 구현 Umeyama, 112×112 ArcFace 기준점) →
 AuraFace(512-dim 임베딩) → 품질 게이트(눈감음 CNN + 흔들림 Laplacian, 토글 ON시 eyes_closed/blurry로 분리·
 재군집 제외) → HDBSCAN(PoC numpy 이식본, cosine, epsilon=0.15, event 전체 임베딩 재군집) → cluster_id 재조정
@@ -321,6 +325,21 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **크기 인지형 confident 게이트 — 대형 오검출 유령 앨범 해소** (2026-07-22, CHMO-403,
+  [ADR 028](docs/decisions/028-size-aware-confident-score-gate.md)) — event 115에서 사람은 2명인데
+  앨범이 3개 생기고 3번째 앨범 썸네일이 "손"으로 뜨던 문제. YuNet이 손 브이(V)포즈를 얼굴로 약하게
+  오검출(score 0.640)했는데 게이트 0.6을 턱걸이로 넘었고, 근중복 재업로드로 두 번 잡혀 서로 닮은(0.590)
+  두 오검출이 min_cluster_size=2를 채워 별도 인물 앨범으로 승격됐다. 기존 방어막(ADR 013/015/025/027)
+  전부 미발동. 해법: confident 게이트를 크기로 나눈다 — 대형(rel_w≥0.20)은 0.70으로 올려 저score
+  [0.6,0.70) 구간을 ADR 017 회복(정규 스케일 재검출)으로 재판정, 소형은 0.6 유지. 게이트 상향이 과거
+  막혔던 이유(YuNet이 초근접 대형 실얼굴에도 저score)는 ADR 017이 회복으로 풀어, 대형은 재검출이
+  실얼굴(≥0.86)/오검출(재검출 실패)을 깨끗이 가른다 — 회복은 대형만이라 소형은 백스톱 없고 실얼굴이
+  같은 score 구간에 겹쳐(유아 0.605 vs 그림 0.686) 상향 불가. 실측(코퍼스 1,181장): 대형 [0.6,0.70)
+  실얼굴 41개 전원 회복, 오검출 2개(event 115 손·event 5 손글씨 장부)만 폐기. 검증(구동작 0.6 vs 신규
+  0.70 전 코퍼스 detect diff): 대형 실얼굴 손실 0·소형 폐기 0·추가 0, event 115 손 앨범 해소(대형 손
+  폐기로 min_cluster_size 미달). `DETECT_BIG_FACE_CONFIDENT_SCORE`(0.6=비활성), 도구
+  `scripts/sweep_score_gate.py`·`scripts/verify_size_gate.py`. 한계: 소형 손(rel_w 19.6%)은 잔존하나
+  단독이라 앨범 미형성; 저장 이벤트는 재검출 트리거 전까지 미치유(ADR 027 잔여와 동류).
 - **매칭 사진의 미매칭 주 인물 얼굴 uncertain 동시 노출 — 미등록 인물 수동 구제 진입점** (2026-07-21,
   feature-spec §6.2 결정) — 2명이 인식된 사진에서 한 명만 매칭되면 사진이 인물 앨범(+공용)에만 실려,
   미매칭 인물을 "분류가 어려워요 → 인물 앨범 편입"(`__uncertain__` reassign)으로 수동 구제할 진입점이
