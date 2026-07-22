@@ -284,6 +284,16 @@ class UncertainImage(_MessageBase):
   # 이 사진을 uncertain으로 만든 주 얼굴의 bbox — 앱 사진 상세 화면의 얼굴 crop용 (계약 확장,
   # feature-spec §6.2). None = bbox 미상(v2 이하 .npz 행) — 앱은 crop 없이 사진만 보여준다.
   face_bbox: FaceBox | None = None
+  # 이 사진이 왜 분류가 어려웠는지 — 앱이 "분류가 어려워요" 화면에 설명·안내 문구를 띄우는 근거 (계약 확장,
+  # CHMO-404). reason(군집에서 무슨 일)과 직교하는 '왜' 축이다:
+  #   low_resolution    = 원본 해상도가 낮아 얼굴이 작게 잡힘 (원본으로 다시 올리면 개선 — 유일한 actionable 신호)
+  #   small_faces       = 해상도는 충분하나 얼굴이 멀리·작게 찍힘 (재업로드로 해결 안 됨, 참고용)
+  #   single_appearance = 얼굴은 선명한데(품질 정상) 이 인물이 이벤트에 한 번만 등장 → 묶을 짝이 없어 앨범 미생성
+  #                       (앨범은 2장+ 필요). "더 나오면 자동 앨범 / 직접 지정"이 안내 — 재업로드 대상 아님
+  # 빈 배열 = 품질·데이터 문제 아님(예: 두 인물 사이 저신뢰 ambiguous, 폭 미상 구버전 행) → 앱은 "직접 인물
+  # 앨범 지정"만 안내. 문구·톤은 앱 소유 — 워커는 코드만 낸다. low_resolution은 small_faces와 동반될 때만 실리고
+  # (둘 다면 앞이 우선 안내), single_appearance는 품질 정상 + unmatched일 때만(작은 얼굴은 품질 원인이 우선).
+  causes: list[Literal["low_resolution", "small_faces", "single_appearance"]] = Field(default_factory=list)
 
 
 class FailedImage(_MessageBase):
@@ -450,8 +460,13 @@ if __name__ == "__main__":
     ],
     common_album=["img-9"],
     uncertain=[
-      UncertainImage(image_id="img-5", reason="ambiguous", face_bbox=FaceBox(x=120, y=48, w=260, h=300)),
-      UncertainImage(image_id="img-6", reason="unmatched"),
+      UncertainImage(
+        image_id="img-5",
+        reason="ambiguous",
+        face_bbox=FaceBox(x=120, y=48, w=260, h=300),
+        causes=["low_resolution", "small_faces"],
+      ),
+      UncertainImage(image_id="img-6", reason="unmatched"),  # causes 생략 = 품질 문제 아님(빈 배열)
     ],
     eyes_closed=["img-3"],
     blurry=["img-4"],
@@ -475,6 +490,11 @@ if __name__ == "__main__":
     "uncertain face_bbox — 동봉 시 직렬화 포함, 생략 시 None (구버전 하위호환)",
     '"face_bbox":{"x":120,"y":48,"w":260,"h":300}' in result.model_dump_json().replace(" ", "")
     and result.uncertain[1].face_bbox is None,
+  )
+  check(
+    "uncertain causes — 동봉 시 직렬화 포함, 생략 시 빈 배열 (CHMO-404 계약 확장)",
+    '"causes":["low_resolution","small_faces"]' in result.model_dump_json().replace(" ", "")
+    and result.uncertain[1].causes == [],
   )
   check("failed 결과 최소 구성", ClassifyResult(job_id="job-9", status="failed").clusters == [])
 

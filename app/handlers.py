@@ -281,7 +281,7 @@ class JobHandlers:
     eyes_closed_images: list[str] = []
     blurry_images: list[str] = []
     failed_images: list[FailedImage] = []
-    new_rows: list[tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str]] = []
+    new_rows: list[tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str, float]] = []
     # 진행률 발행 (CHMO-274): 이미지 루프가 job 비용의 사실상 전부라 여기서 처리 장수를 흘려보낸다.
     # 루프 진입 전 0/total 1회 — 백엔드가 즉시 QUEUED→PROCESSING으로 바를 띄우게 한다.
     total = len(request.images)
@@ -320,8 +320,11 @@ class JobHandlers:
         continue
       widths = extracted.face_widths or [0.0] * len(extracted.embeddings)
       bboxes = extracted.bboxes or [(0, 0, 0, 0)] * len(extracted.embeddings)
+      long_side = float(
+        max(image.shape[0], image.shape[1])
+      )  # 원본 긴 변 px — uncertain 저해상도 원인 판정용 (CHMO-404)
       new_rows.extend(
-        (self._new_face_id(), ref.image_id, embedding, width, tuple(float(v) for v in bbox), ref.s3_key)
+        (self._new_face_id(), ref.image_id, embedding, width, tuple(float(v) for v in bbox), ref.s3_key, long_side)
         for embedding, width, bbox in zip(extracted.embeddings, widths, bboxes)
       )
 
@@ -649,6 +652,11 @@ class JobHandlers:
     for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths)):
       if counted[index]:
         max_width_of[photo_id] = max(max_width_of.get(photo_id, 0.0), width)
+    # uncertain 품질 원인(CHMO-404)용: 사진별 원본 긴 변 px (같은 사진 행은 같은 값, 0=미상이라 제외 = v3 이하 .npz)
+    long_side_of: dict[str, float] = {}
+    for photo_id, side in zip(event.photo_ids, event.image_long_sides):
+      if side > 0:
+        long_side_of[photo_id] = side
     main_face = [
       counted[index] and (ratio <= 0 or width >= max_width_of[photo_id] * ratio)
       for index, (photo_id, width) in enumerate(zip(event.photo_ids, event.face_widths))
@@ -697,7 +705,12 @@ class JobHandlers:
           continue
         routed.add(photo_id)
         uncertain.append(
-          UncertainImage(image_id=photo_id, reason=reason, face_bbox=_uncertain_face_box(event, crop_face_of[photo_id]))
+          UncertainImage(
+            image_id=photo_id,
+            reason=reason,
+            face_bbox=_uncertain_face_box(event, crop_face_of[photo_id]),
+            causes=self._uncertain_causes(max_width_of.get(photo_id, 0.0), long_side_of.get(photo_id, 0.0), reason),
+          )
         )
 
     retired_cluster_ids = list(dict.fromkeys([*snapshot.retired_cluster_ids, *extra_retired]))
@@ -714,6 +727,30 @@ class JobHandlers:
       failed_images=list(failed_images),
       retired_cluster_ids=retired_cluster_ids,
     )
+
+  def _uncertain_causes(self, max_main_face_width: float, long_side: float, reason: str) -> list[str]:
+    """uncertain 사진이 왜 분류가 어려웠는지 원인 코드 (CHMO-404) — 앱이 "분류가 어려워요" 화면에 설명·안내를 띄우는 근거.
+
+    reason(군집에서 무슨 일: ambiguous/unmatched)과 직교하는 '왜' 축이다. 세 원인:
+      small_faces       = 주 얼굴(counted 최대 폭)이 small_face_px 미만 — 멀리·작게 찍힘(참고용)
+      low_resolution    = 그중 원본 긴 변이 low_res_long_side 미만 — 저해상도가 작은 얼굴을 유발("원본으로 다시",
+                          유일 actionable). small_faces 없이는 실리지 않는다(멀쩡한 사진에 "저해상도" 오안내 차단).
+      single_appearance = 주 얼굴이 충분히 크고(품질 정상) 아무와도 매칭 안 됨(unmatched) — 이 인물이 이벤트에
+                          한 번만 등장해 묶을 짝이 없음(앨범은 2장+ 필요, 화질 정상이라 재업로드가 아니라 "더
+                          나오면 자동 앨범/직접 지정"이 안내다). ambiguous(두 인물 사이)는 한 번 등장이 아니라 제외.
+    폭·긴 변 미상(0, v1/v3 이하 .npz 행)이면 판정 불가로 그 원인은 빠진다. small_face_px=0이면 기능 전체 비활성.
+    """
+    small_px = self._cluster_config.uncertain_small_face_px
+    if small_px <= 0 or max_main_face_width <= 0.0:
+      return []  # 비활성 또는 폭 미상(v1 .npz) → 판단 근거 없음
+    if max_main_face_width < small_px:  # 작은 얼굴 → 품질이 원인
+      low_res = self._cluster_config.uncertain_low_res_long_side
+      if low_res > 0 and 0.0 < long_side < low_res:
+        return ["low_resolution", "small_faces"]  # 저해상도가 작은 얼굴을 유발 — 재업로드가 actionable(우선 안내)
+      return ["small_faces"]  # 해상도는 충분하나 멀리·작게 찍힘 — 재업로드로 해결 안 됨(참고용)
+    if reason == "unmatched":  # 선명한 얼굴(품질 정상)인데 아무와도 매칭 안 됨 = 이 이벤트에 한 번만 등장
+      return ["single_appearance"]
+    return []  # 큰 얼굴 + ambiguous(두 인물 사이) → 깔끔한 원인 없음
 
   def _headcount_eligible(self, event: EventEmbeddings) -> list[bool]:
     """단체 판정 머릿수 자격 — 이중 검출(ADR 027)과 오검출(ADR 025)을 머릿수에서 뺀다.
@@ -1438,6 +1475,13 @@ if __name__ == "__main__":
     walkin.uncertain[0].face_bbox == FaceBox(x=0, y=0, w=120, h=120),
   )
   check(
+    # single_appearance는 counted(실인물) 얼굴에만 붙는다 — 합성 orthogonal 벡터는 최근접 유사도 0이라
+    # ADR-025 FP 게이트에 걸려 counted 얼굴이 없다(→ max_width 0 → causes []). 실 데이터의 외톨이 실얼굴은
+    # 최근접 ~0.3(> 0.185)이라 counted → single_appearance (아래 FP 게이트 off 종단 테스트로 재현).
+    "uncertain causes: FP 게이트에 걸린 합성 얼굴은 counted 아님 → 원인 없음 (CHMO-404)",
+    walkin.uncertain[0].causes == [],
+  )
+  check(
     "얼굴 폭이 .npz에 저장·왕복됨",
     store.load("event-9").face_widths == (120.0, 40.0),
   )
@@ -1655,6 +1699,72 @@ if __name__ == "__main__":
   check(
     "동시 노출 비활성(False): 매칭 얼굴 있는 사진은 uncertain 제외 — 구 정책 재현 (검증의 적대적 성질 유지)",
     legacy.uncertain == [],
+  )
+
+  # ㉑ uncertain 품질 원인 (CHMO-404): 저해상도(긴 변 < 2000)로 주 얼굴이 작게(< 100px) 잡힌 미매칭 사진은
+  # uncertain에 low_resolution·small_faces 원인을 실어, 앱이 "원본으로 다시 올리세요" 안내를 띄우게 한다.
+  # fake_image는 shape (2,16,3)이라 긴 변 16 < 2000 — 작은 얼굴이면 저해상도 분기가 자동으로 잡힌다.
+  image_source.images["img-lowres.jpg"] = fake_image([(13, 7, 80)])  # 미등록 1인, 작은 얼굴(80px < 100)
+  lowres_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-404",
+      "group_id": "group-1",
+      "event_id": "event-404",
+      "images": [{"image_id": "img-lowres", "s3_key": "img-lowres.jpg"}],
+    }
+  )
+  lowres = handlers.handle(parse_inbound_message(lowres_body))
+  check(
+    "uncertain 품질 원인: 저해상도+작은 얼굴 → causes=[low_resolution, small_faces]",
+    [(u.image_id, u.reason, u.causes) for u in lowres.uncertain]
+    == [("img-lowres", "unmatched", ["low_resolution", "small_faces"])],
+  )
+  check("이미지 긴 변이 .npz에 저장·왕복됨 (v4)", store.load("event-404").image_long_sides == (16.0,))
+  check(
+    "uncertain causes 판정 분기 (single_appearance·품질·ambiguous·폭미상)",
+    handlers._uncertain_causes(120.0, 16.0, "unmatched") == ["single_appearance"]  # 선명+매칭없음 → 한 번 등장
+    and handlers._uncertain_causes(120.0, 16.0, "ambiguous") == []  # 선명하지만 두 인물 사이 → 원인 없음
+    and handlers._uncertain_causes(80.0, 16.0, "unmatched") == ["low_resolution", "small_faces"]  # 작은 얼굴+저해상도
+    and handlers._uncertain_causes(80.0, 4000.0, "unmatched") == ["small_faces"]  # 작은 얼굴+고해상도 → 재업로드 무효
+    and handlers._uncertain_causes(80.0, 0.0, "unmatched")
+    == ["small_faces"]  # 긴 변 미상(v3 이하) → low_resolution 미판정
+    and handlers._uncertain_causes(0.0, 16.0, "unmatched") == [],  # 폭 미상(v1) → 판단 근거 없음
+  )
+  disabled_causes = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    cluster_config=ClusterConfig(uncertain_small_face_px=0.0),
+  )
+  check(
+    "uncertain causes 비활성(small_face_px=0): 항상 빈 배열 (롤백 스위치)",
+    disabled_causes._uncertain_causes(80.0, 16.0, "unmatched") == []
+    and disabled_causes._uncertain_causes(120.0, 16.0, "unmatched") == [],
+  )
+  # single_appearance 종단: 선명한 대형 얼굴 1인이 한 번만 등장하면 앨범이 안 생긴다(2장+ 필요) — 화질은
+  # 정상이라 재업로드가 아니라 "더 나오면 자동 앨범/직접 지정" 안내다. counted 실인물 얼굴에만 붙으므로
+  # FP 게이트를 끄고(실 데이터 외톨이 실얼굴의 counted 상태 재현) 검증한다.
+  solo_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    cluster_config=ClusterConfig(common_face_min_similarity=0.0),  # FP 게이트 off = 모든 얼굴 counted
+  )
+  image_source.images["img-solo.jpg"] = fake_image([(14, 3, 200)])  # 선명한 대형 얼굴(200px) 1인, 한 번 등장
+  solo_body = json.dumps(
+    {
+      "type": "classify_request",
+      "job_id": "job-solo",
+      "group_id": "group-1",
+      "event_id": "event-solo",
+      "images": [{"image_id": "img-solo", "s3_key": "img-solo.jpg"}],
+    }
+  )
+  solo = solo_handlers.handle(parse_inbound_message(solo_body))
+  check(
+    "single_appearance 종단: 선명한 대형 얼굴 1인(한 번 등장) → causes=[single_appearance]",
+    [(u.image_id, u.reason, u.causes) for u in solo.uncertain] == [("img-solo", "unmatched", ["single_appearance"])],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
