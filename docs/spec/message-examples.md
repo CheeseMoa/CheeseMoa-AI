@@ -143,10 +143,13 @@
   "uncertain": [                                  // "분류가 어려워요" — 뷰어 비노출
     // album_id: 이 사진을 인물 앨범으로 옮길 때 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id
     // face_bbox: 주 얼굴 bbox(원본 px, x·y=좌상단) — 앱 상세 화면 얼굴 crop용 (아래 註)
+    // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거 (아래 註)
     { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__",    // 두 인물 사이 저신뢰
-      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 } },
+      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },
+      "causes": ["low_resolution", "small_faces"] },  // 저해상도라 얼굴이 작게 잡힘 → "원본으로 다시"
     { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__",    // 얼굴은 있으나 인물 미매칭 (예: 행인)
-      "face_bbox": null }                          // null = bbox 미상(구버전 .npz 행) — crop 없이 사진만 표시
+      "face_bbox": null,                           // null = bbox 미상(구버전 .npz 행) — crop 없이 사진만 표시
+      "causes": [] }                               // 빈 배열 = 품질 문제 아님(예: 고해상도 미등록 인물)
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
   "blurry": ["img-4"],                            // exclude_blurry=ON일 때만 — 뷰어 비노출
@@ -171,6 +174,15 @@
 - `uncertain`은 `clusters`·`common_album`과 **중복 노출될 수 있다**(계약 확장, 결정 2026-07-21): 인물
   앨범에 배정된 사진이라도 주 인물 크기의 미매칭 얼굴이 남아 있으면 uncertain에도 실린다 — 미등록
   인물을 `__uncertain__` reassign으로 수동 편입할 진입점. 상세는 [feature-spec §6.2](feature-spec.md).
+- `causes`(계약 확장, CHMO-404): uncertain 항목이 **왜** 분류가 어려웠는지 — `reason`(군집에서 무슨 일이
+  있었나: ambiguous/unmatched)과 직교하는 '왜' 축이다. 코드만 오고 **문구·톤은 앱이 소유**한다(Spring은
+  그대로 relay). 값 3종:
+  - `low_resolution`: 원본 해상도가 낮아 얼굴이 작게 잡힘 — **"원본으로 다시 올리세요"**가 유효한 유일 actionable.
+  - `small_faces`: 해상도는 충분하나 멀리·작게 찍힘 — 재업로드로 해결 안 됨(참고용). `low_resolution`은 항상 이것과 동반(둘 다면 앞이 우선).
+  - `single_appearance`: 얼굴은 선명한데 이 인물이 **이벤트에 한 번만 등장** → 묶을 짝이 없어 앨범 미생성(앨범은 2장+ 필요). 재업로드가 아니라 **"더 나오면 자동 앨범 / 직접 지정"**이 안내. counted 실인물 얼굴에만 붙는다(오검출 FP 제외).
+  **빈 배열** = 품질·데이터 문제 아님(예: 두 인물 사이 저신뢰 ambiguous, 폭 미상 구버전 행) → 앱은 "직접 인물
+  앨범 지정"만 안내. 임계는 `CLUSTER_UNCERTAIN_SMALL_FACE_PX`(100)·`CLUSTER_UNCERTAIN_LOW_RES_LONG_SIDE`(2000),
+  전자 0이면 기능 비활성. 상세는 [feature-spec §6.2](feature-spec.md).
 - 실패 케이스를 포함한 계약 검증 전체는 `python -m app.schemas.messages`로 실행할 수 있다.
 
 ## ⑤ 분류 진행률 — `progress` (AI → Spring, progress 큐, CHMO-274)

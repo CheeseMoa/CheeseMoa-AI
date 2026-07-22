@@ -325,6 +325,25 @@ AWS CLI v2 설치(`brew install awscli` / `winget install -e --id Amazon.AWSCLI`
    채택 시 자동 해소되는 항목
 
 ### 완료된 목표
+- **uncertain 품질 원인 `causes` 계약 확장 — "분류가 어려워요" 설명글 근거** (2026-07-22, CHMO-404) —
+  저해상도·초소형 얼굴(유아 단체사진 등) 때문에 대량 미배정→uncertain/공용으로 흩어진 결과를 사용자가
+  "왜 이렇게 됐지?" 물을 때, 앱이 그 자리에서 이유를 설명하고 재업로드를 넛지할 근거가 없던 문제. 진단으로
+  근본 원인 확정: 스택(워커·Spring·웹)은 사진을 축소하지 않으며(워커 `detect_max_side=2000`>업로드 크기,
+  Spring은 presigned 직PUT, 웹은 원본 File PUT), 저해상도는 사용자가 이미 압축된 사진(메신저 전달본 등)을
+  올려서 생긴 업로드 이전 손실 — 워커가 복구 불가. 해법: `UncertainImage`에 `causes: list[Literal[
+  "low_resolution","small_faces"]]` 추가(계약 확장) — 워커는 **코드만** 내고 문구·톤은 앱 소유, Spring은
+  relay. 코드 3종: `low_resolution`(주 얼굴이 저해상도로 작게 잡힘 — "원본으로 다시"가 유효한 유일
+  actionable, 항상 `small_faces` 동반)·`small_faces`(고해상도인데 멀리·작게 — 재업로드 무효, 참고용)·
+  `single_appearance`(선명한 대형 얼굴인데 이 인물이 이벤트에 한 번만 등장 → 묶을 짝이 없어 앨범 미생성,
+  "더 나오면 자동 앨범/직접 지정" 안내, counted 실인물만). 직교 분리로 멀쩡한 사진 오안내 차단. 빈
+  배열=품질·데이터 문제 아님(예: 두 인물 사이 ambiguous)→"직접 지정"만 안내. **공용엔 안 싣고
+  uncertain에만** (공용은 실패가 아니라 정상 목적지). 판정은 결과 조립(`_assemble_result`)에서 저장 데이터로
+  전 경로 일관 계산 — 이를 위해 **.npz 스키마 v4**(image_long_sides 열, v3 이하는 긴 변 0=미상 폴백으로
+  low_resolution만 빠지고 small_faces는 face_widths로 유지). 임계는 실측 근거(얼굴폭 매칭 무릎 ~100px,
+  단체사진 얼굴 rel_w ~5%라 100px엔 긴 변 ~2000px): `CLUSTER_UNCERTAIN_SMALL_FACE_PX`(100, 0=기능 전체
+  비활성)·`CLUSTER_UNCERTAIN_LOW_RES_LONG_SIDE`(2000, 0=low_resolution만 비활성). 자가검증 handlers 57건
+  (신규 ㉑ 5건 — 저해상도·4분기·비활성·single_appearance 종단)·schemas 35건(신규 1)·storage 27건(신규 v4
+  왕복·하위호환 3)·스모크 통과. Spring·FE엔 필드 하나 추가 통지만 필요.
 - **크기 인지형 confident 게이트 — 대형 오검출 유령 앨범 해소** (2026-07-22, CHMO-403,
   [ADR 028](docs/decisions/028-size-aware-confident-score-gate.md)) — event 115에서 사람은 2명인데
   앨범이 3개 생기고 3번째 앨범 썸네일이 "손"으로 뜨던 문제. YuNet이 손 브이(V)포즈를 얼굴로 약하게

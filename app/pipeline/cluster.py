@@ -138,6 +138,13 @@ class ClusterConfig:
   # 쌍 758개): 이중 검출 전부 0.978~0.979 vs 같은사진 타인 쌍 최고 0.756 — 0.95가 빈 구간 안.
   # 0이면 비활성(기존 동작 — 행 수 그대로 센다).
   common_duplicate_face_similarity: float = 0.95
+  # uncertain 사진의 품질 원인(UncertainImage.causes) 판정 임계 — 군집엔 영향 없고 핸들러가 결과 조립 때
+  # 읽는다 (CHMO-404). 이 사진 주 얼굴(counted 최대 폭)이 이 px 미만이면 small_faces, 그중 원본 긴 변이
+  # uncertain_low_res_long_side 미만이면 low_resolution도 함께 실린다. 실측 근거: 얼굴폭 매칭 무릎 ~100px
+  # (이벤트 중앙 얼굴폭 <100px면 배정률 20~40%, ≥450px면 70~100%), 단체사진 얼굴 rel_w 중앙 ~5%라
+  # 100px 얼굴엔 긴 변 ~2000px 필요(≤1080 이벤트 배정률 20%, ≥4896 이벤트 70~100%). 0이면 비활성.
+  uncertain_small_face_px: float = 100.0
+  uncertain_low_res_long_side: float = 2000.0
 
   def __post_init__(self) -> None:
     # 이식한 HDBSCAN이 min_cluster_size < 2에서 raise하므로 생성 시점에 같은 계약을 강제한다
@@ -165,6 +172,10 @@ class ClusterConfig:
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
         raise ValueError(f"{name}은(는) [0, 1] 범위여야 합니다. 받은 값: {value}")
+    for name in ("uncertain_small_face_px", "uncertain_low_res_long_side"):
+      value = getattr(self, name)  # px 임계라 [0,1]이 아니다 — 0(비활성) 이상의 유한값만 강제
+      if not np.isfinite(value) or value < 0.0:
+        raise ValueError(f"{name}은(는) 0 이상의 유한값이어야 합니다. 받은 값: {value}")
     if self.cluster_selection_epsilon > 2.0:
       # cosine 거리 범위는 [0, 2] — 밖의 값은 기하학적으로 무의미한데도 조용히 동작해 군집 선택을 왜곡한다
       raise ValueError(

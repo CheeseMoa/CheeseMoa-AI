@@ -168,8 +168,10 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
   "uncertain": [                // uncertain("분류가 어려워요") — 뷰어 비노출
     // album_id: 인물 앨범 편입 시 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id ("__uncertain__")
     // face_bbox: 주 얼굴 bbox(원본 px) — 앱 상세 화면 얼굴 crop용. null 가능(v2 이하 .npz 행)
+    // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거. 빈 배열 = 품질 문제 아님
     { "image_id": "uuid", "reason": "ambiguous", "album_id": "__uncertain__",  // "ambiguous"(저신뢰) | "unmatched"
-      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 } }
+      "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },
+      "causes": ["low_resolution", "small_faces"] }  // "low_resolution" | "small_faces"
   ],
   "eyes_closed": ["uuid"],      // eyes_closed 앨범 — exclude_eyes_closed=ON일 때만. 뷰어 비노출
   "blurry": ["uuid"],           // blurry 앨범 — exclude_blurry=ON일 때만. 뷰어 비노출
@@ -230,6 +232,21 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
     용도에는 과잉이라 기각. 사진에 uncertain 얼굴이 여럿이면(주 얼굴+행인 등) 머릿수 자격(ADR 025·027
     통과) 우선, 다음 최대 폭 얼굴을 고른다. **null 가능**: bbox 미상(v2 이하 `.npz` 행) — crop 없이
     사진만 표시. 가장자리 얼굴은 bbox가 이미지 경계를 벗어날 수 있다(클램프는 표시 측 몫).
+  - **분류가 어려운 이유 — `causes`**(계약 확장, CHMO-404): 각 uncertain 항목은 **왜** 분류가 어려웠는지
+    코드 배열을 함께 싣는다 — 앱이 "분류가 어려워요" 화면에 설명·안내를 띄우는 근거다. `reason`(군집에서
+    무슨 일이 있었나: ambiguous/unmatched)과 **직교하는 '왜' 축**이다. 값 3종:
+    - `low_resolution`: 원본 해상도가 낮아 주 얼굴이 작게 잡힘 — **"원본으로 다시 올리세요"**가 유효한 유일 actionable.
+    - `small_faces`: 해상도는 충분하나 얼굴이 멀리·작게 찍힘 — 재업로드로 해결 안 됨(참고용). `low_resolution`은
+      항상 이것과 동반(멀쩡한 사진에 "저해상도" 오안내 차단 — 저해상도가 실제로 작은 얼굴을 유발했을 때만).
+    - `single_appearance`: 주 얼굴이 충분히 크고(품질 정상) 아무와도 매칭 안 됨(unmatched) = 이 인물이
+      **이벤트에 한 번만 등장** → 묶을 짝이 없어 앨범 미생성(앨범은 2장+ 필요). 재업로드가 아니라 **"더 나오면
+      자동 앨범 / 직접 지정"**이 안내. counted 실인물 얼굴에만 붙는다(오검출 FP는 애초에 머릿수에서 빠짐, ADR 025).
+    **빈 배열** = 품질·데이터 문제 아님(예: 두 인물 사이 저신뢰 ambiguous, 폭 미상 구버전 행) → 앱은
+    "직접 인물 앨범 지정"만 안내한다. 판정은 그 사진 주 얼굴(counted 최대 폭)이 `CLUSTER_UNCERTAIN_SMALL_FACE_PX`
+    (100) 미만이면 `small_faces`(+긴 변 `CLUSTER_UNCERTAIN_LOW_RES_LONG_SIDE`(2000) 미만이면 `low_resolution`),
+    100 이상이고 unmatched면 `single_appearance` — 실측 근거(얼굴폭 매칭 무릎 ~100px, 단체사진 얼굴 rel_w
+    ~5%라 100px엔 긴 변 ~2000px 필요). 폭·긴 변 미상(구버전 `.npz` 행: 폭은 v1, 긴 변은 v3 이하)이면 그
+    원인은 빠진다. **문구·톤은 앱 소유** — 워커는 코드만 내고 Spring은 그대로 relay한다. `SMALL_FACE_PX=0`이면 기능 전체 비활성.
   - (TBD: `back`(뒷모습)·`duplicate`(중복)를 `uncertain` 사유로 추가할지는 백엔드와 합의)
 - `eyes_closed` / `blurry`: **눈감음·흔들림은 "분류가 어려워요"와 별개의 독립 앨범**이다(제품 명세 정정 반영). 업로드 토글(6.1 `options`)이 ON일 때만 인물 앨범 대신 이 앨범으로 라우팅하고, OFF면 분리하지 않는다.
 - `failed_images`: 타임아웃 등 **기술적 실패**. 화질·매칭 문제인 위 앨범들과 구분한다(재시도 대상).

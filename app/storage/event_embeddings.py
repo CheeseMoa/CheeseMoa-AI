@@ -22,7 +22,10 @@ EMBED_DIM = 512
 # v3: bboxes(x,y,w,h px)·s3_keys(원본 객체 키) 열 추가 — 대표 얼굴 썸네일 crop의 원천 (CHMO-335).
 # v2 이하 파일은 bbox 전부 0·s3_key ""로 로드된다: 폭 0/키 없음 행은 썸네일 대표 후보 자격이 없어
 # 해당 행만으로 구성된 클러스터는 썸네일 None — 종전(썸네일 없음) 동작과 일치하는 안전 폴백.
-SCHEMA_VERSION = 3
+# v4: image_long_sides(원본 이미지 긴 변 px) 열 추가 — uncertain 품질 원인(low_resolution) 판정용 (CHMO-404).
+# v3 이하 파일은 긴 변 0(미상)으로 로드된다: 0인 행은 low_resolution을 판정할 수 없어 그 원인만 빠질 뿐
+# (small_faces는 face_widths로 여전히 판정), 종전 동작과 일치하는 안전 폴백.
+SCHEMA_VERSION = 4
 # numpy 문자열 배열에는 null이 없어 "직전 배정 없음"을 빈 문자열로 인코딩한다 (ADR-007)
 _NO_CLUSTER = ""
 _ID_KEYS = ("face_ids", "photo_ids", "cluster_ids")
@@ -70,6 +73,9 @@ class EventEmbeddings:
     tuple[float, float, float, float], ...
   ] = ()  # 길이 N — (x, y, w, h) 원본 px (전부 0 = 미상, v2 이하 폴백)
   s3_keys: tuple[str, ...] = ()  # 길이 N — 원본 이미지 S3 키 ("" = 미상, v2 이하 폴백). 썸네일 재fetch용
+  image_long_sides: tuple[
+    float, ...
+  ] = ()  # 길이 N — 원본 이미지 긴 변 px (0 = 미상, v3 이하 폴백). uncertain 저해상도 판정용
 
   def __post_init__(self) -> None:
     n = len(self.face_ids)
@@ -102,6 +108,12 @@ class EventEmbeddings:
       object.__setattr__(self, "s3_keys", ("",) * n)
     if len(self.s3_keys) != n:
       raise ValueError(f"s3_keys 길이가 다릅니다. face_ids={n}, s3_keys={len(self.s3_keys)}")
+    if not self.image_long_sides and n:
+      object.__setattr__(self, "image_long_sides", (0.0,) * n)  # 생략 = 전부 미상 (v3 이하 로드·기존 생성처 호환)
+    if len(self.image_long_sides) != n:
+      raise ValueError(f"image_long_sides 길이가 다릅니다. face_ids={n}, image_long_sides={len(self.image_long_sides)}")
+    if any(not np.isfinite(side) or side < 0 for side in self.image_long_sides):
+      raise ValueError("image_long_sides는 0 이상의 유한값이어야 합니다.")
     if len(set(self.face_ids)) != n:
       raise ValueError("face_ids에 중복이 있습니다.")
     if any(not face_id for face_id in self.face_ids) or any(not photo_id for photo_id in self.photo_ids):
@@ -145,13 +157,14 @@ class EventEmbeddings:
       | tuple[str, str, np.ndarray, float]
       | tuple[str, str, np.ndarray, float, tuple[float, float, float, float]]
       | tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str]
+      | tuple[str, str, np.ndarray, float, tuple[float, float, float, float], str, float]
     ],
   ) -> "EventEmbeddings":
-    """(face_id, photo_id, 임베딩[, 얼굴 폭 px[, bbox[, s3_key]]]) 행들을 cluster_id=None(신규)으로 뒤에 추가한 새 인스턴스를 만든다.
+    """(face_id, photo_id, 임베딩[, 얼굴 폭 px[, bbox[, s3_key[, 이미지 긴 변 px]]]]) 행들을 cluster_id=None(신규)으로 뒤에 추가한 새 인스턴스를 만든다.
 
     photo_id 기준 멱등 스킵(이미 저장된 사진 제외)은 호출자(classify 핸들러)의 책임이다 —
     이 타입은 요청 메시지를 모르고 행 단위 정합성만 지킨다. 폭 생략 = 0(미상, 주 인물 취급),
-    bbox·s3_key 생략 = 미상(썸네일 대표 후보 자격 없음).
+    bbox·s3_key 생략 = 미상(썸네일 대표 후보 자격 없음), 이미지 긴 변 생략 = 0(미상, low_resolution 미판정).
     """
     if not rows:
       return self
@@ -166,6 +179,7 @@ class EventEmbeddings:
       bboxes=self.bboxes
       + tuple(tuple(float(v) for v in row[4]) if len(row) > 4 else (0.0, 0.0, 0.0, 0.0) for row in rows),
       s3_keys=self.s3_keys + tuple(str(row[5]) if len(row) > 5 else "" for row in rows),
+      image_long_sides=self.image_long_sides + tuple(float(row[6]) if len(row) > 6 else 0.0 for row in rows),
     )
 
   def masked_by_photo_ids(self, deleted: Collection[str]) -> "EventEmbeddings":
@@ -187,6 +201,7 @@ class EventEmbeddings:
       face_widths=tuple(width for width, kept in zip(self.face_widths, keep) if kept),
       bboxes=tuple(bbox for bbox, kept in zip(self.bboxes, keep) if kept),
       s3_keys=tuple(key for key, kept in zip(self.s3_keys, keep) if kept),
+      image_long_sides=tuple(side for side, kept in zip(self.image_long_sides, keep) if kept),
       must_link_pairs=tuple(pair for pair in self.must_link_pairs if pair[0] in kept_faces and pair[1] in kept_faces),
       cannot_link_pairs=tuple(
         pair for pair in self.cannot_link_pairs if pair[0] in kept_faces and pair[1] in kept_faces
@@ -228,6 +243,7 @@ class EventEmbeddings:
       face_widths=np.asarray(self.face_widths, dtype=np.float32),
       bboxes=np.asarray(self.bboxes, dtype=np.float32).reshape(-1, 4),  # 빈 입력도 shape (0, 4) 보장
       s3_keys=_as_str_array(self.s3_keys),
+      image_long_sides=np.asarray(self.image_long_sides, dtype=np.float32),
     )
     return buffer.getvalue()
 
@@ -240,7 +256,7 @@ class EventEmbeddings:
     try:
       with np.load(io.BytesIO(blob), allow_pickle=False) as archive:
         version = int(archive["schema_version"])
-        if version not in (1, 2, SCHEMA_VERSION):
+        if version not in (1, 2, 3, SCHEMA_VERSION):
           raise StoreCorruptionError(
             f"지원하지 않는 schema_version입니다. 받은 값: {version}, 지원: 1~{SCHEMA_VERSION}"
           )
@@ -259,6 +275,8 @@ class EventEmbeddings:
         else:
           bboxes = ((0.0, 0.0, 0.0, 0.0),) * n
           s3_keys = ("",) * n
+        # v3 이하에는 image_long_sides가 없다 — 긴 변 0(미상)이면 low_resolution만 미판정, 나머지 동작 동일
+        image_long_sides = tuple(float(side) for side in archive["image_long_sides"]) if version >= 4 else (0.0,) * n
         pairs: dict[str, tuple[tuple[str, str], ...]] = {}
         for key in _PAIR_KEYS:
           array = archive[key]
@@ -281,6 +299,7 @@ class EventEmbeddings:
         face_widths=face_widths,
         bboxes=bboxes,
         s3_keys=s3_keys,
+        image_long_sides=image_long_sides,
       )
     except ValueError as exc:  # __post_init__ 불변식 위반 (길이 정합·face_id 유일·제약 참조 존재 등)
       raise StoreCorruptionError(f".npz 불변식 위반: {exc}") from exc
@@ -308,9 +327,15 @@ if __name__ == "__main__":
 
   event = empty.append_faces(
     [
-      ("face-1", "img-1", unit(0), 120.0, (10.0, 20.0, 120.0, 150.0), "photos/img-1.jpg"),
-      ("face-2", "img-1", unit(1), 40.0, (300.0, 5.0, 40.0, 50.0)),  # 한 image_id에 얼굴 여러 개 (N:M), s3_key 생략
-      ("face-3", "img-2", unit(2)),  # 폭·bbox·s3_key 생략 = 미상
+      ("face-1", "img-1", unit(0), 120.0, (10.0, 20.0, 120.0, 150.0), "photos/img-1.jpg", 1600.0),
+      (
+        "face-2",
+        "img-1",
+        unit(1),
+        40.0,
+        (300.0, 5.0, 40.0, 50.0),
+      ),  # 한 image_id에 얼굴 여러 개 (N:M), s3_key·긴변 생략
+      ("face-3", "img-2", unit(2)),  # 폭·bbox·s3_key·긴변 생략 = 미상
     ]
   )
   check("append_faces 폭 기록 (생략 = 0)", event.face_widths == (120.0, 40.0, 0.0))
@@ -319,6 +344,7 @@ if __name__ == "__main__":
     event.bboxes == ((10.0, 20.0, 120.0, 150.0), (300.0, 5.0, 40.0, 50.0), (0.0, 0.0, 0.0, 0.0))
     and event.s3_keys == ("photos/img-1.jpg", "", ""),
   )
+  check("append_faces 이미지 긴 변 기록 (생략 = 0)", event.image_long_sides == (1600.0, 0.0, 0.0))
   event = event.with_cluster_ids(["person-A", None, "person-B"])
   event = event.with_constraints([("face-1", "face-3")], [("face-2", "face-3")])
   restored = EventEmbeddings.from_npz_bytes(event.to_npz_bytes())
@@ -344,6 +370,7 @@ if __name__ == "__main__":
     "삭제 마스킹이 bbox·s3_key도 함께 마스킹",
     masked.bboxes == ((0.0, 0.0, 0.0, 0.0),) and masked.s3_keys == ("",),
   )
+  check("삭제 마스킹이 이미지 긴 변도 함께 마스킹", masked.image_long_sides == (0.0,))
   check("삭제 대상 없음이면 동일 인스턴스", event.masked_by_photo_ids(["img-없음"]) is event)
   check("전체 삭제 → 빈 event", event.masked_by_photo_ids(["img-1", "img-2"]) == empty)
 
@@ -386,6 +413,28 @@ if __name__ == "__main__":
     from_v2.bboxes == ((0.0, 0.0, 0.0, 0.0),) * 3
     and from_v2.s3_keys == ("", "", "")
     and from_v2.face_widths == event.face_widths,
+  )
+
+  # v3 하위호환: image_long_sides 열이 없는 .npz는 긴 변 0(미상)으로 로드된다 — low_resolution만 미판정,
+  # bbox·s3_key·폭은 보존된다 (SCHEMA_VERSION 주석, CHMO-404).
+  v3_buffer = io.BytesIO()
+  np.savez_compressed(
+    v3_buffer,
+    schema_version=np.int64(3),
+    embeddings=event.embeddings,
+    face_ids=_as_str_array(event.face_ids),
+    photo_ids=_as_str_array(event.photo_ids),
+    cluster_ids=_as_str_array([cid if cid is not None else _NO_CLUSTER for cid in event.cluster_ids]),
+    must_link_pairs=_as_str_array(event.must_link_pairs, columns=2),
+    cannot_link_pairs=_as_str_array(event.cannot_link_pairs, columns=2),
+    face_widths=np.asarray(event.face_widths, dtype=np.float32),
+    bboxes=np.asarray(event.bboxes, dtype=np.float32).reshape(-1, 4),
+    s3_keys=_as_str_array(event.s3_keys),
+  )
+  from_v3 = EventEmbeddings.from_npz_bytes(v3_buffer.getvalue())
+  check(
+    "v3 .npz 로드: 이미지 긴 변 미상(0) 폴백 + bbox·s3_key 보존",
+    from_v3.image_long_sides == (0.0, 0.0, 0.0) and from_v3.bboxes == event.bboxes and from_v3.s3_keys == event.s3_keys,
   )
 
   invalid_cases = [
