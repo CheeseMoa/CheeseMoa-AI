@@ -74,7 +74,9 @@ metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적 후처
 평균 0.475 [ADR 016](docs/decisions/016-merge-facepair-cohesion-gate.md), 승인은 컴포넌트 '현재 전체 멤버'
 재평가 [ADR 024](docs/decisions/024-merge-component-linkage.md)) → 노이즈 구제(전역 유사도 내림차순) →
 저신뢰 ambiguous 분리(leave-one-out + 회색지대 face-pair 축출,
-[ADR 020](docs/decisions/020-evict-facepair-gray-gate.md)) → 2차 파편 병합
+[ADR 020](docs/decisions/020-evict-facepair-gray-gate.md)) → margin 구제(top1≥0.40 AND 2위 군집 대비
+1.7배 여유 — 절대 임계가 못 붙이는 [0.40, 0.60) 대역 재심, 실 이벤트 적대 검증 후 활성화
+[2026-07-23 리뷰](docs/reviews/2026-07-23-margin-gate-real-event-validation.md)) → 2차 파편 병합
 ([ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 재군집 입력은 근중복 행(≥0.985 — 재업로드·
 유령 행 복제)을 대표 1행으로 접고 결과에서 펼친다([ADR 029](docs/decisions/029-duplicate-embedding-collapse.md),
 쌍 앨범 와해 방어). 임계는 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.

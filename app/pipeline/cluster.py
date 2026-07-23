@@ -13,7 +13,7 @@
   ⑤ 저신뢰 분리 — 절대 유사도·2위 마진 임계 미달 멤버를 ambiguous로 분리 (TBD #3 기본 정책)
      + 회색지대(centroid 바닥은 넘었지만 낮음) 멤버는 face-pair 증거로 재확인해 증거 없으면 축출 (ADR 020)
      + margin 구제 — 절대 유사도는 ④ 임계에 못 미쳐도 2위 군집 대비 여유가 큰 잔여 노이즈(옆얼굴·역광·
-       모션)를 top1 군집에 편입 (기본 비활성 — margin_rescue_floor 주석·2026-07-23 실측 참조)
+       모션·교차연령 정면)를 top1 군집에 편입 (margin_rescue_floor 주석·2026-07-23 실측·실 이벤트 검증 참조)
   ⑥ 2차 파편 병합 — 구제·분리로 바뀐 최종 멤버십에 ③과 같은 판정을 재적용 (ADR-010)
   ⑦ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
   ⑧ 클러스터별 대표벡터(L2 정규화 평균, 파생 캐시) 계산
@@ -101,8 +101,12 @@ class ClusterConfig:
   # (recall +0.118)·오답쌍 0, 라벨 아동 8인 52장 무변화(구제 0·오배정 0), 닮은꼴(카리나·고윤정)
   # 무변화 — 전 데이터셋 정밀도 1.0 유지. 알려진 한계: 닮은꼴 형제가 자기 군집 없이 본인 부재
   # 사진에 등장하면 오배정 가능(자매 top1 0.561 실측 — 같은 사진 cannot-link만 차단).
-  # floor 0 = 비활성(기본 — 실 이벤트 적대 검증 전까지 실험 전용).
-  margin_rescue_floor: float = 0.0
+  # 0.40 활성화(2026-07-23): 실 이벤트 적대 검증 통과 — S3 실코퍼스 34 이벤트·1,200 얼굴 OFF/ON 전수
+  # 비교에서 구제 9건(내용 유니크 6)이 몽타주 육안 전건 동일 인물(교차연령 정면·극단 옆모습·모자 그림자),
+  # 구제 외 멤버십 변동 0. 단일 군집 이벤트 전체 skip은 설계대로 동작(2건 관측, top1 0.46~0.47 =
+  # 남남 부착 대역 직상이라 보수성이 옳음). 상세·잔여 노이즈 분포:
+  # docs/reviews/2026-07-23-margin-gate-real-event-validation.md. floor 0 = 비활성(킬 스위치).
+  margin_rescue_floor: float = 0.40
   margin_rescue_ratio: float = 1.7
   # 저신뢰 분리 임계 (TBD feature-spec §10 #3의 초기값) — 아래 둘 중 하나라도 걸리면 ambiguous로 뺀다:
   # 자기 centroid 절대 유사도 바닥, 그리고 2위 클러스터와의 유사도 마진.
@@ -1669,18 +1673,17 @@ if __name__ == "__main__":
   margin_m = (0.45 * axis(0) + math.sqrt(1.0 - 0.45**2) * axis(40)).astype(np.float32)
   margin_x = (0.45 * axis(0) + 0.44 * axis(1) + math.sqrt(1.0 - 0.45**2 - 0.44**2) * axis(41)).astype(np.float32)
   margin_event = np.vstack([margin_a, margin_b, margin_m[None, :], margin_x[None, :]])
-  result = recluster(margin_event, [None] * 8)
+  result = recluster(margin_event, [None] * 8, config=ClusterConfig(margin_rescue_floor=0.0))
   check(
-    "(o) 전제: margin OFF(기본)면 하드 포즈 M·모호 X 둘 다 노이즈",
+    "(o) 전제: margin OFF(floor 0 킬 스위치)면 하드 포즈 M·모호 X 둘 다 노이즈",
     {6, 7} <= set(result.noise_indices) and len(result.clusters) == 2,
   )
-  margin_on = ClusterConfig(margin_rescue_floor=0.40, margin_rescue_ratio=1.7)
-  result = recluster(margin_event, [None] * 8, config=margin_on)
+  result = recluster(margin_event, [None] * 8)  # 기본 설정 = margin ON (2026-07-23 실 이벤트 검증 후 활성화)
   check(
-    "(o) margin ON: 여유 큰 M만 top1(A)에 편입, 배율 ≈1.0인 X는 노이즈 유지",
+    "(o) margin ON(기본): 여유 큰 M만 top1(A)에 편입, 배율 ≈1.0인 X는 노이즈 유지",
     any(c.member_indices == (0, 1, 2, 6) for c in result.clusters) and 7 in result.noise_indices,
   )
-  result = recluster(np.vstack([margin_a, margin_m[None, :]]), [None] * 4, config=margin_on)
+  result = recluster(np.vstack([margin_a, margin_m[None, :]]), [None] * 4)
   check(
     "(o) 군집 1개 이벤트는 top2가 없어 margin 구제 전체 건너뜀 (무차별 편입 방지)",
     3 in result.noise_indices,
