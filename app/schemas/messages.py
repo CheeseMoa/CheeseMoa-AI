@@ -267,6 +267,20 @@ class FaceBox(_MessageBase):
   h: int = Field(gt=0)
 
 
+class UncertainSuggestion(_MessageBase):
+  """uncertain 얼굴 1개에 대한 "이 앨범 아닐까요?" 제안 (Rekognition 보조 재판정, ADR-030).
+
+  자동 편입 임계(기본 90) 미만·제안 임계(기본 85) 이상 대역의 재판정 결과다 — 워커가 확신하지
+  못해 편입 대신 사용자 확인을 요청한다("같은 분인가요?" UX, 크로스-이벤트 연결 제안과 동일 패턴).
+  얼굴 결속은 face_bbox 값으로 한다: face_bboxes 배열의 원소와 정확히 같은 값이라 앱은 int 동등
+  비교로 어느 얼굴의 제안인지 찾는다 (배열 인덱스 결속은 BE 필터링·정렬 변경에 취약해 기각).
+  """
+
+  face_bbox: FaceBox  # 제안 대상 얼굴 — 같은 UncertainImage의 face_bboxes 원소와 동일 값
+  cluster_id: Id  # 제안하는 인물 앨범 (clusters의 cluster_id)
+  similarity: Annotated[float, Field(allow_inf_nan=False, ge=0, le=100)]  # Rekognition Similarity (0~100)
+
+
 class UncertainImage(_MessageBase):
   """인물에 자신 있게 붙이지 못한 사진 ("분류가 어려워요" 앨범, 뷰어 비노출).
 
@@ -297,6 +311,10 @@ class UncertainImage(_MessageBase):
   # 앨범 지정"만 안내. 문구·톤은 앱 소유 — 워커는 코드만 낸다. low_resolution은 small_faces와 동반될 때만 실리고
   # (둘 다면 앞이 우선 안내), single_appearance는 품질 정상 + unmatched일 때만(작은 얼굴은 품질 원인이 우선).
   causes: list[Literal["low_resolution", "small_faces", "single_appearance"]] = Field(default_factory=list)
+  # Rekognition 보조 재판정의 "이 앨범 아닐까요?" 제안 (ADR-030, 계약 확장). 유사도 내림차순.
+  # 빈 배열 = 제안 없음 — 재판정 비활성(REJUDGE_ENABLED=false 롤백), 제안 대역 미해당, 재판정 실패
+  # (best-effort) 전부 이 값이라 토글 OFF 동안 wire는 종전과 동일하다(하위 호환·배포 순서 무관).
+  suggestions: list[UncertainSuggestion] = Field(default_factory=list)
 
 
 class FailedImage(_MessageBase):
@@ -468,6 +486,9 @@ if __name__ == "__main__":
         reason="ambiguous",
         face_bboxes=[FaceBox(x=120, y=48, w=260, h=300), FaceBox(x=400, y=60, w=180, h=200)],
         causes=["low_resolution", "small_faces"],
+        suggestions=[
+          UncertainSuggestion(face_bbox=FaceBox(x=120, y=48, w=260, h=300), cluster_id="person-A", similarity=88.7)
+        ],
       ),
       UncertainImage(image_id="img-6", reason="unmatched"),  # causes 생략 = 품질 문제 아님(빈 배열)
     ],
@@ -499,6 +520,13 @@ if __name__ == "__main__":
     "uncertain causes — 동봉 시 직렬화 포함, 생략 시 빈 배열 (CHMO-404 계약 확장)",
     '"causes":["low_resolution","small_faces"]' in result.model_dump_json().replace(" ", "")
     and result.uncertain[1].causes == [],
+  )
+  check(
+    "uncertain suggestions — 동봉 시 face_bbox·cluster_id·similarity 직렬화, 생략 시 빈 배열 (ADR-030 계약 확장)",
+    '"suggestions":[{"face_bbox":{"x":120,"y":48,"w":260,"h":300},"cluster_id":"person-A","similarity":88.7}]'
+    in result.model_dump_json().replace(" ", "")
+    and result.uncertain[0].suggestions[0].face_bbox == result.uncertain[0].face_bboxes[0]
+    and result.uncertain[1].suggestions == [],
   )
   check("failed 결과 최소 구성", ClassifyResult(job_id="job-9", status="failed").clusters == [])
 
@@ -583,6 +611,13 @@ if __name__ == "__main__":
     check("거부: 대표벡터 NaN", True)
   else:
     raise SystemExit("실패: 대표벡터 NaN — ValidationError가 발생해야 하는데 통과됨")
+
+  try:
+    UncertainSuggestion(face_bbox=FaceBox(x=0, y=0, w=10, h=10), cluster_id="person-A", similarity=120.0)
+  except ValidationError:
+    check("거부: suggestion similarity 범위 밖 (0~100)", True)
+  else:
+    raise SystemExit("실패: suggestion similarity 120 — ValidationError가 발생해야 하는데 통과됨")
 
   for case_name, kwargs in [
     ("progress total=0", {"job_id": "j", "event_id": "e", "processed": 0, "total": 0}),

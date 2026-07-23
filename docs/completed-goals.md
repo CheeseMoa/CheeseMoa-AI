@@ -3,6 +3,25 @@
 CLAUDE.md에서 이동한 완료 목표 아카이브 (2026-07-22, 컨텍스트 절감). 새 목표를 완료하면 이 파일
 **맨 위에** 같은 형식(문제 → 원인 → 해법 → 실측 검증 → 롤백 스위치)으로 추가한다 — CLAUDE.md에는 넣지 않는다.
 
+- **Rekognition uncertain 재판정 — 하드케이스 자동 편입·제안 (P0 목표 0 구현분)** (2026-07-24, CHMO-420,
+  [ADR 030](decisions/030-rekognition-uncertain-rejudge.md),
+  [실측 리뷰](reviews/2026-07-23-rekognition-uncertain-ab.md)) — 옆얼굴·가림·나이차 하드케이스는
+  AuraFace 코사인으로 원리적으로 못 가른다(동일인 0.18~0.48 vs 타인 0.20~0.36 완전 겹침, 로컬 임계
+  불가는 2026-07-23 두 리뷰로 확정)는 문제에, 실측으로 근거 확보된 CompareFaces(동일인 83~100 vs
+  타인 0~16, 실서버 미배정 24.5% 회수 전수 정답)를 보조 신호로 도입. 해법: 재군집 후 uncertain 확정
+  직전 핸들러 opt-in 훅(`pipeline/rejudge.py` + `deps._build_rejudger`) — 미배정 얼굴 × AuraFace
+  top-3 앨범 폭최대 대표를 **전부 호출 후 argmax**(조기 종료 없음 — AuraFace 순위를 못 믿는 대역이라)
+  로 ≥90 자동 편입(must-link 기록 + 재군집 2차 패스 — 모든 후처리 불변식 자동 재적용·재전달 안전성
+  유지·이후 uncertain 재진입 차단), [85,90) 제안(`uncertain[].suggestions` 계약 확장 — face_bbox 값
+  결속, Spring 합의 필요·OFF 동안 빈 배열 하위 호환), ≥95 복수 매칭 파편 힌트(로그). 편입 전 3중
+  검사(사용자 cannot-link 존중·같은사진 공존·사진당 argmax 가드)로 사용자 결정·같은사진 불변식 보호.
+  (face,대표) 점수는 event별 S3 JSON(`rekognition-scores/`)에 캐싱해 재군집·보정 재과금 방지(얼굴
+  미검출 -1.0 센티널, 삭제 시 캐시 동반 삭제), crop은 실측 파리티(bbox+0.25 여백·q92·무축소).
+  장애는 best-effort(전면 장애 = 비활성과 동일 결과 자가검증 고정), job당 호출 상한 150. 검증:
+  rejudge 24건·scores 코덱·handlers 종단 10건(편입 지속·재실행 0호출·cannot-link 존중·웜 캐시)·
+  스모크 발행 왕복. 롤백: `REJUDGE_ENABLED=false`(기본은 CHMO-420에서 ON 전환 — 운영 전제 조건
+  미충족 환경은 false 배포, ADR 030 §활성화 게이트). 잔여: AWS AI 학습 opt-out 확인·워커 IAM
+  `rekognition:CompareFaces`·Spring `suggestions` 소비 합의·파편 힌트 wire 계약.
 - **재군집 전 근중복 행 붕괴 — 재업로드·유령 행 오염의 앨범 와해 방어(P0 워커 방어층)** (2026-07-23,
   CHMO-419, [ADR 029](decisions/029-duplicate-embedding-collapse.md)) — 같은 사진 재업로드(멱등 스킵이
   `image_id` 기준이라 새 id면 재임베딩)·`delete_request` 미도달 유령 행이 만든 유사도 ≈1.0 복제

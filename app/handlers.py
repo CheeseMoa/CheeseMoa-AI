@@ -24,6 +24,7 @@ from typing import NamedTuple
 import numpy as np
 
 from app.pipeline.cluster import ClusterConfig, Constraints, PersonCluster, recluster
+from app.pipeline.rejudge import RejudgeOutcome, UncertainRejudger
 from app.schemas.messages import (
   UNCERTAIN_ALBUM_ID,
   ClassifyRequest,
@@ -37,10 +38,12 @@ from app.schemas.messages import (
   ResultCluster,
   SplitFeedback,
   UncertainImage,
+  UncertainSuggestion,
 )
 from app.storage.embedding_store import EmbeddingStore
 from app.storage.event_embeddings import EventEmbeddings
 from app.storage.image_source import ImageSource
+from app.storage.rekognition_scores import RekognitionScoreStore
 from app.storage.thumbnail_store import ThumbnailStore
 
 logger = logging.getLogger(__name__)
@@ -216,6 +219,50 @@ def _uncertain_face_boxes(event: EventEmbeddings, indices: Iterable[int]) -> lis
   return boxes
 
 
+def _uncertain_suggestions(
+  event: EventEmbeddings, indices: Iterable[int], suggestion_of: dict[int, tuple[str, float]]
+) -> list[UncertainSuggestion]:
+  """uncertain 사진의 재판정 제안 목록 (ADR-030) — 유사도 내림차순, 동률은 event 행 순.
+
+  face_bbox는 _uncertain_face_boxes와 동일한 반올림 값이라 앱이 face_bboxes 원소와 int 동등
+  비교로 결속한다 — 그래서 대상도 같은 집합(주 인물 자격 crop 얼굴)으로 제한하고, bbox 미상
+  행(face_bboxes에서 빠지는 행)은 제안도 싣지 않는다(결속 불가).
+  """
+  items: list[tuple[float, int, UncertainSuggestion]] = []
+  for index in indices:
+    matched = suggestion_of.get(index)
+    if matched is None:
+      continue
+    x, y, w, h = event.bboxes[index]
+    if round(w) <= 0 or round(h) <= 0:
+      continue
+    cluster_id, similarity = matched
+    items.append(
+      (
+        similarity,
+        index,
+        UncertainSuggestion(
+          face_bbox=FaceBox(x=round(x), y=round(y), w=round(w), h=round(h)),
+          cluster_id=cluster_id,
+          similarity=similarity,
+        ),
+      )
+    )
+  items.sort(key=lambda entry: (-entry[0], entry[1]))
+  return [entry[2] for entry in items]
+
+
+@dataclass(frozen=True)
+class _ClusterPass:
+  """재군집 + 단일 사진 클러스터 강등 1회 실행의 결과 — 저장 없는 순수 계산 (재판정 2차 패스 재사용)."""
+
+  clusters: tuple[PersonCluster, ...]  # 인물로 승격된 클러스터만 (강등분 제외)
+  unmatched_indices: tuple[int, ...]  # 재군집 노이즈 + 강등된 얼굴
+  ambiguous_indices: tuple[int, ...]
+  retired_cluster_ids: tuple[str, ...]  # 재군집 은퇴분 + 강등된 기존 id
+  new_cluster_ids: tuple[str | None, ...]  # 행별 새 배정 (.npz 갱신 원천)
+
+
 @dataclass(frozen=True)
 class _ClusterSnapshot:
   """재군집 + 단일 사진 클러스터 강등까지 끝난, 결과 조립에 필요한 event 스냅샷 요약."""
@@ -225,6 +272,7 @@ class _ClusterSnapshot:
   unmatched_indices: tuple[int, ...]  # 재군집 노이즈 + 강등된 얼굴
   ambiguous_indices: tuple[int, ...]
   retired_cluster_ids: tuple[str, ...]  # 재군집 은퇴분 + 강등된 기존 id
+  rejudge: RejudgeOutcome | None = None  # Rekognition 재판정 결과 — 제안이 _assemble_result로 흐르는 통로 (ADR-030)
 
 
 class JobHandlers:
@@ -241,6 +289,8 @@ class JobHandlers:
     report_progress: ProgressReporter | None = None,
     render_thumbnail: ThumbnailRenderer | None = None,
     thumbnails: ThumbnailStore | None = None,
+    rejudger: UncertainRejudger | None = None,
+    rejudge_scores: RekognitionScoreStore | None = None,
   ) -> None:
     self._store = store
     self._images = images
@@ -249,6 +299,9 @@ class JobHandlers:
     # 둘 다 주입돼야 썸네일 활성 (CHMO-335) — 하나라도 None이면 전 경로에서 생략 = 종전 동작 (롤백 경로)
     self._render_thumbnail = render_thumbnail
     self._thumbnails = thumbnails
+    # 둘 다 주입돼야 Rekognition 재판정 활성 (ADR-030) — 하나라도 None이면 생략 = 종전 동작 (REJUDGE_ENABLED=false 롤백 경로)
+    self._rejudger = rejudger
+    self._rejudge_scores = rejudge_scores
     # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
     self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
     self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
@@ -506,19 +559,8 @@ class JobHandlers:
 
   # ── 공통 꼬리: 재군집 + .npz rewrite + 결과 조립 ─────────────────────────────
 
-  def _recluster_and_save(self, event_id: str, event: EventEmbeddings) -> _ClusterSnapshot:
-    """event 전체를 재군집·강등 판정하고 새 배정을 반영해 저장한다 — 이 저장이 유일한 쓰기이자 마지막 변이다.
-
-    저장 후 크래시(발행·삭제 전)로 메시지가 재전달돼도, photo_id 멱등 append + 결정적 재군집이
-    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조).
-    """
-    if not event.face_ids:
-      # 전부 삭제된(또는 애초에 빈) event — 재군집할 것이 없어도 빈 파일을 저장해 단일 진실을 유지한다
-      self._store.save(event_id, event)
-      return _ClusterSnapshot(
-        event=event, clusters=(), unmatched_indices=(), ambiguous_indices=(), retired_cluster_ids=()
-      )
-
+  def _cluster_pass(self, event: EventEmbeddings) -> _ClusterPass:
+    """재군집 + 단일 사진 클러스터 강등 1회 — 저장 없는 순수 계산 (재판정 편입 반영 시 2차 패스로 재실행)."""
     row_of = event.row_index_of()
     constraints = Constraints(
       must_link=tuple((row_of[a], row_of[b]) for a, b in event.must_link_pairs),
@@ -549,15 +591,87 @@ class JobHandlers:
     for cluster in kept:
       for index in cluster.member_indices:
         new_cluster_ids[index] = cluster.cluster_id
-    saved = event.with_cluster_ids(new_cluster_ids)
-    self._store.save(event_id, saved)
-    return _ClusterSnapshot(
-      event=saved,
+    return _ClusterPass(
       clusters=tuple(kept),
       unmatched_indices=tuple(sorted([*result.noise_indices, *demoted_indices])),
       ambiguous_indices=result.ambiguous_indices,
       retired_cluster_ids=tuple(dict.fromkeys([*result.retired_cluster_ids, *demoted_retired])),
+      new_cluster_ids=tuple(new_cluster_ids),
     )
+
+  def _recluster_and_save(self, event_id: str, event: EventEmbeddings) -> _ClusterSnapshot:
+    """event 전체를 재군집·강등 판정하고 새 배정을 반영해 저장한다 — 이 저장이 유일한 쓰기이자 마지막 변이다.
+
+    저장 후 크래시(발행·삭제 전)로 메시지가 재전달돼도, photo_id 멱등 append + 결정적 재군집이
+    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조). Rekognition 재판정
+    (ADR-030)이 활성이고 미배정 얼굴이 있으면 uncertain 확정 직전에 재판정해, 자동 편입은
+    must-link로 기록 후 재군집을 한 번 더 돌린다 — 스냅샷 직접 수정 대신 2차 패스를 쓰는 이유는
+    같은사진 cannot-link·강등·병합 게이트 등 모든 후처리 불변식이 자동 재적용되고, 저장된 .npz를
+    재군집한 결과와 발행 결과가 항상 일치해 재전달 안전성이 유지되기 때문이다 (군집 비용 <0.1%).
+    """
+    if not event.face_ids:
+      # 전부 삭제된(또는 애초에 빈) event — 재군집할 것이 없어도 빈 파일을 저장해 단일 진실을 유지한다.
+      # 재판정 점수 캐시도 함께 지운다 — 생체 파생 정보가 원본 얼굴보다 오래 남지 않게 (ADR-030)
+      self._store.save(event_id, event)
+      self._delete_rejudge_scores(event_id)
+      return _ClusterSnapshot(
+        event=event, clusters=(), unmatched_indices=(), ambiguous_indices=(), retired_cluster_ids=()
+      )
+
+    current = self._cluster_pass(event)
+    outcome: RejudgeOutcome | None = None
+    if (
+      self._rejudger is not None
+      and self._rejudge_scores is not None
+      and (current.unmatched_indices or current.ambiguous_indices)
+    ):
+      # best-effort 격리 (썸네일과 동일 정책): 재판정·캐시의 어떤 실패도 job을 죽이지 않는다 — 실패 시
+      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 must-link가
+      # 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 제약이 저장되면 이후 모든 재군집이 죽는다(오염 방지).
+      try:
+        cached = self._rejudge_scores.load(event_id)
+        outcome = self._rejudger.rejudge(
+          event, current.clusters, (*current.ambiguous_indices, *current.unmatched_indices), cached
+        )
+        if outcome.assignments:
+          augmented = event.with_constraints(
+            event.must_link_pairs + tuple((a.face_id, a.rep_face_id) for a in outcome.assignments),
+            event.cannot_link_pairs,
+          )
+          current = self._cluster_pass(augmented)
+          event = augmented  # 2차 패스 성공 — 편입 must-link를 저장 대상으로 확정 (이후 재군집에서 유지)
+      except Exception:
+        logger.warning("Rekognition 재판정 실패 event_id=%s — 무시하고 진행 (현 동작 유지)", event_id, exc_info=True)
+        outcome = None
+
+    saved = event.with_cluster_ids(current.new_cluster_ids)
+    self._store.save(event_id, saved)
+    if outcome is not None and outcome.scores is not None:
+      # 점수 캐시 갱신 — best-effort. 죽은 face_id 항목은 프루닝한다 (.npz의 제약 프루닝과 같은 위생)
+      try:
+        alive = set(saved.face_ids)
+        self._rejudge_scores.save(
+          event_id, {pair: sim for pair, sim in outcome.scores.items() if pair[0] in alive and pair[1] in alive}
+        )
+      except Exception:
+        logger.warning("재판정 점수 캐시 저장 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
+    return _ClusterSnapshot(
+      event=saved,
+      clusters=current.clusters,
+      unmatched_indices=current.unmatched_indices,
+      ambiguous_indices=current.ambiguous_indices,
+      retired_cluster_ids=current.retired_cluster_ids,
+      rejudge=outcome,
+    )
+
+  def _delete_rejudge_scores(self, event_id: str) -> None:
+    """재판정 점수 캐시를 지운다 — best-effort (실패해도 고아 객체일 뿐, 다음 활성 job의 프루닝이 정리)."""
+    if self._rejudge_scores is None:
+      return
+    try:
+      self._rejudge_scores.delete(event_id)
+    except Exception:
+      logger.warning("재판정 점수 캐시 삭제 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
 
   # ── 대표 얼굴 썸네일 (CHMO-335) ──────────────────────────────────────────────
 
@@ -691,6 +805,19 @@ class JobHandlers:
     for index in (*snapshot.ambiguous_indices, *snapshot.unmatched_indices):
       if main_face[index]:
         crop_faces_of.setdefault(event.photo_ids[index], []).append(index)
+    # Rekognition 재판정 제안 (ADR-030): face_id → (앨범, 유사도). 제안의 앨범은 판정 시점 id가 아니라
+    # "비교했던 대표 얼굴이 최종 상태에서 속한 클러스터"로 재해석한다 — 편입이 2차 패스를 돌리면
+    # 신규 발급·병합으로 id가 바뀔 수 있기 때문 (RejudgeSuggestion 독스트링). 대표가 최종적으로
+    # 미배정이면(극단) 제안을 버리고, 편입돼 uncertain을 벗어난 얼굴의 제안은 아래 결합에서 자연 탈락한다.
+    suggestion_of: dict[int, tuple[str, float]] = {}
+    if snapshot.rejudge is not None and snapshot.rejudge.suggestions:
+      row_of = event.row_index_of()
+      for suggestion in snapshot.rejudge.suggestions:
+        row = row_of.get(suggestion.face_id)
+        rep_row = row_of.get(suggestion.rep_face_id)
+        final_cluster = event.cluster_ids[rep_row] if rep_row is not None else None
+        if row is not None and final_cluster is not None:
+          suggestion_of[row] = (final_cluster, suggestion.similarity)
     # ambiguous 우선: 한 사진에 ambiguous·unmatched 얼굴이 섞이면 더 정보가 많은 ambiguous로 보고
     for reason, indices in (("ambiguous", snapshot.ambiguous_indices), ("unmatched", snapshot.unmatched_indices)):
       for index in indices:
@@ -715,6 +842,7 @@ class JobHandlers:
             reason=reason,
             face_bboxes=_uncertain_face_boxes(event, crop_faces_of.get(photo_id, ())),
             causes=self._uncertain_causes(max_width_of.get(photo_id, 0.0), long_side_of.get(photo_id, 0.0), reason),
+            suggestions=_uncertain_suggestions(event, crop_faces_of.get(photo_id, ()), suggestion_of),
           )
         )
 
@@ -926,6 +1054,15 @@ if __name__ == "__main__":
       image[0, slot + 1, 2] = face[2] if len(face) > 2 else 100
     return image
 
+  def rj_stranger_vector(tag: int) -> np.ndarray:
+    """재판정(㉓) 전용 미등록 인물 모사 — 인물 4 평면에 0.3 성분: FP 게이트(0.185)는 넘되 구제 전부 미달.
+
+    AuraFace로는 절대 앨범에 못 붙는 하드케이스 대역이다 — Rekognition 재판정만이 회수 경로다."""
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[2 * 4] = 0.3
+    vector[490 + tag] = math.sqrt(1.0 - 0.09)  # 490+ 축 — garbage(450대)·stranger(460~483) 축과 불겹침
+    return vector
+
   def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
     vectors: list[np.ndarray] = []
@@ -933,7 +1070,9 @@ if __name__ == "__main__":
     for slot in range(count):
       person, step = int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])
       widths.append(float(image[0, slot + 1, 2]))
-      if person >= 50:
+      if person >= 60:
+        vectors.append(rj_stranger_vector(person - 60))
+      elif person >= 50:
         vectors.append(garbage_vector(step))
       elif person >= 40:
         vectors.append(confirm_distinct_vector(person, step))
@@ -1817,6 +1956,226 @@ if __name__ == "__main__":
     # 입력을 역순으로 줘 정렬이 실제로 개입함을 보장 — 폭 동률은 event 행 순이 계약이다
     "uncertain face_bboxes: 폭 동률은 event 행 순 — 입력 순서 무관",
     _uncertain_face_boxes(tie_event, (1, 0)) == [FaceBox(x=0, y=0, w=100, h=100), FaceBox(x=10, y=0, w=100, h=100)],
+  )
+
+  # ㉓ Rekognition 재판정 (ADR-030): AuraFace로는 회수 불가한 하드케이스(유사도 0.295) 미배정 얼굴을
+  # CompareFaces 점수로 자동 편입(≥90)·제안(85~90)한다. 편입은 must-link 기록 + 재군집 2차 패스,
+  # 점수는 (face, 대표) 쌍으로 캐싱돼 재군집·보정에서 재과금이 없다.
+  from app.storage.rekognition_scores import InMemoryRekognitionScoreStore
+
+  image_source.images.update(
+    {
+      # step 간격 3(15°, 동일인 쌍 cos≈0.967)로 근중복 붕괴 임계(0.985, ADR-029) 아래의 실사진 대역을
+      # 모사한다 — 간격 1(cos≈0.996)이면 ⓪ 붕괴가 앨범 쌍을 대표 1행으로 접어, 편입 must-link가 2차
+      # 패스에서 클러스터를 만들 때 고아 근중복 승격이 꺼져 무관한 앨범이 와해된다 (confirm_distinct_vector
+      # 의 12° 지터와 같은 이유).
+      "rj-a1.jpg": fake_image([(4, 0)]),
+      "rj-a2.jpg": fake_image([(4, 3, 150)]),  # 폭 최대 — 앨범 A의 재판정 대표
+      "rj-b1.jpg": fake_image([(5, 0)]),
+      "rj-b2.jpg": fake_image([(5, 3)]),
+      "rj-u-join.jpg": fake_image([(60, 0)]),  # 하드케이스 미등록 — 99점 → A 편입
+      "rj-u-sugg.jpg": fake_image([(61, 0)]),  # 하드케이스 미등록 — 88점 → A 제안
+      # cannot-link 케이스는 전 얼굴과 직교(garbage 대역)로 둔다 — 0.3 성분 대역이면 HDBSCAN이 일단
+      # A에 붙였다가 cannot-link 강제 분리 + 제약 당사자 보호로 단독 앨범이 되어 uncertain을 벗어난다
+      "rj-u-cl.jpg": fake_image([(50, 5)]),  # 미등록 — 99점이지만 사용자 cannot-link 탈락
+    }
+  )
+  # 페이크 crop 태그 = "p{인물}-{step}" — comparer가 어떤 쌍인지 식별하는 배선 (fetch는 실제 image_source 경유)
+  rj_crop = lambda image, bbox: f"p{int(image[0, 1, 0])}-{int(image[0, 1, 1])}".encode()  # noqa: E731
+  rj_scores_by_pair = {
+    ("p60-0", "p4-3"): 99.0,
+    ("p61-0", "p4-3"): 88.0,
+  }
+  rj_calls: list[tuple[str, str]] = []
+  rj_raises: set[tuple[str, str]] = set()
+
+  def rj_compare(source: bytes, target: bytes) -> float:
+    key = (source.decode(), target.decode())
+    rj_calls.append(key)
+    if key in rj_raises:
+      raise RuntimeError("throttled")
+    return rj_scores_by_pair.get(key, 5.0)
+
+  rj_score_store = InMemoryRekognitionScoreStore()
+  rj_store = InMemoryEmbeddingStore()
+  rj_handlers = JobHandlers(
+    store=rj_store,
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("rj-person"),
+    new_face_id=counter("rj-face"),
+    rejudger=UncertainRejudger(compare=rj_compare, fetch_image=image_source.fetch, crop=rj_crop),
+    rejudge_scores=rj_score_store,
+  )
+  rj_body = {
+    "type": "classify_request",
+    "job_id": "job-rj1",
+    "group_id": "group-1",
+    "event_id": "event-rj",
+    "images": [
+      {"image_id": "rj-a1", "s3_key": "rj-a1.jpg"},
+      {"image_id": "rj-a2", "s3_key": "rj-a2.jpg"},
+      {"image_id": "rj-b1", "s3_key": "rj-b1.jpg"},
+      {"image_id": "rj-b2", "s3_key": "rj-b2.jpg"},
+      {"image_id": "rj-u-join", "s3_key": "rj-u-join.jpg"},
+      {"image_id": "rj-u-sugg", "s3_key": "rj-u-sugg.jpg"},
+    ],
+  }
+  rj1 = rj_handlers.handle(parse_inbound_message(json.dumps(rj_body)))
+  rj_cluster_a = next(c for c in rj1.clusters if "rj-a1" in c.image_ids)
+  check(
+    "재판정 자동 편입: 99점 하드케이스가 앨범 A에 편입 + uncertain에서 제거",
+    "rj-u-join" in rj_cluster_a.image_ids and all(u.image_id != "rj-u-join" for u in rj1.uncertain),
+  )
+  rj_event = rj_store.load("event-rj")
+  rj_face_of = dict(zip(rj_event.photo_ids, rj_event.face_ids))
+  check(
+    "재판정 편입은 (얼굴, 대표) must-link로 .npz에 기록 — 이후 재군집에서 유지되는 근거",
+    rj_event.must_link_pairs == ((rj_face_of["rj-u-join"], rj_face_of["rj-a2"]),)
+    and dict(zip(rj_event.photo_ids, rj_event.cluster_ids))["rj-u-join"] == rj_cluster_a.cluster_id,
+  )
+  rj_sugg = next(u for u in rj1.uncertain if u.image_id == "rj-u-sugg")
+  check(
+    "재판정 제안 [85, 90): suggestions 동봉 + face_bbox가 face_bboxes 원소와 동일 값 (결속 계약)",
+    [(s.cluster_id, s.similarity) for s in rj_sugg.suggestions] == [(rj_cluster_a.cluster_id, 88.0)]
+    and rj_sugg.suggestions[0].face_bbox == rj_sugg.face_bboxes[0],
+  )
+  check(
+    "재판정 호출 정산: 미배정 2명 × top-k 2앨범 = 4회 + 점수 캐시 저장",
+    len(rj_calls) == 4 and len(rj_score_store.load("event-rj")) == 4,
+  )
+
+  # 같은 event 재분류(재업로드·보정 재군집 모사): 편입 얼굴은 uncertain에 재진입하지 않고,
+  # 남은 미배정의 쌍은 캐시 히트 — CompareFaces 추가 호출 0회 (재과금 방지의 종단 검증)
+  rj2 = rj_handlers.handle(parse_inbound_message(json.dumps({**rj_body, "job_id": "job-rj2"})))
+  check(
+    "재판정 재실행: 편입 유지 + 제안 재현 + 추가 호출 0회 (캐시 전량 히트)",
+    "rj-u-join" in next(c for c in rj2.clusters if "rj-a1" in c.image_ids).image_ids
+    and any(u.image_id == "rj-u-sugg" and len(u.suggestions) == 1 for u in rj2.uncertain)
+    and len(rj_calls) == 4,
+  )
+
+  # 사용자 cannot-link 존중 종단: 99점이어도 사용자가 "다른 사람"으로 확정한 앨범엔 편입하지 않는다.
+  # u-cl 첫 분류는 일시 장애로 판정 보류(미캐싱)시켜 두고, cannot-link를 기록한 뒤 99점을 노출한다.
+  rj_raises.update({("p50-5", "p4-3"), ("p50-5", "p5-0")})
+  rj3 = rj_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          **rj_body,
+          "job_id": "job-rj3",
+          "images": [*rj_body["images"], {"image_id": "rj-u-cl", "s3_key": "rj-u-cl.jpg"}],
+        }
+      )
+    )
+  )
+  check(
+    "재판정 일시 장애: 해당 얼굴만 판정 보류(uncertain 유지) + 실패 쌍 미캐싱",
+    any(u.image_id == "rj-u-cl" for u in rj3.uncertain)
+    and all(pair[0] != rj_face_of.get("rj-u-cl", "") for pair in rj_score_store.load("event-rj")),
+  )
+  rj_raises.clear()
+  rj_scores_by_pair[("p50-5", "p4-3")] = 99.0
+  rj_event = rj_store.load("event-rj")
+  rj_face_of = dict(zip(rj_event.photo_ids, rj_event.face_ids))
+  rj_store.save(  # 사용자 결정 모사: u-cl ↔ 앨범 A 멤버 cannot-link (split/confirm_distinct 번역 결과와 동일 형태)
+    "event-rj",
+    rj_event.with_constraints(
+      rj_event.must_link_pairs, rj_event.cannot_link_pairs + ((rj_face_of["rj-u-cl"], rj_face_of["rj-a1"]),)
+    ),
+  )
+  rj4 = rj_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          **rj_body,
+          "job_id": "job-rj4",
+          "images": [*rj_body["images"], {"image_id": "rj-u-cl", "s3_key": "rj-u-cl.jpg"}],
+        }
+      )
+    )
+  )
+  check(
+    "재판정 cannot-link 존중: 99점이어도 편입·제안 없음 — uncertain 유지 (사용자 결정 우선)",
+    any(u.image_id == "rj-u-cl" and u.suggestions == [] for u in rj4.uncertain)
+    and all("rj-u-cl" not in c.image_ids for c in rj4.clusters),
+  )
+
+  # 전체 삭제 시 점수 캐시도 삭제 (생체 파생 정보 위생)
+  rj_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          "type": "delete_request",
+          "job_id": "job-rj-del",
+          "event_id": "event-rj",
+          "image_ids": ["rj-a1", "rj-a2", "rj-b1", "rj-b2", "rj-u-join", "rj-u-sugg", "rj-u-cl"],
+        }
+      )
+    )
+  )
+  check(
+    "전체 delete: 재판정 점수 캐시 함께 삭제", rj_score_store.blobs == {} and rj_store.load("event-rj").face_ids == ()
+  )
+
+  # 재판정 장애 = 종전 동작: comparer가 전 쌍에서 던져도 결과가 비활성(미주입) 실행과 완전히 같다
+  def rj_always_raise(source: bytes, target: bytes) -> float:
+    raise RuntimeError("rekognition down")
+
+  rj_err_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("rj2-person"),
+    new_face_id=counter("rj2-face"),
+    rejudger=UncertainRejudger(compare=rj_always_raise, fetch_image=image_source.fetch, crop=rj_crop),
+    rejudge_scores=InMemoryRekognitionScoreStore(),
+  )
+  rj_off_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("rj2-person"),
+    new_face_id=counter("rj2-face"),
+  )
+  check(
+    "재판정 전면 장애: 결과가 비활성 실행과 동일 (best-effort — 현 동작 유지)",
+    rj_err_handlers.handle(parse_inbound_message(json.dumps(rj_body)))
+    == rj_off_handlers.handle(parse_inbound_message(json.dumps(rj_body))),
+  )
+
+  # 콜드 핸들러 + 웜 캐시: 다른 워커/재기동이 캐시만 물려받아도 호출 0회로 같은 판정 (재과금 방지)
+  pre_calls: list[tuple[bytes, bytes]] = []
+
+  def pre_compare(source: bytes, target: bytes) -> float:
+    pre_calls.append((source, target))
+    return 5.0
+
+  pre_score_store = InMemoryRekognitionScoreStore()
+  pre_score_store.save(
+    "event-rj",
+    {
+      ("pre-face-5", "pre-face-2"): 99.0,  # u-join ↔ A 대표 (append 순서 기반 결정적 face id)
+      ("pre-face-5", "pre-face-3"): 5.0,
+      ("pre-face-6", "pre-face-2"): 88.0,
+      ("pre-face-6", "pre-face-3"): 5.0,
+    },
+  )
+  pre_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("pre-person"),
+    new_face_id=counter("pre-face"),
+    rejudger=UncertainRejudger(compare=pre_compare, fetch_image=image_source.fetch, crop=rj_crop),
+    rejudge_scores=pre_score_store,
+  )
+  pre_result = pre_handlers.handle(parse_inbound_message(json.dumps(rj_body)))
+  check(
+    "웜 캐시 콜드 시작: 편입·제안 재현 + CompareFaces 호출 0회",
+    "rj-u-join" in next(c for c in pre_result.clusters if "rj-a1" in c.image_ids).image_ids
+    and any(u.image_id == "rj-u-sugg" and len(u.suggestions) == 1 for u in pre_result.uncertain)
+    and pre_calls == [],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

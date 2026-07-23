@@ -144,13 +144,17 @@
     // album_id: 이 사진을 인물 앨범으로 옮길 때 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id
     // face_bboxes: 주 인물 얼굴 bbox 배열(원본 px, x·y=좌상단, 폭 내림차순) — 앱 상세 화면 얼굴 crop용 (아래 註)
     // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거 (아래 註)
+    // suggestions: Rekognition 재판정의 "이 앨범 아닐까요?" 제안 (ADR-030, 아래 註) — 빈 배열 = 제안 없음/비활성
     { "image_id": "img-5", "reason": "ambiguous", "album_id": "__uncertain__",    // 두 인물 사이 저신뢰
       "face_bboxes": [ { "x": 120, "y": 48, "w": 260, "h": 300 },
                        { "x": 400, "y": 60, "w": 180, "h": 200 } ],
-      "causes": ["low_resolution", "small_faces"] },  // 저해상도라 얼굴이 작게 잡힘 → "원본으로 다시"
+      "causes": ["low_resolution", "small_faces"],  // 저해상도라 얼굴이 작게 잡힘 → "원본으로 다시"
+      "suggestions": [ { "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },  // face_bboxes[0]과 같은 값 — 얼굴 결속
+                         "cluster_id": "person-A", "similarity": 88.7 } ] },
     { "image_id": "img-6", "reason": "unmatched", "album_id": "__uncertain__",    // 얼굴은 있으나 인물 미매칭 (예: 행인)
       "face_bboxes": [],                           // 빈 배열 = 자격 얼굴 없음·bbox 미상 — crop 없이 사진만 표시
-      "causes": [] }                               // 빈 배열 = 품질 문제 아님(예: 고해상도 미등록 인물)
+      "causes": [],                                // 빈 배열 = 품질 문제 아님(예: 고해상도 미등록 인물)
+      "suggestions": [] }                          // 빈 배열 = 제안 없음 (기능 비활성이면 항상 빈 배열)
   ],
   "eyes_closed": ["img-3"],                       // exclude_eyes_closed=ON일 때만 — 뷰어 비노출
   "blurry": ["img-4"],                            // exclude_blurry=ON일 때만 — 뷰어 비노출
@@ -188,6 +192,13 @@
   **빈 배열** = 품질·데이터 문제 아님(예: 두 인물 사이 저신뢰 ambiguous, 폭 미상 구버전 행) → 앱은 "직접 인물
   앨범 지정"만 안내. 임계는 `CLUSTER_UNCERTAIN_SMALL_FACE_PX`(100)·`CLUSTER_UNCERTAIN_LOW_RES_LONG_SIDE`(2000),
   전자 0이면 기능 비활성. 상세는 [feature-spec §6.2](feature-spec.md).
+- `suggestions`(계약 확장, [ADR 030](../decisions/030-rekognition-uncertain-rejudge.md) — **Spring 합의 필요**):
+  Rekognition 보조 재판정의 "이 앨범 아닐까요?" 제안. `face_bbox`는 같은 항목 `face_bboxes` 배열의
+  원소와 **정확히 같은 값**(int 동등 비교로 얼굴 결속), `cluster_id`는 제안 앨범, `similarity`는
+  Rekognition 점수(0~100, 유사도 내림차순). 사용자가 수락하면 기존
+  `reassign(from_cluster_id="__uncertain__")`을 그대로 쓴다 — 신규 액션 불요. **기능 비활성
+  (`REJUDGE_ENABLED=false` 롤백)이면 항상 빈 배열**이라 배포 순서 제약이 없다. 자동 편입(임계 90 이상)된
+  얼굴은 제안 없이 처음부터 `clusters`에 실린다. 상세는 [feature-spec §6.2](feature-spec.md).
 - 실패 케이스를 포함한 계약 검증 전체는 `python -m app.schemas.messages`로 실행할 수 있다.
 
 ## ⑤ 분류 진행률 — `progress` (AI → Spring, progress 큐, CHMO-274)

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
   from app.pipeline.detect import DetectorConfig
   from app.pipeline.quality import QualityConfig
+  from app.pipeline.rejudge import RejudgeConfig
   from app.pipeline.thumbnail import ThumbnailConfig
 
 
@@ -167,6 +168,22 @@ class Settings(BaseSettings):
   # (originals/events/{id}/)·사진 썸네일(thumbnails/events/{id}/)과 같은 계층에 둔다 (버킷 레이아웃 통일).
   thumbnail_prefix: str = "thumbnails/events/"
 
+  # ── Rekognition uncertain 재판정 (ADR-030, 2026-07-23 실측 리뷰) ─────────────
+  # 미배정 얼굴을 AuraFace 상위 top_k개 앨범 대표와 CompareFaces로 재판정해 자동 편입(≥auto)·
+  # 제안(≥suggest)·파편 힌트(복수 ≥fragment)를 낸다. 기본 ON(CHMO-420 활성화) — false가 롤백
+  # 스위치(재판정·캐시·suggestions 전부 끄고 종전 동작 복귀). 운영 전제 조건(AWS AI 학습 opt-out·
+  # 처리방침·워커 IAM CompareFaces 권한)은 ADR 030 §활성화 게이트 — 미충족 환경은 false로 배포.
+  rejudge_enabled: bool = True
+  rejudge_auto_assign_similarity: float = 90.0  # 실측 실용 권장값 (보수 운영 95 — 전수 정답)
+  rejudge_suggest_similarity: float = 85.0  # 미만은 오답 대역(82~84 남매·타인 아기 실존) — 판정 보류
+  rejudge_fragment_similarity: float = 95.0
+  rejudge_top_k: int = 3
+  rejudge_max_calls_per_job: int = 150  # $0.001/호출 — 오염 이벤트의 비용 폭주 안전판
+  # crop은 실측과 파리티가 계약 (bbox+0.25 여백·JPEG q92·축소 없음 — render_rejudge_crop 주석)
+  rejudge_crop_margin: float = 0.25
+  rejudge_crop_jpeg_quality: int = Field(default=92, ge=1, le=100)
+  rejudge_scores_prefix: str = "rekognition-scores/"  # (face, 대표) 점수 캐시 키 = {prefix}{event_id}.json
+
   log_level: str = "INFO"
 
   def to_cluster_config(self) -> "ClusterConfig":
@@ -238,6 +255,23 @@ class Settings(BaseSettings):
       bbox_scale=self.thumbnail_bbox_scale,
       max_side=self.thumbnail_max_side,
       jpeg_quality=self.thumbnail_jpeg_quality,
+    )
+
+  def to_rejudge_config(self) -> "RejudgeConfig":
+    """설정값을 재판정의 RejudgeConfig로 변환한다 (값 검증은 RejudgeConfig.__post_init__이 수행).
+
+    to_cluster_config와 같은 이유로 pipeline 임포트를 지연시킨다 (core→pipeline 역의존 회피).
+    활성 여부(rejudge_enabled)는 호출자(deps)가 먼저 판단한다. crop 파라미터(margin·quality)는
+    RejudgeConfig가 아니라 deps의 crop 렌더러 클로저가 소비한다 (render_rejudge_crop이 검증).
+    """
+    from app.pipeline.rejudge import RejudgeConfig
+
+    return RejudgeConfig(
+      auto_assign_similarity=self.rejudge_auto_assign_similarity,
+      suggest_similarity=self.rejudge_suggest_similarity,
+      fragment_similarity=self.rejudge_fragment_similarity,
+      top_k=self.rejudge_top_k,
+      max_calls=self.rejudge_max_calls_per_job,
     )
 
   def to_quality_config(self) -> "QualityConfig":
