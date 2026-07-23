@@ -275,6 +275,12 @@ class Constraints:
   must_link: tuple[tuple[int, int], ...] = ()
   cannot_link: tuple[tuple[int, int], ...] = ()
   auto_cannot_link: tuple[tuple[int, int], ...] = ()
+  # soft_attach는 (F, R) 방향 쌍 — Rekognition 재판정 편입(ADR-030 개정)이다. must_link와 달리 재군집
+  # 초반 강제에 참여하지 않는다: 모든 병합·구제·축출 게이트가 끝난 뒤 F를 R의 최종 클러스터에 부착만
+  # 한다(_apply_soft_attach). 저응집 하드케이스 F를 must_link로 강제하면 대상 클러스터의 응집이 내려가
+  # 파편병합 게이트 탈락·기존 멤버 축출을 유발하던 회귀(실 event 134)의 교정이다. 사람 보정이 우선이라
+  # 사용자 must_link로 이미 묶인 F는 부착 대상에서 제외하고, cannot_link(같은 사진 포함) 충돌은 보류한다.
+  soft_attach: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -837,6 +843,49 @@ def _evict_ambiguous(
   return tuple(sorted(ambiguous))
 
 
+def _apply_soft_attach(
+  labels: np.ndarray,
+  ambiguous_set: set[int],
+  soft_attach: tuple[tuple[int, int], ...],
+  blocking_cannot: tuple[tuple[int, int], ...],
+  frozen: set[int],
+) -> set[int]:
+  """소프트 어태치 (F→R): 모든 병합·구제·축출 게이트가 끝난 뒤, 미배정 얼굴 F를 대표 R이 최종적으로
+  속한 클러스터에 부착한다 (labels 제자리 수정, ADR-030 개정).
+
+  F는 어떤 응집 게이트에도 참여하지 않았으므로 대상 클러스터의 centroid·face-pair 응집을 끌어내려
+  재파편화·멤버 축출을 유발하지 않는다 — 저응집 하드케이스 F를 must-link로 강제 편입할 때 이미 올바르던
+  클러스터가 무너지던 회귀(실 event 134)의 교정이다. 다음이면 부착을 보류한다(F는 uncertain 유지):
+    - R이 이번 재군집에서 노이즈 = 대표가 사라짐 (붙일 앨범 없음)
+    - 대상 클러스터에 F와 결합 금지(cannot-link/같은 사진) 얼굴이 있음 = 같은 사진 불변식 보존
+    - F가 사용자 must-link로 이미 묶여 있음(frozen) = 사람 결정이 재판정보다 우선
+
+  R이 같은 배치의 다른 어태치로 클러스터를 얻는 연쇄까지 반영하기 위해 고정점까지 반복한다(실무상 1회
+  수렴 — R은 언제나 확정 클러스터의 대표라 연쇄가 없다). 반환: 실제로 부착된 F 행 인덱스 집합.
+  """
+  cannot_partners: dict[int, set[int]] = {}
+  for a, b in blocking_cannot:
+    cannot_partners.setdefault(a, set()).add(b)
+    cannot_partners.setdefault(b, set()).add(a)
+  attached: set[int] = set()
+  changed = True
+  while changed:
+    changed = False
+    for f, r in soft_attach:
+      if f in attached or f in frozen:
+        continue
+      target = int(labels[r])
+      if target == _NOISE:
+        continue  # 대표가 미배정 — 부착 보류 (폴백: F는 uncertain 유지)
+      if any(labels[partner] == target for partner in cannot_partners.get(f, ())):
+        continue  # 대상 클러스터에 결합 금지 얼굴 — 부착 보류 (같은 사진 불변식)
+      labels[f] = target
+      ambiguous_set.discard(f)
+      attached.add(f)
+      changed = True
+  return attached
+
+
 def _match_cluster_ids(
   new_clusters: list[tuple[int, list[int]]],
   previous_cluster_ids: Sequence[str | None],
@@ -959,6 +1008,9 @@ def _collapse_and_recluster(
     must_link=remap(resolved_constraints.must_link),
     cannot_link=remap(resolved_constraints.cannot_link),
     auto_cannot_link=remap(resolved_constraints.auto_cannot_link),
+    # soft_attach는 방향(F→R)이 있지만 remap이 입력 순서를 보존한다 — F·R이 같은 근중복 그룹으로
+    # 접히면(F가 R의 복제) 자기 쌍이 되어 탈락하고, 접힌 F는 대표 R의 클러스터에 자연 편입된다.
+    soft_attach=remap(resolved_constraints.soft_attach),
   )
   try:
     # 붕괴가 만든 모순의 사전 탐지 — 원 제약이 애초에 모순이면 폴백한 비붕괴 경로가 같은 계약대로 raise한다
@@ -1086,6 +1138,7 @@ def recluster(
   _validate_pairs(resolved_constraints.must_link, n, "must-link")
   _validate_pairs(resolved_constraints.cannot_link, n, "cannot-link")
   _validate_pairs(resolved_constraints.auto_cannot_link, n, "auto-cannot-link")
+  _validate_pairs(resolved_constraints.soft_attach, n, "soft-attach")
 
   # ⓪ 근중복 행 붕괴 (ADR-029) — HDBSCAN이 거리 0의 복제 쌍을 실제 인물 덩어리보다 우선 선택해
   # 앨범이 쌍 단위로 와해되는 재업로드·유령 행 오염(실 event 8)을 재군집 전에 차단한다.
@@ -1183,6 +1236,16 @@ def _recluster_core(
     resolved_config.merge_facepair_floor,
     resolved_config.merge_component_linkage,
   )
+
+  # 소프트 어태치 (ADR-030 개정) — 모든 응집 게이트가 끝난 최종 상태에서 재판정 편입 F를 대표 R의
+  # 클러스터에 부착만 한다. 게이트에 불참하므로 대상 클러스터를 재파편화·축출로 흔들지 않는다. 사용자
+  # must-link로 이미 묶인 F(frozen)는 사람 결정 우선이라 제외한다. 부착분은 ambiguous에서 빼 uncertain
+  # 집계에서 제거한다.
+  if resolved_constraints.soft_attach:
+    frozen = {idx for members in components.values() if len(members) >= 2 for idx in members}
+    attached = _apply_soft_attach(labels, ambiguous_set, resolved_constraints.soft_attach, blocking_cannot, frozen)
+    if attached:
+      ambiguous_indices = tuple(idx for idx in ambiguous_indices if idx not in attached)
 
   # ID 재조정
   new_clusters = _cluster_groups(labels)
@@ -1687,6 +1750,41 @@ if __name__ == "__main__":
   check(
     "(o) 군집 1개 이벤트는 top2가 없어 margin 구제 전체 건너뜀 (무차별 편입 방지)",
     3 in result.noise_indices,
+  )
+
+  # (p) 소프트 어태치 (ADR-030 개정) — 재판정 편입을 응집 게이트 이후 터미널 부착으로 반영한다.
+  soft_person = spread_vectors((0.95, 0.9, 0.88), axis(0), 10)  # 인물 A 3장 (쌍 ~0.85, 확실한 클러스터)
+  soft_f = (0.4 * axis(0) + math.sqrt(1.0 - 0.4**2) * axis(50)).astype(np.float32)  # F: A와 ~0.36 (rescue 미달)
+  soft_event = np.vstack([soft_person, soft_f[None, :]])  # 0,1,2 = A ; 3 = F
+  base_res = recluster(soft_event, [None] * 4)
+  check(
+    "(p) 전제: 저유사 F는 rescue(0.6) 미달로 노이즈", len(base_res.clusters) == 1 and base_res.noise_indices == (3,)
+  )
+  attach_res = recluster(soft_event, [None] * 4, Constraints(soft_attach=((3, 0),)))
+  check(
+    "(p) 소프트 어태치: F가 대표 R=0의 클러스터에 부착 (노이즈→멤버, 재파편화 없음)",
+    len(attach_res.clusters) == 1
+    and attach_res.clusters[0].member_indices == (0, 1, 2, 3)
+    and attach_res.noise_indices == ()
+    and attach_res.ambiguous_indices == (),
+  )
+  cl_res = recluster(soft_event, [None] * 4, Constraints(soft_attach=((3, 0),), cannot_link=((3, 0),)))
+  check("(p) cannot-link 충돌(대상 클러스터에 결합 금지 얼굴)이면 부착 보류", 3 in cl_res.noise_indices)
+  soft_g = (0.4 * axis(1) + math.sqrt(1.0 - 0.4**2) * axis(60)).astype(np.float32)  # G도 노이즈
+  soft_event2 = np.vstack([soft_person, soft_f[None, :], soft_g[None, :]])  # 3 = F, 4 = G (둘 다 노이즈)
+  hold_res = recluster(soft_event2, [None] * 5, Constraints(soft_attach=((3, 4),)))
+  check(
+    "(p) 대표 R이 노이즈면 부착 보류 (F는 uncertain 유지)", 3 in hold_res.noise_indices and 4 in hold_res.noise_indices
+  )
+  soft_b_base = (0.3 * axis(0) + math.sqrt(1.0 - 0.3**2) * axis(1)).astype(np.float64)
+  # 인물 B 4장 (A와 교차 ~0.24, 별개 클러스터). F = idx6은 B의 저유사 멤버(B와 0.78, A와 0.23).
+  soft_b = spread_vectors((0.95, 0.9, 0.88, 0.82), soft_b_base, 60)
+  frozen_event = np.vstack([soft_person, soft_b])  # 0,1,2 = A ; 3,4,5,6 = B (F=6)
+  fr_res = recluster(frozen_event, [None] * 7, Constraints(must_link=((6, 3),), soft_attach=((6, 0),)))
+  f_cluster = next(c.member_indices for c in fr_res.clusters if 6 in c.member_indices)
+  check(
+    "(p) 사람 우선: 사용자 must-link로 B에 묶인 F는 soft-attach(→A)가 못 덮음 (frozen skip)",
+    3 in f_cluster and 0 not in f_cluster,
   )
 
   print(f"\n합성 자가 검증 {passed}건 전부 통과")

@@ -419,7 +419,12 @@ class JobHandlers:
       pair for pair in stored.must_link_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
     ]
     must, cannot = _reconcile_constraints(old_must, stored.cannot_link_pairs, new_must, new_cannot)
-    event = stored.with_constraints(must, cannot)
+    # 사람이 옮긴 얼굴(superseded)의 재판정 편입은 폐기한다 — 사람 결정이 재판정보다 우선이므로
+    # 낡은 soft-attach가 이후 재군집에서 그 얼굴을 옛 대표 앨범으로 되돌리지 못하게 한다 (ADR-030 개정).
+    kept_soft_attach = [
+      pair for pair in stored.soft_attach_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
+    ]
+    event = stored.with_constraints(must, cannot).with_soft_attach_pairs(kept_soft_attach)
     snapshot = self._recluster_and_save(message.event_id, event)
     return self._assemble_result(message.job_id, message.event_id, snapshot)
 
@@ -566,6 +571,9 @@ class JobHandlers:
       must_link=tuple((row_of[a], row_of[b]) for a, b in event.must_link_pairs),
       cannot_link=tuple((row_of[a], row_of[b]) for a, b in event.cannot_link_pairs),
       auto_cannot_link=_same_photo_cannot_links(event),
+      # 재판정 편입(ADR-030 개정): 응집 게이트 이후 F를 R의 최종 클러스터에 부착만 한다 (must-link 강제로
+      # 대상 클러스터가 재파편화되던 회귀 교정). 방향(F→R) 보존 — 저장 순서가 (F, R)이다.
+      soft_attach=tuple((row_of[f], row_of[r]) for f, r in event.soft_attach_pairs),
     )
     result = recluster(event.embeddings, event.cluster_ids, constraints, self._cluster_config, self._new_cluster_id)
 
@@ -626,7 +634,7 @@ class JobHandlers:
       and (current.unmatched_indices or current.ambiguous_indices)
     ):
       # best-effort 격리 (썸네일과 동일 정책): 재판정·캐시의 어떤 실패도 job을 죽이지 않는다 — 실패 시
-      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 must-link가
+      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 soft-attach가
       # 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 제약이 저장되면 이후 모든 재군집이 죽는다(오염 방지).
       try:
         cached = self._rejudge_scores.load(event_id)
@@ -634,12 +642,14 @@ class JobHandlers:
           event, current.clusters, (*current.ambiguous_indices, *current.unmatched_indices), cached
         )
         if outcome.assignments:
-          augmented = event.with_constraints(
-            event.must_link_pairs + tuple((a.face_id, a.rep_face_id) for a in outcome.assignments),
-            event.cannot_link_pairs,
+          # 편입은 must-link가 아니라 soft-attach로 기록한다 (ADR-030 개정): 저응집 F를 must-link로 강제하면
+          # 대상 클러스터의 응집이 내려가 파편병합 게이트 탈락·기존 멤버 축출을 유발했다(실 event 134 회귀).
+          # soft-attach는 모든 응집 게이트 이후 F를 대표 R의 최종 클러스터에 부착만 해 클러스터를 안 흔든다.
+          augmented = event.with_soft_attach_pairs(
+            event.soft_attach_pairs + tuple((a.face_id, a.rep_face_id) for a in outcome.assignments)
           )
           current = self._cluster_pass(augmented)
-          event = augmented  # 2차 패스 성공 — 편입 must-link를 저장 대상으로 확정 (이후 재군집에서 유지)
+          event = augmented  # 2차 패스 성공 — 편입 soft-attach를 저장 대상으로 확정 (이후 재군집에서 유지)
       except Exception:
         logger.warning("Rekognition 재판정 실패 event_id=%s — 무시하고 진행 (현 동작 유지)", event_id, exc_info=True)
         outcome = None
@@ -2030,8 +2040,9 @@ if __name__ == "__main__":
   rj_event = rj_store.load("event-rj")
   rj_face_of = dict(zip(rj_event.photo_ids, rj_event.face_ids))
   check(
-    "재판정 편입은 (얼굴, 대표) must-link로 .npz에 기록 — 이후 재군집에서 유지되는 근거",
-    rj_event.must_link_pairs == ((rj_face_of["rj-u-join"], rj_face_of["rj-a2"]),)
+    "재판정 편입은 (얼굴, 대표) soft-attach로 .npz에 기록 — 이후 재군집에서 유지되는 근거 (ADR-030 개정)",
+    rj_event.soft_attach_pairs == ((rj_face_of["rj-u-join"], rj_face_of["rj-a2"]),)
+    and rj_event.must_link_pairs == ()
     and dict(zip(rj_event.photo_ids, rj_event.cluster_ids))["rj-u-join"] == rj_cluster_a.cluster_id,
   )
   rj_sugg = next(u for u in rj1.uncertain if u.image_id == "rj-u-sugg")

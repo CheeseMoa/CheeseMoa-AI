@@ -25,7 +25,10 @@ EMBED_DIM = 512
 # v4: image_long_sides(원본 이미지 긴 변 px) 열 추가 — uncertain 품질 원인(low_resolution) 판정용 (CHMO-404).
 # v3 이하 파일은 긴 변 0(미상)으로 로드된다: 0인 행은 low_resolution을 판정할 수 없어 그 원인만 빠질 뿐
 # (small_faces는 face_widths로 여전히 판정), 종전 동작과 일치하는 안전 폴백.
-SCHEMA_VERSION = 4
+# v5: soft_attach_pairs(F→R, 방향 있음) 열 추가 — Rekognition 재판정 편입(ADR-030 개정). must-link와 달리
+# 모든 응집 게이트 이후 F를 R의 최종 클러스터에 부착만 해 대상 클러스터를 재파편화·축출로 흔들지 않는다.
+# v4 이하 파일은 빈 튜플로 로드된다: 재판정 편입이 없던 상태와 정확히 일치하는 안전 폴백.
+SCHEMA_VERSION = 5
 # numpy 문자열 배열에는 null이 없어 "직전 배정 없음"을 빈 문자열로 인코딩한다 (ADR-007)
 _NO_CLUSTER = ""
 _ID_KEYS = ("face_ids", "photo_ids", "cluster_ids")
@@ -76,6 +79,12 @@ class EventEmbeddings:
   image_long_sides: tuple[
     float, ...
   ] = ()  # 길이 N — 원본 이미지 긴 변 px (0 = 미상, v3 이하 폴백). uncertain 저해상도 판정용
+  # face_id 쌍 (F, R) — Rekognition 재판정이 미배정 F를 대표 R의 앨범에 편입하려는 지시 (ADR-030 개정).
+  # must-link와 별도 채널인 이유: must-link는 재군집 초반에 강제돼 저응집 F가 대상 클러스터의 응집을
+  # 끌어내려 재파편화·멤버 축출을 유발했다(실 event 134 회귀). soft-attach는 모든 병합·구제·축출
+  # 게이트가 끝난 뒤 F를 R의 최종 클러스터에 부착만 한다. 방향(F→R)이 의미를 가진다 — R은 사라지지 않는
+  # 대표, F는 붙는 얼굴. 사람 보정(must/cannot)이 우선이며 soft-attach는 사람 결정을 덮지 않는다.
+  soft_attach_pairs: tuple[tuple[str, str], ...] = ()
 
   def __post_init__(self) -> None:
     n = len(self.face_ids)
@@ -130,7 +139,11 @@ class EventEmbeddings:
         # recluster와 동일한 단위벡터 계약을 저장 경계에서 먼저 강제해 손상을 조기에 표면화한다
         raise ValueError("embeddings는 L2 정규화 단위벡터여야 합니다.")
     known = set(self.face_ids)
-    for kind, pairs in (("must-link", self.must_link_pairs), ("cannot-link", self.cannot_link_pairs)):
+    for kind, pairs in (
+      ("must-link", self.must_link_pairs),
+      ("cannot-link", self.cannot_link_pairs),
+      ("soft-attach", self.soft_attach_pairs),
+    ):
       for a, b in pairs:
         if a == b:
           raise ValueError(f"{kind} 쌍은 서로 다른 얼굴이어야 합니다. 받은 쌍: ({a}, {b})")
@@ -206,6 +219,9 @@ class EventEmbeddings:
       cannot_link_pairs=tuple(
         pair for pair in self.cannot_link_pairs if pair[0] in kept_faces and pair[1] in kept_faces
       ),
+      soft_attach_pairs=tuple(
+        pair for pair in self.soft_attach_pairs if pair[0] in kept_faces and pair[1] in kept_faces
+      ),
     )
 
   def with_cluster_ids(self, cluster_ids: Sequence[str | None]) -> "EventEmbeddings":
@@ -217,12 +233,19 @@ class EventEmbeddings:
     must_link_pairs: Sequence[tuple[str, str]],
     cannot_link_pairs: Sequence[tuple[str, str]],
   ) -> "EventEmbeddings":
-    """제약 셋 전체를 교체한 새 인스턴스를 만든다 (later-wins 조정 결과 반영용)."""
+    """사람 보정 제약(must/cannot) 셋 전체를 교체한 새 인스턴스를 만든다 (later-wins 조정 결과 반영용).
+
+    soft_attach_pairs는 건드리지 않는다 — 재판정 편입은 별도 채널이라 사람 보정 조정에 휩쓸리지 않는다.
+    """
     return replace(
       self,
       must_link_pairs=tuple(must_link_pairs),
       cannot_link_pairs=tuple(cannot_link_pairs),
     )
+
+  def with_soft_attach_pairs(self, soft_attach_pairs: Sequence[tuple[str, str]]) -> "EventEmbeddings":
+    """소프트 어태치 쌍(F→R) 셋을 교체한 새 인스턴스를 만든다 (Rekognition 재판정 편입 반영용, ADR-030)."""
+    return replace(self, soft_attach_pairs=tuple(soft_attach_pairs))
 
   def row_index_of(self) -> dict[str, int]:
     """face_id → 행 인덱스 매핑 — 제약 쌍을 recluster의 인덱스 쌍으로 번역할 때 쓴다."""
@@ -244,6 +267,7 @@ class EventEmbeddings:
       bboxes=np.asarray(self.bboxes, dtype=np.float32).reshape(-1, 4),  # 빈 입력도 shape (0, 4) 보장
       s3_keys=_as_str_array(self.s3_keys),
       image_long_sides=np.asarray(self.image_long_sides, dtype=np.float32),
+      soft_attach_pairs=_as_str_array(self.soft_attach_pairs, columns=2),
     )
     return buffer.getvalue()
 
@@ -256,7 +280,7 @@ class EventEmbeddings:
     try:
       with np.load(io.BytesIO(blob), allow_pickle=False) as archive:
         version = int(archive["schema_version"])
-        if version not in (1, 2, 3, SCHEMA_VERSION):
+        if version not in (1, 2, 3, 4, SCHEMA_VERSION):
           raise StoreCorruptionError(
             f"지원하지 않는 schema_version입니다. 받은 값: {version}, 지원: 1~{SCHEMA_VERSION}"
           )
@@ -283,6 +307,14 @@ class EventEmbeddings:
           if array.ndim != 2 or array.shape[1] != 2:
             raise StoreCorruptionError(f"{key}는 shape (K, 2)여야 합니다. 받은 shape: {array.shape}")
           pairs[key] = tuple((str(a), str(b)) for a, b in array)
+        # v4 이하에는 soft_attach_pairs가 없다 — 빈 튜플(재판정 편입 없던 상태)로 폴백, 나머지 동작 동일
+        if version >= 5:
+          sa_array = archive["soft_attach_pairs"]
+          if sa_array.ndim != 2 or sa_array.shape[1] != 2:
+            raise StoreCorruptionError(f"soft_attach_pairs는 shape (K, 2)여야 합니다. 받은 shape: {sa_array.shape}")
+          soft_attach_pairs = tuple((str(a), str(b)) for a, b in sa_array)
+        else:
+          soft_attach_pairs = ()
     except StoreCorruptionError:
       raise
     except (KeyError, ValueError, OSError, zipfile.BadZipFile) as exc:
@@ -300,6 +332,7 @@ class EventEmbeddings:
         bboxes=bboxes,
         s3_keys=s3_keys,
         image_long_sides=image_long_sides,
+        soft_attach_pairs=soft_attach_pairs,
       )
     except ValueError as exc:  # __post_init__ 불변식 위반 (길이 정합·face_id 유일·제약 참조 존재 등)
       raise StoreCorruptionError(f".npz 불변식 위반: {exc}") from exc
@@ -347,8 +380,14 @@ if __name__ == "__main__":
   check("append_faces 이미지 긴 변 기록 (생략 = 0)", event.image_long_sides == (1600.0, 0.0, 0.0))
   event = event.with_cluster_ids(["person-A", None, "person-B"])
   event = event.with_constraints([("face-1", "face-3")], [("face-2", "face-3")])
+  event = event.with_soft_attach_pairs([("face-2", "face-1")])  # 재판정 편입 (F=face-2 → R=face-1)
   restored = EventEmbeddings.from_npz_bytes(event.to_npz_bytes())
   check("직렬화 왕복 (id·제약 보존)", restored == event)
+  check("소프트 어태치 쌍 직렬화 왕복", restored.soft_attach_pairs == (("face-2", "face-1"),))
+  check(
+    "with_constraints는 soft_attach를 건드리지 않음",
+    event.with_constraints([], []).soft_attach_pairs == (("face-2", "face-1"),),
+  )
   check(
     '미배정 None ↔ "" 인코딩 왕복',
     restored.cluster_ids == ("person-A", None, "person-B"),
@@ -358,12 +397,13 @@ if __name__ == "__main__":
 
   masked = event.masked_by_photo_ids(["img-1", "img-1"])  # 중복 삭제 id 멱등
   check(
-    "삭제 마스킹 + 댕글링 제약 프루닝",
+    "삭제 마스킹 + 댕글링 제약 프루닝 (must/cannot/soft-attach 전부)",
     masked.face_ids == ("face-3",)
     and masked.photo_ids == ("img-2",)
     and masked.cluster_ids == ("person-B",)
     and masked.must_link_pairs == ()
-    and masked.cannot_link_pairs == (),
+    and masked.cannot_link_pairs == ()
+    and masked.soft_attach_pairs == (),
   )
   check("삭제 마스킹이 폭도 함께 마스킹", masked.face_widths == (0.0,))
   check(
@@ -435,6 +475,31 @@ if __name__ == "__main__":
   check(
     "v3 .npz 로드: 이미지 긴 변 미상(0) 폴백 + bbox·s3_key 보존",
     from_v3.image_long_sides == (0.0, 0.0, 0.0) and from_v3.bboxes == event.bboxes and from_v3.s3_keys == event.s3_keys,
+  )
+
+  # v4 하위호환: soft_attach_pairs 열이 없는 .npz는 빈 튜플(재판정 편입 없던 상태)로 로드된다 —
+  # image_long_sides·bbox·제약은 보존된다 (SCHEMA_VERSION 주석, ADR-030 개정).
+  v4_buffer = io.BytesIO()
+  np.savez_compressed(
+    v4_buffer,
+    schema_version=np.int64(4),
+    embeddings=event.embeddings,
+    face_ids=_as_str_array(event.face_ids),
+    photo_ids=_as_str_array(event.photo_ids),
+    cluster_ids=_as_str_array([cid if cid is not None else _NO_CLUSTER for cid in event.cluster_ids]),
+    must_link_pairs=_as_str_array(event.must_link_pairs, columns=2),
+    cannot_link_pairs=_as_str_array(event.cannot_link_pairs, columns=2),
+    face_widths=np.asarray(event.face_widths, dtype=np.float32),
+    bboxes=np.asarray(event.bboxes, dtype=np.float32).reshape(-1, 4),
+    s3_keys=_as_str_array(event.s3_keys),
+    image_long_sides=np.asarray(event.image_long_sides, dtype=np.float32),
+  )
+  from_v4 = EventEmbeddings.from_npz_bytes(v4_buffer.getvalue())
+  check(
+    "v4 .npz 로드: soft_attach 빈 튜플 폴백 + must/cannot 보존",
+    from_v4.soft_attach_pairs == ()
+    and from_v4.must_link_pairs == event.must_link_pairs
+    and from_v4.cannot_link_pairs == event.cannot_link_pairs,
   )
 
   invalid_cases = [
