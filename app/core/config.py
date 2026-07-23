@@ -61,6 +61,10 @@ class Settings(BaseSettings):
   # ADR-024: 병합 승인을 컴포넌트 '현재 전체 멤버' 재평가로 판정 (false = 구 파편 스냅샷 완전 연결)
   cluster_merge_component_linkage: bool = True
   cluster_rescue_similarity: float = 0.6
+  # margin 구제 (2026-07-23 실측) — 절대 유사도는 낮지만 2위 군집 대비 여유가 큰 노이즈(옆얼굴·역광)
+  # 편입. 0 = 비활성(기본 — 실 이벤트 적대 검증 전 실험 전용). 근거·한계는 ClusterConfig 주석 참조.
+  cluster_margin_rescue_floor: float = 0.0
+  cluster_margin_rescue_ratio: float = 1.7
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
   cluster_evict_gray_ceiling: float = 0.46  # ADR-020: LOO centroid 회색지대 상한 — face-pair 재확인 대상
@@ -182,6 +186,8 @@ class Settings(BaseSettings):
       merge_facepair_floor=self.cluster_merge_facepair_floor,
       merge_component_linkage=self.cluster_merge_component_linkage,
       rescue_similarity=self.cluster_rescue_similarity,
+      margin_rescue_floor=self.cluster_margin_rescue_floor,
+      margin_rescue_ratio=self.cluster_margin_rescue_ratio,
       min_membership_similarity=self.cluster_min_membership_similarity,
       min_membership_margin=self.cluster_min_membership_margin,
       evict_gray_ceiling=self.cluster_evict_gray_ceiling,
