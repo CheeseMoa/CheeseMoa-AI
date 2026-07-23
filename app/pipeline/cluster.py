@@ -12,6 +12,8 @@
   ④ 노이즈 구제 — 최근접 centroid 유사도가 충분한 노이즈 얼굴을 클러스터에 편입
   ⑤ 저신뢰 분리 — 절대 유사도·2위 마진 임계 미달 멤버를 ambiguous로 분리 (TBD #3 기본 정책)
      + 회색지대(centroid 바닥은 넘었지만 낮음) 멤버는 face-pair 증거로 재확인해 증거 없으면 축출 (ADR 020)
+     + margin 구제 — 절대 유사도는 ④ 임계에 못 미쳐도 2위 군집 대비 여유가 큰 잔여 노이즈(옆얼굴·역광·
+       모션)를 top1 군집에 편입 (기본 비활성 — margin_rescue_floor 주석·2026-07-23 실측 참조)
   ⑥ 2차 파편 병합 — 구제·분리로 바뀐 최종 멤버십에 ③과 같은 판정을 재적용 (ADR-010)
   ⑦ 기존 클러스터와의 overlap(Jaccard) 매칭으로 cluster_id 승계 / 신규 발급 / 은퇴
   ⑧ 클러스터별 대표벡터(L2 정규화 평균, 파생 캐시) 계산
@@ -88,6 +90,20 @@ class ClusterConfig:
   # 노이즈 구제 임계 — 최근접 centroid 유사도가 이 이상인 노이즈 얼굴을 그 클러스터에 편입한다.
   # 동일 인물 하한(≈0.6) 수준. 1.0에 가깝게 올리면 사실상 비활성.
   rescue_similarity: float = 0.6
+  # margin 구제 (2026-07-23 커스텀 15인 세트 실측) — 절대 유사도가 rescue_similarity에 못 미치는 잔여
+  # 노이즈(옆얼굴·역광·모션)를 "top1 군집 유사도 ≥ floor AND top1 ≥ ratio×top2"일 때만 top1에 편입한다.
+  # 절대 임계 인하로는 불가한 대역이다 — 동일인 하드 포즈↔정면(0.34~0.49)이 타인·형제 구간(0.42~0.46,
+  # ADR-012 타인 최고 0.4584)과 겹친다. 판별 신호는 상대 여유에 남는다: 동일인 하드 포즈는 top1
+  # 0.44~0.49 / top2 0.14~0.28(배율 1.7~3.3)인 반면 형제 모호·타인 top1은 배율 ≈1.0. floor도 하중을
+  # 받는다 — 배율만 통과하는 타인 top1이 0.22~0.26 대역에 실존(배율 1.7~1.9 관측). ⑤ 축출 뒤에
+  # 최종 노이즈(축출 강등분 포함, ambiguous 제외)를 재심한다 — 근거는 _recluster_core 주석.
+  # 코퍼스 실측(scripts/eval_accuracy.py, floor 0.40·ratio 1.7): 성인 9인 50장 쌍 F1 0.792→0.872
+  # (recall +0.118)·오답쌍 0, 라벨 아동 8인 52장 무변화(구제 0·오배정 0), 닮은꼴(카리나·고윤정)
+  # 무변화 — 전 데이터셋 정밀도 1.0 유지. 알려진 한계: 닮은꼴 형제가 자기 군집 없이 본인 부재
+  # 사진에 등장하면 오배정 가능(자매 top1 0.561 실측 — 같은 사진 cannot-link만 차단).
+  # floor 0 = 비활성(기본 — 실 이벤트 적대 검증 전까지 실험 전용).
+  margin_rescue_floor: float = 0.0
+  margin_rescue_ratio: float = 1.7
   # 저신뢰 분리 임계 (TBD feature-spec §10 #3의 초기값) — 아래 둘 중 하나라도 걸리면 ambiguous로 뺀다:
   # 자기 centroid 절대 유사도 바닥, 그리고 2위 클러스터와의 유사도 마진.
   min_membership_similarity: float = 0.4
@@ -169,6 +185,7 @@ class ClusterConfig:
       "merge_centroid_similarity",
       "merge_facepair_floor",
       "rescue_similarity",
+      "margin_rescue_floor",
       "min_membership_similarity",
       "min_membership_margin",
       "evict_gray_ceiling",
@@ -192,6 +209,10 @@ class ClusterConfig:
       raise ValueError(
         f"cluster_selection_epsilon은 cosine 거리 범위 [0, 2] 안이어야 합니다. 받은 값: {self.cluster_selection_epsilon}"
       )
+    if self.margin_rescue_floor > 0 and self.margin_rescue_ratio < 1.0:
+      # 배율 1 미만이면 top2가 top1에 근접해도(형제 모호) 통과한다 — 게이트의 존재 이유가 무너지는
+      # 오설정을 즉시 드러낸다
+      raise ValueError(f"margin_rescue_ratio는 1 이상이어야 합니다. 받은 값: {self.margin_rescue_ratio}")
     if self.rescue_similarity < self.min_membership_similarity:
       # 이 순서가 깨지면 [rescue, floor) 대역에서 구제된 얼굴이 같은 실행의 저신뢰 축출에서 곧바로
       # 노이즈로 재강등된다 — 구제 시점과 축출 시점의 자기 제외 유사도가 정확히 같기 때문 (리뷰 재현).
@@ -700,6 +721,46 @@ def _rescue_noise(
     rescued.add(idx)
 
 
+def _margin_rescue_noise(
+  labels: np.ndarray,
+  embeddings: np.ndarray,
+  cannot_link: tuple[tuple[int, int], ...],
+  candidates: Sequence[int],
+  config: ClusterConfig,
+) -> None:
+  """2위 군집 대비 여유(margin)가 큰 잔여 노이즈를 top1 군집에 편입한다 (labels 제자리 수정).
+
+  ④ 절대 임계 구제가 놓치는 하드 포즈(옆얼굴·역광·모션) 전용의 2차 구제다 — 근거·실측·한계는
+  ClusterConfig.margin_rescue_floor 주석, 후보 선정(축출 강등분 포함)의 근거는 _recluster_core
+  주석 참조. ④와 달리 top1 군집만 후보로 삼는다: top1이
+  cannot-link로 차단됐을 때 top2로 낙착하면 "2위와는 멀어서 믿는다"는 게이트의 전제 자체가
+  깨진다. 군집이 1개뿐이면 top2가 없어 여유를 정의할 수 없으므로 보수적으로 전체를 건너뛴다
+  (단일 군집 이벤트에서 무차별 편입 방지). 처리 순서는 ④와 같은 전역 top1 유사도 내림차순 —
+  cannot-link 경합에서 더 나은 매치가 항상 먼저 배정되어 결과가 결정적이다.
+  """
+  if not candidates:
+    return
+  ordered = _cluster_groups(labels)
+  if len(ordered) < 2:
+    return
+  centroids = np.stack([_normalized_mean(embeddings, members) for _, members in ordered])
+  similarities = embeddings[np.asarray(candidates)] @ centroids.T  # (후보 수, 클러스터 수)
+  ranked: list[tuple[float, int, int]] = []
+  for row, idx in enumerate(candidates):
+    order = np.argsort(similarities[row])
+    top1, top2 = float(similarities[row, order[-1]]), float(similarities[row, order[-2]])
+    # top2 ≤ 0(경쟁자 없음)은 배율 조건이 자동 충족 — max(top2, 0)으로 나눗셈 없이 판정한다
+    if top1 >= config.margin_rescue_floor and top1 >= config.margin_rescue_ratio * max(top2, 0.0):
+      ranked.append((-top1, idx, int(order[-1])))
+  partners = _cannot_link_partners(cannot_link)
+  for _, idx, pos in sorted(ranked):
+    target = ordered[pos][0]
+    # 라이브 labels 검사 — 먼저 구제된 cannot-link 상대가 있으면 편입하지 않는다 (top2 낙착 없음)
+    if any(labels[partner] == target for partner in partners.get(idx, ())):
+      continue
+    labels[idx] = target
+
+
 def _evict_ambiguous(
   labels: np.ndarray,
   embeddings: np.ndarray,
@@ -1097,6 +1158,16 @@ def _recluster_core(
   protected.update(idx for pair in resolved_constraints.cannot_link for idx in pair)
   ambiguous_indices = _evict_ambiguous(labels, emb, resolved_constraints.cannot_link, protected, resolved_config)
   ambiguous_set = set(ambiguous_indices)
+  if resolved_config.margin_rescue_floor > 0:
+    # 후보 = 축출까지 끝난 최종 노이즈 전부(축출의 회색지대 강등분 포함) − ambiguous.
+    # 강등분을 제외하지 않는 이유: HDBSCAN이 하드 포즈를 일단 클러스터에 붙였다가 회색지대 게이트가
+    # 강등하는 경로가 흔해(옆얼굴은 개별 쌍도 전부 0.45 미만이라 ADR-020 증거를 못 만든다), 제외하면
+    # 게이트가 사실상 죽는다(성인 9인 실측: 제외 시 구제 1건 vs 포함 시 3건·F1 +0.056). 회색지대
+    # 축출(절대·쌍 증거 부재)과 margin(상대 여유)은 다른 증거축의 재심이라 실행 내 재순환도 없다 —
+    # margin이 멤버십의 최종 발언이고 매 실행 같은 고정점에 수렴한다. ambiguous는 '2위 마진 부족'
+    # 판정이라 margin과 같은 축에서 이미 기각된 것이므로 제외한다.
+    margin_candidates = sorted(int(i) for i in np.flatnonzero(labels == _NOISE) if int(i) not in ambiguous_set)
+    _margin_rescue_noise(labels, emb, blocking_cannot, margin_candidates, resolved_config)
   # 2차 파편 병합 (ADR-010) — 1차 병합은 구제·축출 전 centroid 스냅샷으로 판정하므로, 구제가 멤버를
   # 추가하면 최종 구성 기준으로는 임계를 넘는 파편 쌍이 남는다 (실 event 실측: 판정 시 0.688 →
   # 구제 후 0.705). 같은 임계·같은 cannot-link 가드를 최종 멤버십에서 한 번 더 적용한다.
@@ -1583,6 +1654,36 @@ if __name__ == "__main__":
   check(
     "(g) floor < min_membership_similarity 조합 거부 (승격 즉시 재강등 churn 차단)",
     raises_value_error(lambda: ClusterConfig(blob_promote_floor=0.3)),
+  )
+  check(
+    "(g) margin 활성 시 ratio < 1 거부 (형제 모호 통과 오설정 차단)",
+    raises_value_error(lambda: ClusterConfig(margin_rescue_floor=0.4, margin_rescue_ratio=0.9)),
+  )
+
+  # (o) margin 구제 (2026-07-23 실측 재현) — 인물 A·B 각 3장 + 하드 포즈 얼굴 M(A와만 0.43 근접,
+  # B와 0 — 옆얼굴 실측 top1 0.44~0.49/top2 0.14~0.28의 합성 재현) + 형제 모호 얼굴 X(A 0.43·B 0.42
+  # — 배율 ≈1.0). 둘 다 HDBSCAN이 A에 붙였다가 회색지대 게이트(최강 쌍 <0.45)가 강등하는 실경로를
+  # 밟는다 — margin 게이트는 그 강등분을 재심해 여유가 큰 M만 편입해야 한다.
+  margin_a = spread_vectors((0.9, 0.88, 0.86), axis(0), 10)
+  margin_b = spread_vectors((0.9, 0.88, 0.86), axis(1), 20)
+  margin_m = (0.45 * axis(0) + math.sqrt(1.0 - 0.45**2) * axis(40)).astype(np.float32)
+  margin_x = (0.45 * axis(0) + 0.44 * axis(1) + math.sqrt(1.0 - 0.45**2 - 0.44**2) * axis(41)).astype(np.float32)
+  margin_event = np.vstack([margin_a, margin_b, margin_m[None, :], margin_x[None, :]])
+  result = recluster(margin_event, [None] * 8)
+  check(
+    "(o) 전제: margin OFF(기본)면 하드 포즈 M·모호 X 둘 다 노이즈",
+    {6, 7} <= set(result.noise_indices) and len(result.clusters) == 2,
+  )
+  margin_on = ClusterConfig(margin_rescue_floor=0.40, margin_rescue_ratio=1.7)
+  result = recluster(margin_event, [None] * 8, config=margin_on)
+  check(
+    "(o) margin ON: 여유 큰 M만 top1(A)에 편입, 배율 ≈1.0인 X는 노이즈 유지",
+    any(c.member_indices == (0, 1, 2, 6) for c in result.clusters) and 7 in result.noise_indices,
+  )
+  result = recluster(np.vstack([margin_a, margin_m[None, :]]), [None] * 4, config=margin_on)
+  check(
+    "(o) 군집 1개 이벤트는 top2가 없어 margin 구제 전체 건너뜀 (무차별 편입 방지)",
+    3 in result.noise_indices,
   )
 
   print(f"\n합성 자가 검증 {passed}건 전부 통과")
