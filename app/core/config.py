@@ -62,8 +62,8 @@ class Settings(BaseSettings):
   cluster_merge_component_linkage: bool = True
   cluster_rescue_similarity: float = 0.6
   # margin 구제 (2026-07-23 실측) — 절대 유사도는 낮지만 2위 군집 대비 여유가 큰 노이즈(옆얼굴·역광)
-  # 편입. 0 = 비활성(기본 — 실 이벤트 적대 검증 전 실험 전용). 근거·한계는 ClusterConfig 주석 참조.
-  cluster_margin_rescue_floor: float = 0.0
+  # 편입. 기본 0.40 (2026-07-23 실 이벤트 적대 검증 통과 — 근거·한계는 ClusterConfig 주석·리뷰 참조). 0 = 비활성.
+  cluster_margin_rescue_floor: float = 0.40
   cluster_margin_rescue_ratio: float = 1.7
   cluster_min_membership_similarity: float = 0.4
   cluster_min_membership_margin: float = 0.05
