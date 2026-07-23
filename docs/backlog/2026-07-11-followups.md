@@ -7,14 +7,15 @@
 
 ## P0 — 데이터 오염 (실 데이터가 이미 깨져 있음)
 
-### 1. 중복 임베딩 방어 (앨범 쌍 단위 와해)
+### 1. 중복 임베딩 방어 (앨범 쌍 단위 와해) — ✅ 완료 (2026-07-23, ADR 029)
 
 동일 사진이 다른 `image_id`로 재업로드되면 유사도 1.00인 임베딩 쌍이 생기고, HDBSCAN이 인물
 군집 대신 **복제 쌍 5개를 각각 앨범으로** 선택한다. 실 event 8에서 발생·재현 완료.
 
 - 원인·재현: [2026-07-11-duplicate-embedding-split.md](../reviews/2026-07-11-duplicate-embedding-split.md)
-- 대응: 재군집 직전 유사도 ≈1.0 행을 대표 1행으로 접고(collapse) 결과 조립 시 펼치기
-- 미결: 임계값, 적용 위치(`recluster()` 입력 전처리 vs `handlers` 계층)
+- 대응 완료: `recluster()` 입력 전처리(⓪)에서 유사도 ≥0.985 행 그룹을 대표 1행으로 접고 결과에서
+  펼친다 — 임계·위치·경계 결정은 [ADR 029](../decisions/029-duplicate-embedding-collapse.md).
+  롤백 `CLUSTER_DUPLICATE_COLLAPSE_SIMILARITY=0`. 아래 2(유령 행 삭제)·4(버저닝)는 여전히 유효.
 
 ### 2. `delete_request` 미도달 — 유령 행
 

@@ -75,8 +75,9 @@ metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적 후처
 재평가 [ADR 024](docs/decisions/024-merge-component-linkage.md)) → 노이즈 구제(전역 유사도 내림차순) →
 저신뢰 ambiguous 분리(leave-one-out + 회색지대 face-pair 축출,
 [ADR 020](docs/decisions/020-evict-facepair-gray-gate.md)) → 2차 파편 병합
-([ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 임계는 전부 `ClusterConfig` 설정값.
-클러스터링은 전체 비용 0.1% 미만.
+([ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 재군집 입력은 근중복 행(≥0.985 — 재업로드·
+유령 행 복제)을 대표 1행으로 접고 결과에서 펼친다([ADR 029](docs/decisions/029-duplicate-embedding-collapse.md),
+쌍 앨범 와해 방어). 임계는 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.
 
 **전체 재군집 + ID 재조정 (정확도 최우선)** ([ADR 007](docs/decisions/007-embedding-storage-s3.md)):
 재군집 격리 단위는 **event**. 군집의 진실은 항상 event 전체 임베딩(S3 `.npz` 보관) 재군집이며, 파티션은
@@ -175,8 +176,9 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 ### 다음 구현 목표
 
-0.1 **[P0] 실 데이터 오염 대응** — 동일 사진 재업로드의 중복 임베딩이 앨범을 쌍 단위로 쪼갬 +
-    `delete_request` 미도달 유령 행 ([backlog](docs/backlog/2026-07-11-followups.md) ·
+0.1 **[P0] 실 데이터 오염 대응 — 잔여분** — 워커 방어(근중복 행 붕괴, ADR 029)는 2026-07-23 완료.
+    잔여: Spring ETag 재업로드 검사 + `delete_request` 발행 검증(PIPA, 유령 행 자체는 여전히 존재) +
+    S3 버킷 버저닝 ([backlog](docs/backlog/2026-07-11-followups.md) ·
     [원인·재현](docs/reviews/2026-07-11-duplicate-embedding-split.md))
 0.5 **[P1] 화장품 팔레트 그림 오검출** — 크게 찍힌 얼굴 그림은 크기·score·종횡비 필터 전부 정상값으로
     통과, 임베딩 단계 신호가 필요한 별도 문제

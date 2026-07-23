@@ -872,17 +872,19 @@ if __name__ == "__main__":
     return vector
 
   # confirm_distinct(⑬) 전용 — 같은 2D 부분공간에서 각도로 인물 간 유사도를 정밀 제어한다.
-  # 인물 40·41은 0°·62°(cos≈0.47 — 병합 임계 0.55 아래라 사전조건에서 별개 앨범)에 두고, 다리 사진
-  # (가상 인물 42)은 이등분각(31°, 각 대표와 cos≈0.86)에 둔다 — 다리가 한쪽에 구제 편입되면 병합 판정이
-  # centroid cos≈0.62(≥0.55)·facepair 평균≈0.60(≥0.475)으로 넘어가, confirm_distinct 없이는 두 인물이
-  # 실제로 오병합된다(아래 인라인 재검증). 종전 0°·50°는 병합 임계 0.68 시절 기준 — ADR-012 재보정
-  # 0.55가 cos 0.64를 삼켜 사전조건이 항상 깨졌다. 현행 보정에 맞게 재배치.
+  # 인물 40·41은 0°·62°(centroid cos≈0.47 — 병합 임계 0.55 아래라 사전조건에서 별개 앨범)에 두고,
+  # 다리 사진(가상 인물 42)은 31°(두 인물 centroid와 cos 0.91/0.80)에 둔다 — 다리가 한쪽에 구제
+  # 편입되면 병합 판정이 centroid cos≈0.59(≥0.55)·facepair 평균≈0.57(≥0.475)으로 넘어가,
+  # confirm_distinct 없이는 두 인물이 실제로 오병합된다(아래 인라인 재검증). 종전 0°·50°는 병합 임계
+  # 0.68 시절 기준 — ADR-012 재보정 0.55가 cos 0.64를 삼켜 사전조건이 항상 깨졌다. 현행 보정에 맞게
+  # 재배치. step 지터는 12° — 같은 인물 사진 쌍 cos 0.978로, 근중복 붕괴 임계(0.985, ADR-029) 아래의
+  # 실사진 대역을 모사한다 (종전 0.5°는 cos 0.99996 = 재업로드 복제 수준이라 ⓪ 붕괴가 접는다).
   _CONFIRM_DISTINCT_ANGLES = {40: 0.0, 41: 62.0}
   _CONFIRM_DISTINCT_BRIDGE_ANGLE = 31.0
 
   def confirm_distinct_vector(person: int, step: int) -> np.ndarray:
     angle = _CONFIRM_DISTINCT_BRIDGE_ANGLE if person == 42 else _CONFIRM_DISTINCT_ANGLES[person]
-    theta = math.radians(angle + 0.5 * step)  # step으로 살짝 jitter — 완전 동률 방지
+    theta = math.radians(angle + 12.0 * step)  # step 지터 — 완전 동률 방지 + 붕괴 임계 아래 실사진 대역
     vector = np.zeros(EMBED_DIM, dtype=np.float32)
     vector[400] = math.cos(theta)
     vector[401] = math.sin(theta)
@@ -1814,8 +1816,7 @@ if __name__ == "__main__":
   check(
     # 입력을 역순으로 줘 정렬이 실제로 개입함을 보장 — 폭 동률은 event 행 순이 계약이다
     "uncertain face_bboxes: 폭 동률은 event 행 순 — 입력 순서 무관",
-    _uncertain_face_boxes(tie_event, (1, 0))
-    == [FaceBox(x=0, y=0, w=100, h=100), FaceBox(x=10, y=0, w=100, h=100)],
+    _uncertain_face_boxes(tie_event, (1, 0)) == [FaceBox(x=0, y=0, w=100, h=100), FaceBox(x=10, y=0, w=100, h=100)],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
