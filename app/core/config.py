@@ -79,6 +79,9 @@ class Settings(BaseSettings):
   cluster_common_face_min_similarity: float = 0.185
   # 이중 검출 붕괴 — 같은 사진의 두 얼굴 행이 이 값 이상 닮으면 한 얼굴의 두 박스로 보고 한 명으로 센다 (ADR 027). 0=비활성
   cluster_common_duplicate_face_similarity: float = 0.95
+  # 근중복 행 붕괴 (ADR 029) — 재업로드·유령 행 복제(유사도 ≥ 이 값)를 재군집 전에 대표 1행으로 접어
+  # 앨범이 쌍 단위로 와해되는 오염(실 event 8)을 차단한다. 0=비활성 (붕괴 없이 종전 동작)
+  cluster_duplicate_collapse_similarity: float = 0.985
   # uncertain 품질 원인 판정 (CHMO-404) — 주 얼굴이 이 px 미만이면 small_faces, 그중 원본 긴 변이 아래 값 미만이면
   # low_resolution도 함께. 앱이 "분류가 어려워요" 화면에 설명·재업로드 안내를 띄우는 근거. small_face_px=0이면 기능 전체 비활성
   cluster_uncertain_small_face_px: float = 100.0
@@ -192,6 +195,7 @@ class Settings(BaseSettings):
       uncertain_small_face_px=self.cluster_uncertain_small_face_px,
       uncertain_low_res_long_side=self.cluster_uncertain_low_res_long_side,
       common_duplicate_face_similarity=self.cluster_common_duplicate_face_similarity,
+      duplicate_collapse_similarity=self.cluster_duplicate_collapse_similarity,
     )
 
   def to_detector_config(self) -> "DetectorConfig":

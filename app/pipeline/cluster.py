@@ -3,6 +3,8 @@
 군집의 진실은 event 전체 임베딩(기존+신규)에 대한 HDBSCAN 재군집이다 (ADR-003, 재군집 단위=event는 ADR-007).
 이 모듈은 저장소(S3 event .npz)·SQS를 모르는 순수 로직으로, 임베딩 행렬과 직전 배정을 받아
 
+  ⓪ 근중복 행 붕괴 — 재업로드·유령 행이 만든 유사도 ≈1.0 행 그룹을 대표 1행으로 접고 결과에서
+     다시 펼친다 (HDBSCAN이 복제 쌍을 인물 덩어리보다 우선해 앨범을 쌍 단위로 쪼개는 오염 방어, ADR-029)
   ① HDBSCAN 전체 재군집 (PoC 검증 이식본, cosine) — 클러스터 0개 퇴화는 연결 성분 부분 승격으로 교정 (ADR-008)
   ② 제약 강제 — 사용자 보정(must/cannot-link)이 사람 결정을 뒤집지 않게 + 같은 사진 자동
      cannot-link(같은 사진의 두 얼굴 = 타인, ADR-011)로 물리적으로 불가능한 동거를 차단
@@ -138,6 +140,14 @@ class ClusterConfig:
   # 쌍 758개): 이중 검출 전부 0.978~0.979 vs 같은사진 타인 쌍 최고 0.756 — 0.95가 빈 구간 안.
   # 0이면 비활성(기존 동작 — 행 수 그대로 센다).
   common_duplicate_face_similarity: float = 0.95
+  # 재군집 입력의 근중복 행 붕괴 (ADR-029) — 두 행이 이 값 이상 닮으면 같은 원본의 복제(같은 사진
+  # 재업로드가 새 image_id로 재임베딩, 또는 delete_request 미도달 유령 행)로 보고 재군집 전에 대표
+  # 1행으로 접는다(결과 조립 시 전 행으로 펼침). HDBSCAN은 밀도 기반이라 거리 0의 복제 쌍을 느슨한
+  # 실제 인물 덩어리(쌍 0.39~0.67)보다 안정적인 클러스터로 선택해 앨범이 쌍 단위로 와해된다
+  # (실 event 8, 2026-07-11 리뷰). 0.985 = 재업로드 완전 복제(1.0)와 크로스이벤트 재업로드 링크
+  # 관례(≥0.985, 2026-07-22 측정)를 포괄하면서, 같은 사진 이중 검출(실측 0.978~0.979 — ADR-027
+  # 붕괴의 몫)과 실서버 동일 인물 새-세션 최고(0.934)는 아래에 남는 빈 구간 값. 0이면 비활성.
+  duplicate_collapse_similarity: float = 0.985
   # uncertain 사진의 품질 원인(UncertainImage.causes) 판정 임계 — 군집엔 영향 없고 핸들러가 결과 조립 때
   # 읽는다 (CHMO-404). 이 사진 주 얼굴(counted 최대 폭)이 이 px 미만이면 small_faces, 그중 원본 긴 변이
   # uncertain_low_res_long_side 미만이면 low_resolution도 함께 실린다. 실측 근거: 얼굴폭 매칭 무릎 ~100px
@@ -168,6 +178,7 @@ class ClusterConfig:
       "common_main_face_ratio",
       "common_face_min_similarity",
       "common_duplicate_face_similarity",
+      "duplicate_collapse_similarity",
     ):
       value = getattr(self, name)
       if not 0.0 <= value <= 1.0:
@@ -808,6 +819,159 @@ def _match_cluster_ids(
   return matched, retired
 
 
+def _duplicate_row_groups(emb: np.ndarray, constraints: Constraints, config: ClusterConfig) -> list[list[int]]:
+  """근중복 행 그룹(쌍 유사도 ≥ duplicate_collapse_similarity, 전이적 연결)을 찾는다 (⓪, ADR-029).
+
+  사람 결정 우선: 그룹 안에 사용자 cannot-link 쌍이 걸려 있으면 임베딩상 복제로 보여도 그 그룹은
+  통째로 접지 않는다 — 사람이 타인이라 지목한 두 행을 붕괴가 한 행으로 삼키면 안 된다.
+  """
+  threshold = config.duplicate_collapse_similarity
+  n = emb.shape[0]
+  if threshold <= 0.0 or n < 2:
+    return []
+  gram = emb @ emb.T
+  pair_rows, pair_cols = np.nonzero(np.triu(gram >= threshold, k=1))
+  if pair_rows.size == 0:
+    return []
+  uf = _UnionFind(n)
+  for i, j in zip(pair_rows.tolist(), pair_cols.tolist()):
+    uf.union(i, j)
+  members: dict[int, list[int]] = {}
+  for row in range(n):
+    members.setdefault(uf.find(row), []).append(row)
+  groups = sorted(rows for rows in members.values() if len(rows) >= 2)
+  user_cannot = {(min(pair), max(pair)) for pair in constraints.cannot_link}
+  kept_groups = []
+  for group in groups:
+    group_set = set(group)
+    if any(i in group_set and j in group_set for i, j in user_cannot):
+      continue
+    kept_groups.append(group)
+  return kept_groups
+
+
+def _collapse_and_recluster(
+  emb: np.ndarray,
+  previous_cluster_ids: Sequence[str | None],
+  resolved_constraints: Constraints,
+  resolved_config: ClusterConfig,
+  factory: Callable[[], str],
+  groups: list[list[int]],
+) -> ReclusterResult | None:
+  """근중복 그룹을 대표 1행으로 접어 재군집하고 결과 인덱스를 원 행으로 펼친다 (⓪, ADR-029).
+
+  접기가 사용자 must/cannot-link에 새 모순을 만들면(복제 행들이 상반된 보정에 걸린 극단 케이스)
+  None을 반환한다 — 호출자는 붕괴를 포기하고 비붕괴 경로로 폴백한다 (사람 결정 우선).
+  """
+  rep_of: dict[int, int] = {}
+  rows_of_rep: dict[int, list[int]] = {}
+  for group in groups:
+    rep = group[0]
+    rows_of_rep[rep] = group
+    for row in group:
+      rep_of[row] = rep
+  kept = [row for row in range(emb.shape[0]) if rep_of.get(row, row) == row]
+  pos_of = {row: pos for pos, row in enumerate(kept)}
+
+  # 대표 행의 직전 배정은 그룹에서 처음 등장하는 non-None id — 대표가 신규 행이어도 복제/유령 행이
+  # 갖고 있던 앨범 번호 연속성(Jaccard 승계 투표)을 잃지 않는다.
+  collapsed_previous: list[str | None] = []
+  for row in kept:
+    rows = rows_of_rep.get(row, [row])
+    collapsed_previous.append(
+      next((previous_cluster_ids[r] for r in rows if previous_cluster_ids[r] is not None), None)
+    )
+
+  def remap(pairs: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    mapped = []
+    for i, j in pairs:
+      a, b = pos_of[rep_of.get(i, i)], pos_of[rep_of.get(j, j)]
+      if a != b:  # 그룹 내부 쌍은 자기 자신 제약이 되므로 탈락 (cannot 내부 쌍은 그룹 선별에서 이미 제외)
+        mapped.append((a, b))
+    return tuple(dict.fromkeys(mapped))
+
+  collapsed_constraints = Constraints(
+    must_link=remap(resolved_constraints.must_link),
+    cannot_link=remap(resolved_constraints.cannot_link),
+    auto_cannot_link=remap(resolved_constraints.auto_cannot_link),
+  )
+  try:
+    # 붕괴가 만든 모순의 사전 탐지 — 원 제약이 애초에 모순이면 폴백한 비붕괴 경로가 같은 계약대로 raise한다
+    _must_link_components(len(kept), collapsed_constraints)
+  except ValueError:
+    return None
+
+  core = _recluster_core(emb[kept], collapsed_previous, collapsed_constraints, resolved_config, factory)
+
+  def expand(indices: Sequence[int]) -> tuple[int, ...]:
+    rows: list[int] = []
+    for pos in indices:
+      row = kept[pos]
+      rows.extend(rows_of_rep.get(row, [row]))
+    return tuple(sorted(rows))
+
+  clusters = []
+  for cluster in core.clusters:
+    member_rows: list[tuple[int, float]] = []
+    for pos, similarity in zip(cluster.member_indices, cluster.membership_similarities):
+      row = kept[pos]
+      member_rows.extend((r, similarity) for r in rows_of_rep.get(row, [row]))  # 복제 행은 대표의 LOO를 공유
+    member_rows.sort()
+    clusters.append(
+      PersonCluster(
+        cluster_id=cluster.cluster_id,
+        is_new=cluster.is_new,
+        member_indices=tuple(r for r, _ in member_rows),
+        membership_similarities=tuple(s for _, s in member_rows),
+        # 접힌 멤버 기준 평균 그대로 — 복제를 다시 넣어 평균하면 재업로드된 사진 쪽으로 대표벡터가 쏠린다
+        centroid=cluster.centroid,
+      )
+    )
+  # 고아 근중복 그룹 승격 — 재군집이 클러스터를 하나도 못 만든 이벤트(예: 근중복 묶음이 사실상 전부)
+  # 에서는 접힌 대표가 홀로 남아 min_cluster_size를 못 채운다. 비붕괴 경로가 이런 이벤트에 만들던
+  # 앨범(자가검증 (d) 버스트 계약)을 보존하기 위해, 원 행 수가 min_cluster_size 이상인 노이즈 그룹만
+  # 클러스터로 승격한다. 클러스터가 있는 이벤트에서는 승격하지 않는다 — 흡수에 실패한 재업로드 쌍을
+  # 승격하면 쌍 앨범(P0 증상)이 되살아난다. 그런 행은 노이즈(uncertain)로 남는 것이 옳다
+  # (재업로드·유령 행 = 같은 얼굴의 1회 등장, single_appearance와 같은 제품 의미).
+  noise_positions: list[int] = list(core.noise_indices)
+  if not core.clusters:
+    promoted: set[int] = set()
+    used_ids: set[str] = set()
+    for pos in noise_positions:
+      rows = rows_of_rep.get(kept[pos], [kept[pos]])
+      if len(rows) < resolved_config.min_cluster_size:
+        continue
+      previous_id = collapsed_previous[pos]
+      inherited_id = previous_id if previous_id is not None and previous_id not in used_ids else None
+      if inherited_id is not None:
+        used_ids.add(inherited_id)
+      centroid = _normalized_mean(emb, rows)
+      centroid.flags.writeable = False
+      clusters.append(
+        PersonCluster(
+          cluster_id=inherited_id if inherited_id is not None else factory(),
+          is_new=inherited_id is None,
+          member_indices=tuple(rows),
+          membership_similarities=tuple(float(s) for s in _loo_similarities(emb, rows)),
+          centroid=centroid,
+        )
+      )
+      promoted.add(pos)
+    noise_positions = [pos for pos in noise_positions if pos not in promoted]
+  clusters.sort(key=lambda cluster: cluster.member_indices[0])  # 결과 계약: 최소 멤버 인덱스 오름차순
+
+  # 은퇴 목록은 원 행 기준으로 재계산 — 접기로 사라진 행만 갖고 있던 기존 id도 승계 실패면 은퇴에 들어가야
+  # 하류(Spring)가 유령 인물을 잡고 있지 않는다. 순서는 비붕괴 경로와 동일한 첫 등장 순.
+  inherited = {cluster.cluster_id for cluster in clusters if not cluster.is_new}
+  retired = tuple(dict.fromkeys(pid for pid in previous_cluster_ids if pid is not None and pid not in inherited))
+  return ReclusterResult(
+    clusters=tuple(clusters),
+    noise_indices=expand(noise_positions),
+    ambiguous_indices=expand(core.ambiguous_indices),
+    retired_cluster_ids=retired,
+  )
+
+
 def recluster(
   embeddings: np.ndarray,
   previous_cluster_ids: Sequence[str | None],
@@ -817,8 +981,9 @@ def recluster(
 ) -> ReclusterResult:
   """event 전체 임베딩을 재군집하고 기존 cluster_id를 재조정한다 (feature-spec §4 ③④⑤).
 
-  재군집 뒤 결정적 후처리를 순서대로 적용한다: 보정 강제(must→cannot-link) → 파편 병합 →
-  노이즈 구제 → 저신뢰 ambiguous 분리 → 2차 파편 병합 → ID 재조정 → 대표벡터 (모듈 독스트링 ①~⑧).
+  재군집 전 근중복 행 붕괴(⓪, ADR-029)로 재업로드·유령 행 오염을 접은 뒤, 재군집과 결정적 후처리를
+  순서대로 적용한다: 보정 강제(must→cannot-link) → 파편 병합 → 노이즈 구제 → 저신뢰 ambiguous 분리 →
+  2차 파편 병합 → ID 재조정 → 대표벡터 (모듈 독스트링 ⓪~⑧). 결과 인덱스는 항상 원 행 기준이다.
 
   Args:
     embeddings: shape (N, EMBED_DIM) — event 전체(기존+신규) 임베딩. L2 정규화 단위벡터 전제.
@@ -856,6 +1021,28 @@ def recluster(
   _validate_pairs(resolved_constraints.must_link, n, "must-link")
   _validate_pairs(resolved_constraints.cannot_link, n, "cannot-link")
   _validate_pairs(resolved_constraints.auto_cannot_link, n, "auto-cannot-link")
+
+  # ⓪ 근중복 행 붕괴 (ADR-029) — HDBSCAN이 거리 0의 복제 쌍을 실제 인물 덩어리보다 우선 선택해
+  # 앨범이 쌍 단위로 와해되는 재업로드·유령 행 오염(실 event 8)을 재군집 전에 차단한다.
+  groups = _duplicate_row_groups(emb, resolved_constraints, resolved_config)
+  if groups:
+    collapsed = _collapse_and_recluster(
+      emb, previous_cluster_ids, resolved_constraints, resolved_config, factory, groups
+    )
+    if collapsed is not None:
+      return collapsed
+  return _recluster_core(emb, previous_cluster_ids, resolved_constraints, resolved_config, factory)
+
+
+def _recluster_core(
+  emb: np.ndarray,
+  previous_cluster_ids: Sequence[str | None],
+  resolved_constraints: Constraints,
+  resolved_config: ClusterConfig,
+  factory: Callable[[], str],
+) -> ReclusterResult:
+  """검증과 근중복 붕괴(⓪)가 끝난 입력의 재군집 본체 (모듈 독스트링 ①~⑧)."""
+  n = emb.shape[0]
   comp_of, components = _must_link_components(n, resolved_constraints)
   # 자동 제약 결합 (Constraints 독스트링·ADR-011): 사람 must-link와 모순되는 자동 쌍은 탈락시키고,
   # 나머지는 병합·분리·구제에서 사람 cannot-link와 동일하게 참여한다. 축출(보호·마진 제외)은
@@ -1120,6 +1307,11 @@ if __name__ == "__main__":
     len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1),
   )
 
+  # (j)(k)의 합성 파편은 동일 벡터의 복제라 기본 설정에서는 ⓪ 근중복 붕괴(ADR-029)가 먼저 접는다 —
+  # 검증 대상(2차 병합·같은사진 제약 기계)을 종전 기하 그대로 격리하기 위해 붕괴만 끈 설정을 쓴다.
+  # 붕괴 경로 자체의 계약은 (n)이 검증한다.
+  no_collapse = ClusterConfig(duplicate_collapse_similarity=0.0)
+
   # (j) 2차 파편 병합 (ADR-010) — 실 event 기하 재현: 파편 A·B가 1차 병합 시점엔 0.69로 임계(0.70)
   # 미달인데, 노이즈 w가 B로 구제되며 B centroid가 A 쪽으로 이동해 최종 구성으로는 임계를 넘는다.
   fragment_a = np.stack([axis(0), axis(0)]).astype(np.float32)  # centroid = e1
@@ -1136,7 +1328,7 @@ if __name__ == "__main__":
     "(j) 전제: 파편 A·B는 분리 클러스터, w는 노이즈로 시작",
     len(set(labels[labels != _NOISE])) == 2 and labels[4] == _NOISE,
   )
-  result = recluster(rescued_split, [None] * 5)
+  result = recluster(rescued_split, [None] * 5, config=no_collapse)
   check(
     "(j) 구제로 임계를 넘은 파편은 2차 병합으로 합류 — 전원 한 클러스터",
     len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1, 2, 3, 4),
@@ -1146,9 +1338,9 @@ if __name__ == "__main__":
   # (병합 임계 0.68 이상 → 제약 없으면 병합). auto 쌍 (0, 2)는 "0과 2가 같은 사진" = 타인 확정.
   k_b = 0.72 * axis(0) + math.sqrt(1.0 - 0.72**2) * axis(1)
   k_frags = np.vstack([np.stack([axis(0), axis(0)]), np.stack([k_b, k_b])]).astype(np.float32)
-  result = recluster(k_frags, [None] * 4)
+  result = recluster(k_frags, [None] * 4, config=no_collapse)
   check("(k) 전제: 0.72 파편 쌍은 제약 없으면 병합된다 (임계 0.68 하향 확인)", len(result.clusters) == 1)
-  result = recluster(k_frags, [None] * 4, Constraints(auto_cannot_link=((0, 2),)))
+  result = recluster(k_frags, [None] * 4, Constraints(auto_cannot_link=((0, 2),)), config=no_collapse)
   check(
     "(k) 같은 사진 얼굴이 걸친 파편 쌍은 유사도가 임계 이상이어도 병합 차단",
     len(result.clusters) == 2 and result.noise_indices == () and result.ambiguous_indices == (),
@@ -1160,12 +1352,12 @@ if __name__ == "__main__":
   k_b2 = 0.5 * axis(0) + math.sqrt(1.0 - 0.5**2) * axis(1)
   k_x = 0.88 * axis(0) + 0.46 * axis(1) + math.sqrt(1.0 - 0.88**2 - 0.46**2) * axis(2)
   k_mixed = np.vstack([np.stack([axis(0), axis(0)]), k_x[None, :], np.stack([k_b2, k_b2])]).astype(np.float32)
-  result = recluster(k_mixed, [None] * 5, Constraints(cannot_link=((2, 3),)))
+  result = recluster(k_mixed, [None] * 5, Constraints(cannot_link=((2, 3),)), config=no_collapse)
   check(
     "(k) 사람 cannot-link 당사자 x는 축출 보호로 유지 (기존 동작)",
     {c.member_indices for c in result.clusters} == {(0, 1, 2), (3, 4)} and result.ambiguous_indices == (),
   )
-  result = recluster(k_mixed, [None] * 5, Constraints(auto_cannot_link=((2, 3),)))
+  result = recluster(k_mixed, [None] * 5, Constraints(auto_cannot_link=((2, 3),)), config=no_collapse)
   check(
     "(k) 같은 기하에서 auto 쌍의 x는 보호 없이 정상 축출 (축출 무력화 회귀 방지)",
     {c.member_indices for c in result.clusters} == {(0, 1), (3, 4)} and result.ambiguous_indices == (2,),
@@ -1319,6 +1511,68 @@ if __name__ == "__main__":
   check(
     "(i) reassign 동률 — 이동 얼굴이 목적지 편입 + 목적지 멤버 유지·id 승계 + 신규 앨범 없음",
     albums.get("b") == (0, 3, 4) and albums.get("a") == (1, 2) and not any(c.is_new for c in result.clusters),
+  )
+
+  # (n) 근중복 행 붕괴 (ADR-029) — event 8 재현: 동일 인물 5장(쌍 0.42~0.50, 병합 임계 0.55 미만
+  # 대역) + 같은 사진 재업로드가 만든 완전 복제 5행. HDBSCAN은 밀도 기반이라 거리 0의 복제 쌍을
+  # 실제 인물 덩어리보다 우선 선택해 앨범이 쌍 단위로 와해된다.
+  dup_person = spread_vectors((0.72, 0.70, 0.68, 0.66, 0.64), axis(0), 10)
+  dup_polluted = np.vstack([dup_person, dup_person.copy()])
+  result = recluster(dup_polluted, [None] * 10, config=no_collapse)
+  check(
+    "(n) 전제: 붕괴 OFF면 재업로드 복제가 동일 인물을 여러 앨범으로 쪼갠다 (event 8 재현)",
+    len(result.clusters) > 1,
+  )
+  result = recluster(dup_polluted, [None] * 10)
+  check(
+    "(n) 붕괴 ON(기본): 복제 오염 10행 → 앨범 1개 전원 소속, 복제 행은 대표의 LOO 공유",
+    len(result.clusters) == 1
+    and result.clusters[0].member_indices == tuple(range(10))
+    and result.clusters[0].membership_similarities
+    == tuple(result.clusters[0].membership_similarities[(i + 5) % 10] for i in range(10)),
+  )
+  # 직전 상태가 이미 쌍 앨범으로 쪼개져 있던 event: 붕괴 후 한 앨범이 최강 겹침 id를 승계하고,
+  # 흡수된 나머지 쌍 앨범 id는 은퇴 목록으로 나가야 하류(Spring)가 유령 인물을 정리한다.
+  dup_pair = spread_vectors((0.72, 0.70), axis(0), 10)  # 쌍 유사도 0.504
+  shattered = np.vstack([dup_pair, dup_pair.copy()])
+  result = recluster(shattered, ["pA", "pB", "pA", "pB"])
+  check(
+    "(n) 붕괴 후 최강 겹침 id 승계(동률은 등장 순) + 흡수된 쌍 앨범 id 은퇴",
+    len(result.clusters) == 1
+    and result.clusters[0].cluster_id == "pA"
+    and not result.clusters[0].is_new
+    and result.clusters[0].member_indices == (0, 1, 2, 3)
+    and result.retired_cluster_ids == ("pB",),
+  )
+  # 사람 결정 우선 — 완전 복제 쌍이라도 사용자 cannot-link가 걸려 있으면 접지 않고 분리를 유지한다.
+  twin = np.stack([axis(0), axis(0)]).astype(np.float32)
+  result = recluster(twin, [None, None], Constraints(cannot_link=((0, 1),)))
+  check(
+    "(n) 복제 쌍 내부의 사용자 cannot-link는 붕괴를 막고 분리를 유지 (사람 결정 우선)",
+    all(len(c.member_indices) == 1 for c in result.clusters),
+  )
+  # 제약 리매핑 — 복제 '행' 인덱스로 걸린 cannot-link가 대표로 이관되어 병합을 계속 차단한다:
+  # A 복제쌍 + B 복제쌍(A↔B 0.72 — 제약 없으면 (k)처럼 한 앨범)에서 비대표 행끼리 (1, 3)을 지목.
+  ab = np.stack([axis(0), axis(0), k_b, k_b]).astype(np.float32)
+  result = recluster(ab, [None] * 4)
+  check(
+    "(n) 전제: 제약 없으면 복제쌍 붕괴 후 0.72 쌍은 한 앨범 + 전 행 복원",
+    len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1, 2, 3),
+  )
+  result = recluster(ab, [None] * 4, Constraints(cannot_link=((1, 3),)))
+  check(
+    "(n) 비대표 복제 행끼리의 cannot-link도 대표로 이관돼 병합 차단 + 전 행 복원",
+    {c.member_indices for c in result.clusters} == {(0, 1), (2, 3)},
+  )
+  # 고아 승격 경계 — 클러스터가 있는 이벤트에서 흡수에 실패한 복제 그룹은 승격하지 않고 노이즈로
+  # 남긴다(쌍 앨범 부활 차단, 재업로드 = 같은 얼굴의 1회 등장). 인물 B 정상 3장 + 남남 A 복제쌍.
+  b_rows = spread_vectors((0.9, 0.85, 0.8), axis(0), 10)
+  a_far = (0.15 * axis(0) + math.sqrt(1.0 - 0.15**2) * axis(30)).astype(np.float32)
+  mixed_dup = np.vstack([b_rows, a_far[None, :], a_far[None, :]])
+  result = recluster(mixed_dup, [None] * 5)
+  check(
+    "(n) 클러스터가 있는 이벤트의 미흡수 복제 그룹은 쌍 앨범으로 승격하지 않고 uncertain",
+    len(result.clusters) == 1 and result.clusters[0].member_indices == (0, 1, 2) and result.noise_indices == (3, 4),
   )
 
   # (g) 설정 불변식 — 잘못된 임계 조합은 생성 시점에 거부
