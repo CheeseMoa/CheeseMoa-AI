@@ -140,6 +140,11 @@ SQS 폴링 시작
 - 결과 큐(`CheeseMoa-cluster-response.fifo`): `SendMessage`
 - `cheesemoa-dev`(이미지): `GetObject`
 - `cheesemoa-test-...-an`(임베딩): `GetObject` · `PutObject` (`embeddings/` 프리픽스)
+- `cheesemoa-test-...-an`(재판정 점수 캐시): `GetObject`·`PutObject`·`DeleteObject` (`rekognition-scores/`
+  프리픽스, CHMO-420) — 없으면 캐시 I/O가 best-effort로 조용히 실패해 매 재군집마다 Rekognition 재호출(재과금)
+- Rekognition 재판정(CHMO-420, ADR 030): `rekognition:CompareFaces` — `aws:RequestedRegion` 조건으로
+  서울 리전 한정(CompareFaces는 리소스 레벨 미지원이라 `Resource: "*"` + 리전 조건). 없어도 워커는
+  best-effort 폴백으로 종전 동작 + 경고 로그(재판정만 무효). `REJUDGE_ENABLED=false`면 호출 자체가 없다
 - 두 버킷: `ListBucket` — 레디니스의 `head_bucket`이 이 권한을 요구한다
 - ECR pull (인스턴스 롤엔 `AmazonEC2ContainerRegistryReadOnly`도 이미 있음)
 

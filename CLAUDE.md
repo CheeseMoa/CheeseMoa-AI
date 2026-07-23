@@ -62,8 +62,13 @@ SQS 결과 발행 / event `.npz` 갱신.
 모델은 **존재하지 않는다** — 라이선스는 코드가 아니라 가중치·학습 데이터에서 막힌다(InsightFace 모델 주
 비상용, Glint360K·WebFace260M은 파생 모델까지 금지, LVFace의 HF `mit` 태그는 함정 — 본문은 비상용).
 AdaFace는 판별력 압도적(파편 간 centroid 0.587→0.809)이지만 상용 불가라 정확도 기준선(yardstick) 전용.
-유일한 합법 성능 향상 경로는 InsightFace 상용 라이선스 구매이며, 결제 전 ⓐ 동아시아 코호트(74.96 vs 백인
-94.70) 자체 A/B ⓑ 학습 데이터 출처 면책 서면 확인이 선행 조건. TTA·자체 학습·합성 데이터는 전부 기각.
+자체 호스팅의 유일한 합법 성능 향상 경로는 InsightFace 상용 라이선스 구매이며, 결제 전 ⓐ 동아시아
+코호트(74.96 vs 백인 94.70) 자체 A/B ⓑ 학습 데이터 출처 면책 서면 확인이 선행 조건. TTA·자체 학습·
+합성 데이터는 전부 기각. **관리형 API는 이 봉쇄 밖이다** — AWS Rekognition(서울 리전, 기존 수탁자)이
+AuraFace가 원리적으로 못 가르는 하드케이스 대역을 실측으로 갈랐고, uncertain 재판정 보조 신호로 **구현
+완료·기본 활성**(`app/pipeline/rejudge.py`, CHMO-420 — `REJUDGE_ENABLED=false` 롤백,
+[ADR 030](docs/decisions/030-rekognition-uncertain-rejudge.md) ·
+[실측 리뷰](docs/reviews/2026-07-23-rekognition-uncertain-ab.md)).
 
 **HDBSCAN — PoC numpy 이식본** ([ADR 005](docs/decisions/005-hdbscan-standalone-port.md), 파라미터 스윕
 [ADR 009](docs/decisions/009-clustering-parameter-tuning.md)): `min_cluster_size=2, min_samples=2,
@@ -88,7 +93,10 @@ metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적 후처
 않게 한다. uncertain("분류가 어려워요") 사진은 예약 앨범 id `"__uncertain__"`로 reassign 편입을 받고,
 항목마다 주 인물 얼굴 bbox 배열 `face_bboxes`(CHMO-407)와 분류 어려움 이유 `causes`(CHMO-404)를 동봉 —
 계약 상세·결정 배경은 [feature-spec §6.2·§6.3](docs/spec/feature-spec.md)·
-[message-examples §④](docs/spec/message-examples.md). 대표벡터(L2 정규화 평균)는 조회·표시용 파생
+[message-examples §④](docs/spec/message-examples.md). uncertain 확정 직전에는 (CHMO-420 기본 활성)
+Rekognition CompareFaces 재판정 훅이 하드케이스를 자동 편입(≥90, must-link 기록 후 2차 재군집)·제안
+(85~94, `suggestions` 동봉)한다 — 점수는 (face, 대표) 쌍으로 S3 캐싱해 재군집 재과금 없음
+([ADR 030](docs/decisions/030-rekognition-uncertain-rejudge.md)). 대표벡터(L2 정규화 평균)는 조회·표시용 파생
 캐시일 뿐 군집 판단의 원천이 아님(feature-spec §4).
 
 **품질 게이트 — 눈감음/흔들림 (CHMO-172)** (`app/pipeline/quality.py`, feature-spec §7 註): 눈감음은
@@ -178,6 +186,13 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 ### 다음 구현 목표
 
+0. **[P0] Rekognition 재판정 — 운영 잔여분** — 워커 구현·기본 활성화(재판정 훅·점수 캐싱·
+   `suggestions` 계약, [ADR 030](docs/decisions/030-rekognition-uncertain-rejudge.md))는 2026-07-24
+   완료(CHMO-420, `REJUDGE_ENABLED=false` 롤백). 잔여: ⓐ **운영 전제 조건 확인** — AWS AI 학습
+   opt-out(샌드박스 계정은 설정 불가 — 운영자 요청/정식 계정 이전 필요)·처리방침 위탁 문구·민감정보
+   동의 점검(리뷰 §선행 조건, 미충족 환경은 false 배포) ⓑ 워커 IAM에 `rekognition:CompareFaces`
+   권한(없으면 best-effort 폴백으로 종전 동작 + 경고 로그) ⓒ Spring `suggestions` 소비·제안 UX
+   합의(미구현이어도 빈/미소비 필드로 무해) ⓓ 파편 병합 힌트 wire 계약(현재 로그만).
 0.1 **[P0] 실 데이터 오염 대응 — 잔여분** — 워커 방어(근중복 행 붕괴, ADR 029)는 2026-07-23 완료.
     잔여: Spring ETag 재업로드 검사 + `delete_request` 발행 검증(PIPA, 유령 행 자체는 여전히 존재) +
     S3 버킷 버저닝 ([backlog](docs/backlog/2026-07-11-followups.md) ·
@@ -197,7 +212,7 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 ### 완료된 목표
 
-이력 전문(28건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
+이력 전문(30건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
 [docs/completed-goals.md](docs/completed-goals.md)로 이동했다. **새 목표를 완료하면 CLAUDE.md가 아니라
-그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: `face_bboxes` 배열 계약 교체(CHMO-407, 2026-07-22) ·
-uncertain `causes` 계약 확장(CHMO-404, 2026-07-22) · 크기 인지형 confident 게이트(CHMO-403/ADR 028).
+그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: Rekognition uncertain 재판정(ADR 030, 2026-07-24) ·
+근중복 행 붕괴(CHMO-419/ADR 029, 2026-07-23) · `face_bboxes` 배열 계약 교체(CHMO-407, 2026-07-22).

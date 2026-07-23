@@ -169,9 +169,12 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
     // album_id: 인물 앨범 편입 시 reassign의 from_cluster_id로 되돌려줄 예약 앨범 id ("__uncertain__")
     // face_bboxes: 주 인물 얼굴 bbox 배열(원본 px, 폭 내림차순) — 앱 상세 화면 얼굴 crop용. 빈 배열 가능
     // causes: 왜 분류가 어려웠는지 — 앱이 설명·재업로드 안내를 띄우는 근거. 빈 배열 = 품질 문제 아님
+    // suggestions: Rekognition 재판정의 "이 앨범 아닐까요?" 제안(ADR-030) — 빈 배열 = 제안 없음/기능 비활성
     { "image_id": "uuid", "reason": "ambiguous", "album_id": "__uncertain__",  // "ambiguous"(저신뢰) | "unmatched"
       "face_bboxes": [ { "x": 120, "y": 48, "w": 260, "h": 300 } ],
-      "causes": ["low_resolution", "small_faces"] }  // "low_resolution" | "small_faces"
+      "causes": ["low_resolution", "small_faces"],  // "low_resolution" | "small_faces" | "single_appearance"
+      "suggestions": [ { "face_bbox": { "x": 120, "y": 48, "w": 260, "h": 300 },
+                         "cluster_id": "uuid", "similarity": 88.7 } ] }
   ],
   "eyes_closed": ["uuid"],      // eyes_closed 앨범 — exclude_eyes_closed=ON일 때만. 뷰어 비노출
   "blurry": ["uuid"],           // blurry 앨범 — exclude_blurry=ON일 때만. 뷰어 비노출
@@ -251,6 +254,18 @@ AI 서버 (S3 .npz, event 단위)          Spring (PostgreSQL)
     100 이상이고 unmatched면 `single_appearance` — 실측 근거(얼굴폭 매칭 무릎 ~100px, 단체사진 얼굴 rel_w
     ~5%라 100px엔 긴 변 ~2000px 필요). 폭·긴 변 미상(구버전 `.npz` 행: 폭은 v1, 긴 변은 v3 이하)이면 그
     원인은 빠진다. **문구·톤은 앱 소유** — 워커는 코드만 내고 Spring은 그대로 relay한다. `SMALL_FACE_PX=0`이면 기능 전체 비활성.
+  - **재판정 제안 — `suggestions`**(계약 확장, ADR-030 — **Spring 합의 필요, 앱 UX 미구현 상태로 무시 가능**):
+    각 uncertain 항목은 Rekognition 보조 재판정이 낸 **"이 앨범 아닐까요?" 제안** 배열을 함께 싣는다.
+    자동 편입 임계(90) 미만·제안 임계(85) 이상 대역의 판정으로, 워커가 확신하지 못해 사용자 확인을
+    요청하는 것이다("같은 분인가요?" UX — 크로스-이벤트 연결 제안과 동일 패턴). 요소:
+    - `face_bbox`: 제안 대상 얼굴 — **같은 항목 `face_bboxes` 배열의 원소와 정확히 같은 값**이라 앱은
+      int 동등 비교로 어느 얼굴의 제안인지 결속한다(인덱스 결속은 정렬·필터 변경에 취약해 기각).
+    - `cluster_id`: 제안하는 인물 앨범(`clusters`의 `cluster_id`). 사용자가 수락하면 기존
+      `reassign(from_cluster_id="__uncertain__", to_cluster_id=이 값)`을 그대로 쓰면 된다 — 신규 액션 불요.
+    - `similarity`: Rekognition Similarity(0~100).
+    유사도 내림차순. **빈 배열** = 제안 없음 — 기능 비활성(`REJUDGE_ENABLED=false` 롤백), 제안 대역 미해당,
+    재판정 실패(best-effort) 전부 이 값이라 **토글 OFF 동안 wire는 종전과 동일**(배포 순서 제약 없음).
+    자동 편입(≥90)된 얼굴은 제안이 아니라 처음부터 `clusters`에 실려 나온다 — 앱은 구분할 필요 없다.
   - (TBD: `back`(뒷모습)·`duplicate`(중복)를 `uncertain` 사유로 추가할지는 백엔드와 합의)
 - `eyes_closed` / `blurry`: **눈감음·흔들림은 "분류가 어려워요"와 별개의 독립 앨범**이다(제품 명세 정정 반영). 업로드 토글(6.1 `options`)이 ON일 때만 인물 앨범 대신 이 앨범으로 라우팅하고, OFF면 분리하지 않는다.
 - `failed_images`: 타임아웃 등 **기술적 실패**. 화질·매칭 문제인 위 앨범들과 구분한다(재시도 대상).

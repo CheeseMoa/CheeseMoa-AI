@@ -161,6 +161,44 @@ def _build_thumbnail_renderer(settings: Settings) -> ThumbnailRenderer | None:
   return render
 
 
+def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
+  """Rekognition 재판정기 + 점수 캐시 저장소를 만든다 (ADR-030) — 비활성이면 (None, None).
+
+  핸들러는 콜러블·Protocol만 안다 — boto3 Rekognition 합성·crop 파라미터는 여기서 가둔다
+  (_build_thumbnail_renderer와 같은 관심사 분리). 반환 튜플이 (None, None)이면 핸들러가 전
+  경로에서 재판정을 생략한다 = 종전 동작 (REJUDGE_ENABLED=false 롤백 경로 — 운영 전제 조건은 ADR 030).
+  """
+  if not settings.rejudge_enabled:
+    return None, None
+  from app.pipeline.rejudge import UncertainRejudger, render_rejudge_crop
+  from app.storage.rekognition_scores import S3RekognitionScoreStore
+
+  rekognition_client = boto3.client("rekognition", region_name=settings.aws_region)
+  margin, quality = settings.rejudge_crop_margin, settings.rejudge_crop_jpeg_quality
+
+  def compare(source: bytes, target: bytes) -> float:
+    # 실측(2026-07-23 리뷰)과 동일 호출 시맨틱스: SimilarityThreshold=0으로 전 매칭을 받고 최고값.
+    # FaceMatches가 비면(타인 판정) 0.0. crop에서 얼굴을 못 찾으면 InvalidParameterException —
+    # 영구 성질이라 -1.0 센티널로 캐싱한다. 그 외(스로틀·네트워크)는 raise → 재판정기가 쌍 단위 보류.
+    try:
+      response = rekognition_client.compare_faces(
+        SourceImage={"Bytes": source}, TargetImage={"Bytes": target}, SimilarityThreshold=0.0
+      )
+    except rekognition_client.exceptions.InvalidParameterException:
+      return -1.0
+    matches = [match["Similarity"] for match in response.get("FaceMatches", [])]
+    return float(max(matches)) if matches else 0.0
+
+  rejudger = UncertainRejudger(
+    compare=compare,
+    fetch_image=images.fetch,
+    crop=lambda image, bbox: render_rejudge_crop(image, bbox, margin_ratio=margin, jpeg_quality=quality),
+    config=settings.to_rejudge_config(),
+  )
+  scores = S3RekognitionScoreStore(s3_client, settings.embeddings_bucket, settings.rejudge_scores_prefix)
+  return rejudger, scores
+
+
 def _available_cores() -> int:
   """이 프로세스가 실제로 쓸 수 있는 코어 수.
 
@@ -203,9 +241,12 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   logger.info("AI 모델 로딩 완료 (추론 스레드=%d, 가용 코어=%d, blink=%s)", threads, cores, bool(blink_scorer))
 
   thumbnail_renderer = _build_thumbnail_renderer(settings)
+  images = S3ImageSource(s3_client, settings.images_bucket)
+  # 재판정(ADR-030)은 핸들러와 같은 ImageSource 인스턴스를 공유한다 — crop 원본 재fetch 경로 통일
+  rejudger, rejudge_scores = _build_rejudger(settings, s3_client, images)
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
-    images=S3ImageSource(s3_client, settings.images_bucket),
+    images=images,
     extract_faces=build_face_extractor(
       detector,
       embedder,
@@ -221,6 +262,9 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
     thumbnails=S3ThumbnailStore(s3_client, settings.embeddings_bucket, settings.thumbnail_prefix)
     if thumbnail_renderer is not None
     else None,
+    # Rekognition 재판정은 둘 다 있어야 활성 — 비활성(rejudge_enabled=false)이면 둘 다 None으로 종전 동작 (ADR-030)
+    rejudger=rejudger,
+    rejudge_scores=rejudge_scores,
   )
   return WorkerDeps(
     consumer=SqsConsumer(sqs_client, settings.inbound_queue_url, settings.sqs_wait_time_seconds),

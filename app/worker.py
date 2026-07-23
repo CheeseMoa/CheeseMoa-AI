@@ -169,10 +169,13 @@ def _run_smoke() -> None:
   from app.handlers import ExtractedFaces, JobHandlers
   from app.messaging.consumer import InMemoryConsumer
   from app.messaging.publisher import InMemoryProgressPublisher, InMemoryPublisher
+  from app.pipeline.rejudge import UncertainRejudger
+  from app.schemas.messages import ClassifyResult as ClassifyResultSchema
   from app.schemas.messages import ProgressUpdate
   from app.storage.embedding_store import InMemoryEmbeddingStore
   from app.storage.event_embeddings import EMBED_DIM
   from app.storage.image_source import InMemoryImageSource
+  from app.storage.rekognition_scores import InMemoryRekognitionScoreStore
   from app.storage.thumbnail_store import InMemoryThumbnailStore
 
   logging.basicConfig(level="WARNING")  # 의도된 실패 케이스의 ERROR 로그만 보이게
@@ -192,6 +195,13 @@ def _run_smoke() -> None:
     vector[2 * person + 1] = math.sin(theta)
     return vector
 
+  def stranger_vector(tag: int) -> np.ndarray:
+    """Rekognition 재판정(ADR-030) 배선 검증용 미등록 인물 — 인물 0과 유사도 0.3(하드케이스 대역)."""
+    vector = np.zeros(EMBED_DIM, dtype=np.float32)
+    vector[0] = 0.3
+    vector[100 + tag] = math.sqrt(1.0 - 0.09)
+    return vector
+
   def fake_image(faces: list[tuple[int, int]]) -> np.ndarray:
     image = np.zeros((2, 16, 3), dtype=np.uint8)
     image[0, 0, 0] = len(faces)
@@ -202,7 +212,12 @@ def _run_smoke() -> None:
 
   def fake_extractor(image: np.ndarray) -> ExtractedFaces:
     count = int(image[0, 0, 0])
-    vectors = [person_vector(int(image[0, slot + 1, 0]), int(image[0, slot + 1, 1])) for slot in range(count)]
+    vectors = [
+      stranger_vector(person - 60)
+      if (person := int(image[0, slot + 1, 0])) >= 60
+      else person_vector(person, int(image[0, slot + 1, 1]))
+      for slot in range(count)
+    ]
     # 품질 플래그는 이 스모크 범위 밖 — 기본 False. bbox는 썸네일 배선 검증용 합성값 (CHMO-335)
     return ExtractedFaces(vectors, face_widths=[100.0] * count, bboxes=[(0, 0, 100, 100)] * count)
 
@@ -215,21 +230,42 @@ def _run_smoke() -> None:
   def report_progress(job_id: str, event_id: str, processed: int, total: int) -> None:
     progress_publisher.publish(ProgressUpdate(job_id=job_id, event_id=event_id, processed=processed, total=total))
 
+  # Rekognition 재판정 페이크 (ADR-030): crop 태그 = "p{인물}-{step}", 점수는 대본대로.
+  # 인물 쌍 step 간격 3(15°, cos≈0.966)은 근중복 붕괴 임계(0.985) 아래의 실사진 대역 모사다 —
+  # 간격 1이면 ⓪ 붕괴 + 고아 승격 경로에 얹혀, 편입 must-link가 2차 패스에서 무관한 앨범을 와해시킨다.
+  rejudge_calls: list[tuple[str, str]] = []
+  rejudge_scores_by_pair = {("p60-0", "p0-0"): 99.0, ("p61-0", "p0-0"): 88.0}
+
+  def fake_compare(source: bytes, target: bytes) -> float:
+    key = (source.decode(), target.decode())
+    rejudge_calls.append(key)
+    return rejudge_scores_by_pair.get(key, 5.0)
+
+  image_source = InMemoryImageSource(
+    {
+      "a1.jpg": fake_image([(0, 0)]),
+      "a2.jpg": fake_image([(0, 3)]),
+      "b1.jpg": fake_image([(1, 0)]),
+      "b2.jpg": fake_image([(1, 3)]),
+      "u-join.jpg": fake_image([(60, 0)]),  # 미등록 하드케이스 — 재판정 99점 → 인물 0 앨범 편입
+      "u-sugg.jpg": fake_image([(61, 0)]),  # 미등록 하드케이스 — 재판정 88점 → 제안 동봉
+    }
+  )
+  rejudge_score_store = InMemoryRekognitionScoreStore()
   thumb_store = InMemoryThumbnailStore()
   handlers = JobHandlers(
     store=store,
-    images=InMemoryImageSource(
-      {
-        "a1.jpg": fake_image([(0, 0)]),
-        "a2.jpg": fake_image([(0, 1)]),
-        "b1.jpg": fake_image([(1, 0)]),
-        "b2.jpg": fake_image([(1, 1)]),
-      }
-    ),
+    images=image_source,
     extract_faces=fake_extractor,
     report_progress=report_progress,
     render_thumbnail=lambda image, bbox: b"jpeg",  # 실렌더는 pipeline.thumbnail __main__이 검증
     thumbnails=thumb_store,
+    rejudger=UncertainRejudger(
+      compare=fake_compare,
+      fetch_image=image_source.fetch,
+      crop=lambda image, bbox: f"p{int(image[0, 1, 0])}-{int(image[0, 1, 1])}".encode(),
+    ),
+    rejudge_scores=rejudge_score_store,
   )
 
   ok_body = json.dumps(
@@ -243,6 +279,8 @@ def _run_smoke() -> None:
         {"image_id": "img-a2", "s3_key": "a2.jpg"},
         {"image_id": "img-b1", "s3_key": "b1.jpg"},
         {"image_id": "img-b2", "s3_key": "b2.jpg"},
+        {"image_id": "img-u-join", "s3_key": "u-join.jpg"},
+        {"image_id": "img-u-sugg", "s3_key": "u-sugg.jpg"},
       ],
     }
   )
@@ -291,13 +329,33 @@ def _run_smoke() -> None:
     ),
   )
 
-  # 진행률 발행 (CHMO-274): "job-정상"(이미지 4장)은 루프 전 0/4 + 3장마다(3/4) + 마지막(4/4) 발행돼
-  # processed가 [0, 3, 4]로 단조 증가하고 total에 도달한다 (_PROGRESS_REPORT_EVERY=3).
+  # Rekognition 재판정 (ADR-030) 발행 경유 종단: AuraFace(유사도 0.3)로는 못 붙는 하드케이스가
+  # 99점 편입으로 clusters에, 88점 제안이 uncertain.suggestions에 실려 발행되고 JSON 왕복이 성립한다.
+  ok_result = results["job-정상"]
+  join_cluster = next(c for c in ok_result.clusters if "img-a1" in c.image_ids)
+  check(
+    "재판정 자동 편입: 99점 하드케이스가 clusters에 실려 발행 (uncertain 아님)",
+    "img-u-join" in join_cluster.image_ids and all(u.image_id != "img-u-join" for u in ok_result.uncertain),
+  )
+  sugg_image = next(u for u in ok_result.uncertain if u.image_id == "img-u-sugg")
+  check(
+    "재판정 제안: suggestions(앨범·유사도·face_bbox 결속) 동봉 + 결과 JSON 왕복",
+    [(s.cluster_id, s.similarity) for s in sugg_image.suggestions] == [(join_cluster.cluster_id, 88.0)]
+    and sugg_image.suggestions[0].face_bbox == sugg_image.face_bboxes[0]
+    and ClassifyResultSchema.model_validate_json(ok_result.model_dump_json()) == ok_result,
+  )
+  check(
+    "재판정 점수 캐시: (face, 대표) 쌍 점수가 저장돼 재군집 재과금이 없다",
+    len(rejudge_calls) == 4 and len(rejudge_score_store.load("event-1")) == 4,
+  )
+
+  # 진행률 발행 (CHMO-274): "job-정상"(이미지 6장)은 루프 전 0/6 + 3장마다(3/6, 6/6) 발행돼
+  # processed가 [0, 3, 6]으로 단조 증가하고 total에 도달한다 (_PROGRESS_REPORT_EVERY=3).
   normal_progress = [p for p in progress_publisher.published if p.job_id == "job-정상"]
   check(
     "정상 job: 진행률 3장마다 발행 + 0/total 시작 + total 도달",
-    [p.processed for p in normal_progress] == [0, 3, 4]
-    and all(p.total == 4 for p in normal_progress)
+    [p.processed for p in normal_progress] == [0, 3, 6]
+    and all(p.total == 6 for p in normal_progress)
     and all(a.processed < b.processed for a, b in zip(normal_progress, normal_progress[1:])),
   )
   check(
