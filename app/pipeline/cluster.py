@@ -281,6 +281,13 @@ class Constraints:
   # 파편병합 게이트 탈락·기존 멤버 축출을 유발하던 회귀(실 event 134)의 교정이다. 사람 보정이 우선이라
   # 사용자 must_link로 이미 묶인 F는 부착 대상에서 제외하고, cannot_link(같은 사진 포함) 충돌은 보류한다.
   soft_attach: tuple[tuple[int, int], ...] = ()
+  # soft_merge는 방향 없는 (rep_a, rep_b) 쌍 — Rekognition 앨범 쌍 재판정(ADR-031)이 "이 두 앨범은 같은
+  # 사람"이라 판정한 결과다. 두 대표가 최종적으로 속한 클러스터를 통째로 합친다. soft_attach와 같은
+  # 이유로 must_link가 아니다: 재군집 초반 강제는 대상 클러스터의 응집을 떨어뜨려 파편병합 게이트
+  # 탈락·멤버 축출을 유발하고(실 event 134 회귀), 앨범 단위는 멤버가 많아 피해가 더 크다. 모든 응집
+  # 게이트가 끝난 뒤 union만 하며(_apply_soft_merge), 두 클러스터 사이에 cannot-link(같은 사진 포함)가
+  # 하나라도 걸리면 보류한다. 병합 여부의 판정(전원 합의·완전 연결)은 호출자(rejudge)에서 끝난 상태다.
+  soft_merge: tuple[tuple[int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -843,6 +850,41 @@ def _evict_ambiguous(
   return tuple(sorted(ambiguous))
 
 
+def _apply_soft_merge(
+  labels: np.ndarray,
+  soft_merge: tuple[tuple[int, int], ...],
+  blocking_cannot: tuple[tuple[int, int], ...],
+) -> int:
+  """소프트 병합 (rep_a ~ rep_b): 모든 응집 게이트가 끝난 뒤, 두 대표가 최종적으로 속한 클러스터를
+  통째로 합친다 (labels 제자리 수정, ADR-031).
+
+  "같은 사람인가"의 판정(대표 K×K 전원 합의 + 컴포넌트 완전 연결)은 호출자(rejudge)에서 이미 끝났다 —
+  여기서는 받은 쌍을 union만 한다(판정과 반영을 섞지 않는 것은 _apply_soft_attach와 같은 구도).
+  게이트에 불참하므로 병합 대상 클러스터가 재파편화·멤버 축출로 흔들리지 않는다. 다음이면 보류한다
+  (폴백 = 종전대로 갈라진 상태 유지):
+    - 두 대표 중 하나가 이번 재군집에서 노이즈 = 붙일 앨범이 없음
+    - 두 클러스터 사이에 cannot-link(사용자 분리 + 같은 사진 자동)가 하나라도 걸림 = 같은 사진 불변식
+
+  쌍은 정규화·정렬한 순서로 한 번씩만 처리한다: 병합은 멤버를 늘리기만 해 차단 조건이 단조 증가하므로
+  (한 번 막힌 쌍이 나중에 풀리는 일이 없다) _apply_soft_attach 같은 고정점 반복이 필요 없고, 순서를
+  고정해야 "A~B는 합치고 B~C는 A와의 cannot-link로 막히는" 경합의 결과가 결정적이다. 살아남는 라벨은
+  최소 멤버 인덱스 쪽 — _merge_fragments와 같은 규칙. 반환: 실제로 합친 쌍 수(로그용).
+  """
+  merged = 0
+  for a, b in sorted(dict.fromkeys(tuple(sorted(pair)) for pair in soft_merge)):
+    label_a, label_b = int(labels[a]), int(labels[b])
+    if label_a == _NOISE or label_b == _NOISE or label_a == label_b:
+      continue  # 대표가 미배정이거나 이미 같은 앨범 — 보류/무시
+    members_a = {int(i) for i in np.flatnonzero(labels == label_a)}
+    members_b = {int(i) for i in np.flatnonzero(labels == label_b)}
+    if _sets_blocked(members_a, members_b, blocking_cannot):
+      continue  # 두 앨범에 결합 금지 얼굴 쌍 — 병합 보류 (사용자 분리 결정·같은 사진 불변식 보존)
+    keep, drop = (label_a, label_b) if min(members_a) < min(members_b) else (label_b, label_a)
+    labels[labels == drop] = keep
+    merged += 1
+  return merged
+
+
 def _apply_soft_attach(
   labels: np.ndarray,
   ambiguous_set: set[int],
@@ -1011,6 +1053,9 @@ def _collapse_and_recluster(
     # soft_attach는 방향(F→R)이 있지만 remap이 입력 순서를 보존한다 — F·R이 같은 근중복 그룹으로
     # 접히면(F가 R의 복제) 자기 쌍이 되어 탈락하고, 접힌 F는 대표 R의 클러스터에 자연 편입된다.
     soft_attach=remap(resolved_constraints.soft_attach),
+    # soft_merge는 방향이 없어 remap 순서와 무관하다 — 두 대표가 같은 근중복 그룹으로 접히면 자기 쌍이
+    # 되어 탈락하고(이미 한 행이라 합칠 것이 없다), 나머지는 접힌 대표 위치로 옮겨 그대로 판정된다.
+    soft_merge=remap(resolved_constraints.soft_merge),
   )
   try:
     # 붕괴가 만든 모순의 사전 탐지 — 원 제약이 애초에 모순이면 폴백한 비붕괴 경로가 같은 계약대로 raise한다
@@ -1139,6 +1184,7 @@ def recluster(
   _validate_pairs(resolved_constraints.cannot_link, n, "cannot-link")
   _validate_pairs(resolved_constraints.auto_cannot_link, n, "auto-cannot-link")
   _validate_pairs(resolved_constraints.soft_attach, n, "soft-attach")
+  _validate_pairs(resolved_constraints.soft_merge, n, "soft-merge")
 
   # ⓪ 근중복 행 붕괴 (ADR-029) — HDBSCAN이 거리 0의 복제 쌍을 실제 인물 덩어리보다 우선 선택해
   # 앨범이 쌍 단위로 와해되는 재업로드·유령 행 오염(실 event 8)을 재군집 전에 차단한다.
@@ -1236,6 +1282,12 @@ def _recluster_core(
     resolved_config.merge_facepair_floor,
     resolved_config.merge_component_linkage,
   )
+
+  # 소프트 병합 (ADR-031) — Rekognition 앨범 쌍 재판정이 동일 인물로 판정한 두 앨범을 합친다. 반드시
+  # 소프트 어태치보다 먼저다: 앨범 합치기가 끝나야 어태치 대상 클러스터가 최종 상태가 된다
+  # (_apply_soft_attach는 labels[R]을 읽는다).
+  if resolved_constraints.soft_merge:
+    _apply_soft_merge(labels, resolved_constraints.soft_merge, blocking_cannot)
 
   # 소프트 어태치 (ADR-030 개정) — 모든 응집 게이트가 끝난 최종 상태에서 재판정 편입 F를 대표 R의
   # 클러스터에 부착만 한다. 게이트에 불참하므로 대상 클러스터를 재파편화·축출로 흔들지 않는다. 사용자
@@ -1785,6 +1837,50 @@ if __name__ == "__main__":
   check(
     "(p) 사람 우선: 사용자 must-link로 B에 묶인 F는 soft-attach(→A)가 못 덮음 (frozen skip)",
     3 in f_cluster and 0 not in f_cluster,
+  )
+
+  # (q) 소프트 병합 (ADR-031) — 앨범 쌍 재판정이 동일 인물로 판정한 두 앨범을 게이트 이후 union한다.
+  # frozen_event: 0,1,2 = 앨범 A ; 3,4,5,6 = 앨범 B (교차 ~0.24라 로컬 파편병합은 절대 붙이지 못한다)
+  all_rows = tuple(range(7))
+  split_res = recluster(frozen_event, [None] * 7)
+  check("(q) 전제: A·B는 로컬 게이트로는 병합되지 않는 별개 앨범", len(split_res.clusters) == 2)
+  merged_res = recluster(frozen_event, [None] * 7, Constraints(soft_merge=((0, 3),)))
+  check(
+    "(q) 소프트 병합: 두 대표가 속한 앨범이 하나로 union (멤버 손실·재파편화 없음)",
+    len(merged_res.clusters) == 1 and merged_res.clusters[0].member_indices == all_rows,
+  )
+  for kind, extra in (
+    ("사용자 cannot-link", {"cannot_link": ((2, 4),)}),
+    ("같은 사진 자동", {"auto_cannot_link": ((1, 5),)}),
+  ):
+    blocked_res = recluster(frozen_event, [None] * 7, Constraints(soft_merge=((0, 3),), **extra))
+    check(f"(q) 두 앨범 사이에 {kind}이 걸리면 병합 보류 (갈라진 상태 유지)", len(blocked_res.clusters) == 2)
+
+  merge_noise_event = np.vstack([soft_person, soft_b, soft_f[None, :]])  # 7 = F (노이즈)
+  rep_noise_res = recluster(merge_noise_event, [None] * 8, Constraints(soft_merge=((0, 7),)))
+  check(
+    "(q) 대표가 이번 재군집에서 노이즈면 병합 보류",
+    len(rep_noise_res.clusters) == 2 and 7 in rep_noise_res.noise_indices,
+  )
+
+  # 순서 계약: 병합이 어태치보다 먼저다. F는 A 멤버(0)와 cannot-link라, 두 앨범이 먼저 합쳐지면
+  # 어태치 대상 클러스터에 결합 금지 얼굴이 들어와 부착이 보류된다 (어태치가 먼저였다면 F가 B에
+  # 붙고 그 cannot-link가 병합을 막아 앨범이 갈라진 채로 남는다 — 관측 결과가 정반대다).
+  order_res = recluster(
+    merge_noise_event, [None] * 8, Constraints(soft_merge=((0, 3),), soft_attach=((7, 3),), cannot_link=((7, 0),))
+  )
+  check(
+    "(q) 소프트 병합이 소프트 어태치보다 먼저 적용된다 (어태치는 병합된 최종 라벨을 본다)",
+    any(cluster.member_indices == all_rows for cluster in order_res.clusters)
+    and all(7 not in cluster.member_indices for cluster in order_res.clusters if len(cluster.member_indices) > 1),
+  )
+
+  # 근중복 붕괴(⓪) 경로에서도 제약이 살아남는다 — 접힌 행(7 = 0의 복제)의 쌍이 대표 행으로 remap된다
+  dup_merge_event = np.vstack([frozen_event, frozen_event[0][None, :]])
+  dup_res = recluster(dup_merge_event, [None] * 8, Constraints(soft_merge=((7, 3),)))
+  check(
+    "(q) 근중복 붕괴 경로: 접힌 대표 행의 soft_merge도 remap돼 병합이 유지",
+    len(dup_res.clusters) == 1 and dup_res.clusters[0].member_indices == tuple(range(8)),
   )
 
   print(f"\n합성 자가 검증 {passed}건 전부 통과")

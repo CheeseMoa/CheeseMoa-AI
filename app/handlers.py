@@ -24,7 +24,7 @@ from typing import NamedTuple
 import numpy as np
 
 from app.pipeline.cluster import ClusterConfig, Constraints, PersonCluster, recluster
-from app.pipeline.rejudge import RejudgeOutcome, UncertainRejudger
+from app.pipeline.rejudge import ClusterPairRejudger, PairRejudgeOutcome, RejudgeOutcome, UncertainRejudger
 from app.schemas.messages import (
   UNCERTAIN_ALBUM_ID,
   ClassifyRequest,
@@ -291,6 +291,8 @@ class JobHandlers:
     thumbnails: ThumbnailStore | None = None,
     rejudger: UncertainRejudger | None = None,
     rejudge_scores: RekognitionScoreStore | None = None,
+    pair_rejudger: ClusterPairRejudger | None = None,
+    apply_pair_merges: bool = False,
   ) -> None:
     self._store = store
     self._images = images
@@ -302,6 +304,11 @@ class JobHandlers:
     # 둘 다 주입돼야 Rekognition 재판정 활성 (ADR-030) — 하나라도 None이면 생략 = 종전 동작 (REJUDGE_ENABLED=false 롤백 경로)
     self._rejudger = rejudger
     self._rejudge_scores = rejudge_scores
+    # 앨범 쌍 병합 재판정 (ADR-031) — 판정(호출·로그)과 반영(soft_merge 기록)이 분리된 2단 스위치다.
+    # apply_pair_merges=False면 판정 로그만 남고 파티션은 변하지 않는다(관측 모드 — 실사용자 이벤트에서
+    # 회색지대 비율·통과율을 확인한 뒤 켠다, ADR-031 §롤아웃). 점수 캐시 저장소는 얼굴 단위와 공유한다.
+    self._pair_rejudger = pair_rejudger
+    self._apply_pair_merges = apply_pair_merges
     # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
     self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
     self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
@@ -424,7 +431,16 @@ class JobHandlers:
     kept_soft_attach = [
       pair for pair in stored.soft_attach_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
     ]
-    event = stored.with_constraints(must, cannot).with_soft_attach_pairs(kept_soft_attach)
+    # 앨범 쌍 병합도 같은 원리로 폐기한다 (ADR-031 ④): 사용자가 split·reassign으로 병합의 근거였던
+    # 대표 얼굴을 옮겼다면, 그 병합 기록이 살아남아 다음 재군집에서 앨범을 다시 붙이면 안 된다.
+    kept_soft_merge = [
+      pair for pair in stored.soft_merge_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
+    ]
+    event = (
+      stored.with_constraints(must, cannot)
+      .with_soft_attach_pairs(kept_soft_attach)
+      .with_soft_merge_pairs(kept_soft_merge)
+    )
     snapshot = self._recluster_and_save(message.event_id, event)
     return self._assemble_result(message.job_id, message.event_id, snapshot)
 
@@ -574,6 +590,9 @@ class JobHandlers:
       # 재판정 편입(ADR-030 개정): 응집 게이트 이후 F를 R의 최종 클러스터에 부착만 한다 (must-link 강제로
       # 대상 클러스터가 재파편화되던 회귀 교정). 방향(F→R) 보존 — 저장 순서가 (F, R)이다.
       soft_attach=tuple((row_of[f], row_of[r]) for f, r in event.soft_attach_pairs),
+      # 앨범 쌍 병합(ADR-031): 두 대표가 최종적으로 속한 앨범을 응집 게이트 이후 union한다. 판정
+      # (전원 합의·완전 연결)은 rejudge에서 끝났고 여기서는 반영만 한다 — soft_attach와 같은 구도.
+      soft_merge=tuple((row_of[a], row_of[b]) for a, b in event.soft_merge_pairs),
     )
     result = recluster(event.embeddings, event.cluster_ids, constraints, self._cluster_config, self._new_cluster_id)
 
@@ -611,11 +630,12 @@ class JobHandlers:
     """event 전체를 재군집·강등 판정하고 새 배정을 반영해 저장한다 — 이 저장이 유일한 쓰기이자 마지막 변이다.
 
     저장 후 크래시(발행·삭제 전)로 메시지가 재전달돼도, photo_id 멱등 append + 결정적 재군집이
-    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조). Rekognition 재판정
-    (ADR-030)이 활성이고 미배정 얼굴이 있으면 uncertain 확정 직전에 재판정해, 자동 편입은
-    must-link로 기록 후 재군집을 한 번 더 돌린다 — 스냅샷 직접 수정 대신 2차 패스를 쓰는 이유는
-    같은사진 cannot-link·강등·병합 게이트 등 모든 후처리 불변식이 자동 재적용되고, 저장된 .npz를
-    재군집한 결과와 발행 결과가 항상 일치해 재전달 안전성이 유지되기 때문이다 (군집 비용 <0.1%).
+    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조). Rekognition 재판정이
+    활성이면 1차 패스가 끝난 상태에서 두 가지를 판정한다 — 미배정 얼굴의 앨범 편입(ADR-030)과
+    회색지대 앨범 쌍의 병합(ADR-031). 둘 다 soft-attach·soft-merge 제약으로 기록하고 재군집을 한 번
+    더 돌린다 — 스냅샷 직접 수정 대신 2차 패스를 쓰는 이유는 같은사진 cannot-link·강등·병합 게이트 등
+    모든 후처리 불변식이 자동 재적용되고, 저장된 .npz를 재군집한 결과와 발행 결과가 항상 일치해
+    재전달 안전성이 유지되기 때문이다 (군집 비용 <0.1%).
     """
     if not event.face_ids:
       # 전부 삭제된(또는 애초에 빈) event — 재군집할 것이 없어도 빈 파일을 저장해 단일 진실을 유지한다.
@@ -628,40 +648,61 @@ class JobHandlers:
 
     current = self._cluster_pass(event)
     outcome: RejudgeOutcome | None = None
-    if (
-      self._rejudger is not None
-      and self._rejudge_scores is not None
-      and (current.unmatched_indices or current.ambiguous_indices)
-    ):
+    pair_outcome: PairRejudgeOutcome | None = None
+    if self._rejudge_scores is not None and (self._rejudger is not None or self._pair_rejudger is not None):
       # best-effort 격리 (썸네일과 동일 정책): 재판정·캐시의 어떤 실패도 job을 죽이지 않는다 — 실패 시
-      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 soft-attach가
-      # 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 제약이 저장되면 이후 모든 재군집이 죽는다(오염 방지).
+      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 soft-attach·
+      # 병합 soft-merge가 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 제약이 저장되면 이후 모든 재군집이
+      # 죽는다(오염 방지). 두 재판정은 같은 1차 패스 클러스터 위에서 판정하고 2차 패스 한 번에 반영한다.
       try:
-        cached = self._rejudge_scores.load(event_id)
-        outcome = self._rejudger.rejudge(
-          event, current.clusters, (*current.ambiguous_indices, *current.unmatched_indices), cached
-        )
-        if outcome.assignments:
+        scores = self._rejudge_scores.load(event_id)
+        if self._rejudger is not None and (current.unmatched_indices or current.ambiguous_indices):
+          outcome = self._rejudger.rejudge(
+            event, current.clusters, (*current.ambiguous_indices, *current.unmatched_indices), scores
+          )
+          scores = outcome.scores if outcome.scores is not None else scores
+        if self._pair_rejudger is not None and len(current.clusters) >= 2:
+          # 같은 점수 dict를 이어 쓴다 — 얼굴 단위와 겹치는 (얼굴, 대표) 쌍은 재과금되지 않는다
+          pair_outcome = self._pair_rejudger.judge(event, current.clusters, scores)
+          scores = pair_outcome.scores if pair_outcome.scores is not None else scores
+
+        augmented = event
+        if outcome is not None and outcome.assignments:
           # 편입은 must-link가 아니라 soft-attach로 기록한다 (ADR-030 개정): 저응집 F를 must-link로 강제하면
           # 대상 클러스터의 응집이 내려가 파편병합 게이트 탈락·기존 멤버 축출을 유발했다(실 event 134 회귀).
           # soft-attach는 모든 응집 게이트 이후 F를 대표 R의 최종 클러스터에 부착만 해 클러스터를 안 흔든다.
-          augmented = event.with_soft_attach_pairs(
-            event.soft_attach_pairs + tuple((a.face_id, a.rep_face_id) for a in outcome.assignments)
+          augmented = augmented.with_soft_attach_pairs(
+            augmented.soft_attach_pairs + tuple((a.face_id, a.rep_face_id) for a in outcome.assignments)
           )
+        if pair_outcome is not None and pair_outcome.merges:
+          if self._apply_pair_merges:
+            augmented = augmented.with_soft_merge_pairs(
+              tuple(dict.fromkeys(augmented.soft_merge_pairs + pair_outcome.soft_merge_pairs))
+            )
+          else:
+            logger.info(
+              "앨범 쌍 병합 판정 %d건 — 관측 모드(REJUDGE_PAIR_APPLY=false)라 반영하지 않음: %s",
+              len(pair_outcome.merges),
+              [merge.cluster_ids for merge in pair_outcome.merges],
+            )
+        if augmented is not event:
           current = self._cluster_pass(augmented)
-          event = augmented  # 2차 패스 성공 — 편입 soft-attach를 저장 대상으로 확정 (이후 재군집에서 유지)
+          event = augmented  # 2차 패스 성공 — 재판정 제약을 저장 대상으로 확정 (이후 재군집에서 유지)
       except Exception:
         logger.warning("Rekognition 재판정 실패 event_id=%s — 무시하고 진행 (현 동작 유지)", event_id, exc_info=True)
         outcome = None
+        pair_outcome = None
 
     saved = event.with_cluster_ids(current.new_cluster_ids)
     self._store.save(event_id, saved)
-    if outcome is not None and outcome.scores is not None:
+    measured = [o.scores for o in (outcome, pair_outcome) if o is not None and o.scores is not None]
+    if measured:
       # 점수 캐시 갱신 — best-effort. 죽은 face_id 항목은 프루닝한다 (.npz의 제약 프루닝과 같은 위생)
       try:
         alive = set(saved.face_ids)
+        merged_scores = {pair: sim for scores in measured for pair, sim in scores.items()}
         self._rejudge_scores.save(
-          event_id, {pair: sim for pair, sim in outcome.scores.items() if pair[0] in alive and pair[1] in alive}
+          event_id, {pair: sim for pair, sim in merged_scores.items() if pair[0] in alive and pair[1] in alive}
         )
       except Exception:
         logger.warning("재판정 점수 캐시 저장 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
@@ -2187,6 +2228,122 @@ if __name__ == "__main__":
     "rj-u-join" in next(c for c in pre_result.clusters if "rj-a1" in c.image_ids).image_ids
     and any(u.image_id == "rj-u-sugg" and len(u.suggestions) == 1 for u in pre_result.uncertain)
     and pre_calls == [],
+  )
+
+  # ㉔ Rekognition 앨범 쌍 병합 재판정 (ADR-031): 같은 인물이 두 앨범으로 갈라진 것을 회수한다.
+  # 인물 40(0°)·41(62°)은 centroid cos≈0.47 — 회색지대(≥probe_floor 0.35)지만 로컬 병합 임계(0.55)
+  # 미달이라 파편병합이 절대 붙이지 못하는, 실측이 말한 바로 그 대역이다.
+  from app.pipeline.rejudge import ClusterPairRejudger
+
+  image_source.images.update(
+    {
+      "pm-a1.jpg": fake_image([(40, 0)]),
+      "pm-a2.jpg": fake_image([(40, 1)]),
+      "pm-b1.jpg": fake_image([(41, 0)]),
+      "pm-b2.jpg": fake_image([(41, 1)]),
+    }
+  )
+  pm_calls: list[tuple[str, str]] = []
+
+  def pm_compare(source: bytes, target: bytes) -> float:
+    pm_calls.append((source.decode(), target.decode()))
+    return 99.0  # 전원 합의 통과 대역 (산포 0)
+
+  def pm_body(job_id: str) -> str:
+    return json.dumps(
+      {
+        "type": "classify_request",
+        "job_id": job_id,
+        "group_id": "group-1",
+        "event_id": "event-pm",
+        "images": [
+          {"image_id": "pm-a1", "s3_key": "pm-a1.jpg"},
+          {"image_id": "pm-a2", "s3_key": "pm-a2.jpg"},
+          {"image_id": "pm-b1", "s3_key": "pm-b1.jpg"},
+          {"image_id": "pm-b2", "s3_key": "pm-b2.jpg"},
+        ],
+      }
+    )
+
+  def pm_handlers_of(store, *, apply_merges: bool, compare=pm_compare) -> JobHandlers:
+    return JobHandlers(
+      store=store,
+      images=image_source,
+      extract_faces=fake_extractor,
+      new_cluster_id=counter("pm-person"),
+      new_face_id=counter("pm-face"),
+      pair_rejudger=ClusterPairRejudger(compare=compare, fetch_image=image_source.fetch, crop=rj_crop),
+      rejudge_scores=InMemoryRekognitionScoreStore(),
+      apply_pair_merges=apply_merges,
+    )
+
+  pm_off = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("pm-person"),
+    new_face_id=counter("pm-face"),
+  ).handle(parse_inbound_message(pm_body("job-pm0")))
+  check("(㉔) 전제: 회색지대 두 앨범은 로컬 게이트로 병합되지 않는다", len(pm_off.clusters) == 2)
+
+  pm_calls.clear()
+  pm_observe_store = InMemoryEmbeddingStore()
+  pm_observe = pm_handlers_of(pm_observe_store, apply_merges=False).handle(parse_inbound_message(pm_body("job-pm1")))
+  check(
+    "(㉔) 관측 모드(APPLY=false): 판정은 하되(호출 4회) 파티션·.npz는 그대로",
+    len(pm_observe.clusters) == 2 and len(pm_calls) == 4 and pm_observe_store.load("event-pm").soft_merge_pairs == (),
+  )
+
+  pm_calls.clear()
+  pm_store = InMemoryEmbeddingStore()
+  pm_handlers = pm_handlers_of(pm_store, apply_merges=True)
+  pm1 = pm_handlers.handle(parse_inbound_message(pm_body("job-pm2")))
+  pm_event = pm_store.load("event-pm")
+  pm_face_of = dict(zip(pm_event.photo_ids, pm_event.face_ids))
+  check(
+    "(㉔) 앨범 쌍 병합: 회색지대 두 앨범이 한 인물로 합쳐진다 (전원 합의 99점)",
+    len(pm1.clusters) == 1 and {"pm-a1", "pm-a2", "pm-b1", "pm-b2"} == set(pm1.clusters[0].image_ids),
+  )
+  check(
+    "(㉔) 병합은 (대표, 대표) soft-merge로 .npz에 기록 — must-link는 쓰지 않는다 (ADR-031 ③)",
+    pm_event.soft_merge_pairs == ((pm_face_of["pm-a1"], pm_face_of["pm-b1"]),) and pm_event.must_link_pairs == (),
+  )
+
+  pm_calls.clear()
+  pm2 = pm_handlers.handle(parse_inbound_message(pm_body("job-pm3")))
+  check(
+    "(㉔) 재분류: 저장된 soft-merge로 병합 유지 + 캐시 전량 히트로 추가 호출 0회",
+    len(pm2.clusters) == 1 and pm_calls == [],
+  )
+
+  # 사용자 split이 병합을 되돌린다 — 사람 결정이 기계 증거에 우선 (두 앨범 사이 cannot-link가 union을 막는다)
+  pm_split = pm_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          "type": "cluster_feedback",
+          "job_id": "job-pm4",
+          "event_id": "event-pm",
+          "action": "split",
+          "split": {
+            "cluster_id": pm2.clusters[0].cluster_id,
+            "groups": [["pm-a1", "pm-a2"], ["pm-b1", "pm-b2"]],
+          },
+        }
+      )
+    )
+  )
+  check("(㉔) 사용자 split이 병합을 되돌림 (soft-merge는 cannot-link를 못 덮는다)", len(pm_split.clusters) == 2)
+
+  def pm_always_raise(source: bytes, target: bytes) -> float:
+    raise RuntimeError("rekognition down")
+
+  pm_broken = pm_handlers_of(InMemoryEmbeddingStore(), apply_merges=True, compare=pm_always_raise).handle(
+    parse_inbound_message(pm_body("job-pm5"))
+  )
+  check(
+    "(㉔) 앨범 쌍 재판정 전면 장애: 비활성 실행과 동일 결과 (best-effort)",
+    [sorted(c.image_ids) for c in pm_broken.clusters] == [sorted(c.image_ids) for c in pm_off.clusters],
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")

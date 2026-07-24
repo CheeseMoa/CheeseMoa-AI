@@ -70,8 +70,12 @@ AuraFace가 원리적으로 못 가르는 하드케이스 대역을 실측으로
 [ADR 030](docs/decisions/030-rekognition-uncertain-rejudge.md) ·
 [실측 리뷰](docs/reviews/2026-07-23-rekognition-uncertain-ab.md)). **동일 인물 앨범 쪼개짐 회수는
 같은 API의 별건**이다 — 얼굴 단위 재판정은 미배정 얼굴만 보므로 앨범 A·B가 둘 다 형성되면 훅이 아예
-실행되지 않는다. 앨범 쌍 재판정은 미구현·설계 확정 상태
-([ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md), §다음 구현 목표 0.2).
+실행되지 않는다. 그래서 회색지대 앨범 쌍(centroid ≥0.35)을 대표 2장씩 K×K로 재판정해 **전원 ≥90 AND
+산포 ≤5**일 때만 병합하는 훅을 별도로 두었다 — 구현 완료·**기본 활성**(2단 롤백:
+`REJUDGE_PAIR_APPLY=false` 판정 로그만 / `REJUDGE_PAIR_ENABLED=false` 호출 0회. 실 이벤트 회귀는
+미수행이라 첫 실사용자 이벤트가 첫 실측 — 감시 항목은 ADR 031 §롤아웃,
+[ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md) ·
+[실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md), §다음 구현 목표 0.2).
 
 **HDBSCAN — PoC numpy 이식본** ([ADR 005](docs/decisions/005-hdbscan-standalone-port.md), 파라미터 스윕
 [ADR 009](docs/decisions/009-clustering-parameter-tuning.md)): `min_cluster_size=2, min_samples=2,
@@ -85,7 +89,9 @@ metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적 후처
 [ADR 020](docs/decisions/020-evict-facepair-gray-gate.md)) → margin 구제(top1≥0.40 AND 2위 군집 대비
 1.7배 여유 — 절대 임계가 못 붙이는 [0.40, 0.60) 대역 재심, 실 이벤트 적대 검증 후 활성화
 [2026-07-23 리뷰](docs/reviews/2026-07-23-margin-gate-real-event-validation.md)) → 2차 파편 병합
-([ADR 010](docs/decisions/010-post-rescue-second-merge.md)). 재군집 입력은 근중복 행(≥0.985 — 재업로드·
+([ADR 010](docs/decisions/010-post-rescue-second-merge.md)) → 재판정 반영 2종(앨범 쌍 병합
+`soft_merge` [ADR 031] → 미배정 부착 `soft_attach` [ADR 030] — 이 순서가 계약: 앨범 합치기가 끝나야
+어태치 대상이 최종 상태다. 둘 다 응집 게이트에 불참해 대상 앨범을 흔들지 않는다). 재군집 입력은 근중복 행(≥0.985 — 재업로드·
 유령 행 복제)을 대표 1행으로 접고 결과에서 펼친다([ADR 029](docs/decisions/029-duplicate-embedding-collapse.md),
 쌍 앨범 와해 방어). 임계는 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.
 
@@ -143,7 +149,8 @@ CheeseMoa-AI/
 │   ├── messaging/           # SQS 수신·발행 + 인메모리 페이크
 │   ├── storage/             # event .npz 코덱·저장소·이미지 소스·썸네일 저장소 + 인메모리 페이크
 │   ├── pipeline/            # detect(YuNet)·align(Umeyama)·embed(AuraFace)·cluster(재군집)·
-│   │                        # quality(품질 게이트)·blink(눈감음)·thumbnail(대표 얼굴)·hdbscan_standalone
+│   │                        # quality(품질 게이트)·blink(눈감음)·thumbnail(대표 얼굴)·hdbscan_standalone·
+│   │                        # rejudge(Rekognition 재판정 — 얼굴 편입 ADR 030 / 앨범 쌍 병합 ADR 031)
 │   └── schemas/             # Pydantic 스키마 (SQS 메시지)
 ├── .env.example             # 환경변수 예시
 └── .pre-commit-config.yaml  # ruff linter + formatter (저장 시 포맷은 .vscode/settings.json)
@@ -200,16 +207,15 @@ python -m app.worker                                # 실 워커 (모델 적재 
     잔여: Spring ETag 재업로드 검사 + `delete_request` 발행 검증(PIPA, 유령 행 자체는 여전히 존재) +
     S3 버킷 버저닝 ([backlog](docs/backlog/2026-07-11-followups.md) ·
     [원인·재현](docs/reviews/2026-07-11-duplicate-embedding-split.md))
-0.2 **[P0] 앨범 쪼개짐 회수 — Rekognition 앨범 쌍 재판정 (미구현, ADR 초안 확정)** — 오병합은 거의
-    없는데 같은 인물이 두 앨범으로 갈라지는 문제. 실측 34개 이벤트 중 12개(35%)에 회수 가능한 쪼개짐이
-    있고, 회수 대상 13쌍 중 12쌍이 파편병합 face-pair 바닥(ADR 016)에 막힌 쌍이다 — 그 바닥은 아동
-    체인 융합 때문에 낮출 수 없다(기각 리뷰). 설계: 회색지대 앨범 쌍(centroid ≥0.35, 같은 사진 공존은
-    호출 전 탈락) × 대표 2장씩 K×K → **전원 ≥90 AND 산포 ≤5**일 때만 `soft_merge`로 병합(must-link는
-    event 134 회귀 재현이라 금지). 3개 이상이 합쳐질 땐 컴포넌트 완전 연결 요구 — 다리 타는 체인 융합
-    차단(ADR 024와 같은 계열). 대표 1쌍 argmax는 실측 기각(확실한 타인 쌍이 `[99.99, 33.7, 2.0, 1.6]`).
+0.2 **[P0] 앨범 쪼개짐 회수 — 앨범 쌍 재판정 (구현 완료·기본 활성, 사후 검증 잔여)** — 워커 구현·
+    활성화는 2026-07-24 완료(CHMO-420, [ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md)).
+    잔여: ⓐ **실 이벤트 회귀(활성화보다 늦게 수행)** — 실측 회수 12개 이벤트(104·105·108·111·114·
+    117·121·123·127·134·135·51)가 붙고 적대 이벤트(105 체인·121·131 남매·128)가 붙지 않는지 파티션
+    diff(실 S3 원본 + 유료 호출 필요) ⓑ **초기 운영 감시** — 앨범 수 급감 이벤트·산포가 0에 가깝지
+    않은 병합 로그·병합 직후 사용자 split 중 하나라도 보이면 `REJUDGE_PAIR_APPLY=false`가 첫 조치
+    (ADR 031 §롤아웃) ⓒ 관측 로그로 회색지대 비율·통과율이 실측(아동 치우침 코퍼스)과 맞는지 확인.
     비용 이벤트당 최초 $0.19 + 월 $1.48(아이 20명)
-    ([ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md) ·
-    [실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
+    ([실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
 0.3 **[P1] 비인간 얼굴 오검출 — 인형·조형물·그림 (미구현, ADR 초안 확정)** — 인형이 사람으로 잡혀
     **앨범이 만들어지고**(실 event 139: 몽치치 인형 3장만으로 된 앨범), 얼굴형 조형물은 uncertain으로
     샌다. 로컬 신호는 전부 실측 기각됐고(조형물 검출 score 0.89~0.92가 실얼굴 0.70~0.93보다 높음)
@@ -237,7 +243,8 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 ### 완료된 목표
 
-이력 전문(30건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
+이력 전문(31건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
 [docs/completed-goals.md](docs/completed-goals.md)로 이동했다. **새 목표를 완료하면 CLAUDE.md가 아니라
-그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: Rekognition uncertain 재판정(ADR 030, 2026-07-24) ·
-근중복 행 붕괴(CHMO-419/ADR 029, 2026-07-23) · `face_bboxes` 배열 계약 교체(CHMO-407, 2026-07-22).
+그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: Rekognition 앨범 쌍 병합 재판정(ADR 031,
+2026-07-24) · Rekognition uncertain 재판정(ADR 030, 2026-07-24) ·
+근중복 행 붕괴(CHMO-419/ADR 029, 2026-07-23).
