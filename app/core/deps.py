@@ -161,18 +161,20 @@ def _build_thumbnail_renderer(settings: Settings) -> ThumbnailRenderer | None:
   return render
 
 
-def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
-  """Rekognition 재판정기 2종 + 점수 캐시 저장소를 만든다 — 전부 비활성이면 (None, None, None).
+def _build_rekognition(settings: Settings, s3_client, images: S3ImageSource):
+  """Rekognition 판정기 3종 + 캐시 저장소 2종을 만든다 — 전부 비활성이면 (None,) × 5.
 
   핸들러는 콜러블·Protocol만 안다 — boto3 Rekognition 합성·crop 파라미터는 여기서 가둔다
-  (_build_thumbnail_renderer와 같은 관심사 분리). 얼굴 단위 편입(ADR-030)과 앨범 쌍 병합(ADR-031)은
-  같은 CompareFaces 클로저·같은 crop·같은 점수 캐시를 공유하고 스위치만 독립이다: 각각
-  REJUDGE_ENABLED / REJUDGE_PAIR_ENABLED가 false면 그 판정기가 None이고 핸들러가 해당 경로를
-  생략한다 = 종전 동작 (롤백 경로 — 운영 전제 조건은 ADR 030 §활성화 게이트).
+  (_build_thumbnail_renderer와 같은 관심사 분리). 얼굴 단위 편입(ADR-030)·앨범 쌍 병합(ADR-031)·
+  비인간 얼굴 게이트(ADR-032)는 같은 rekognition 클라이언트·같은 crop 렌더를 공유하고 스위치만
+  독립이다: 각각 REJUDGE_ENABLED / REJUDGE_PAIR_ENABLED / NONHUMAN_GATE_ENABLED가 false면 그
+  판정기가 None이고 핸들러가 해당 경로를 생략한다 = 종전 동작 (롤백 경로 — 운영 전제 조건은
+  ADR 030 §활성화 게이트, 게이트는 추가로 IAM DetectLabels·DetectFaces 권한).
   """
-  if not (settings.rejudge_enabled or settings.rejudge_pair_enabled):
-    return None, None, None
-  from app.pipeline.rejudge import ClusterPairRejudger, UncertainRejudger, render_rejudge_crop
+  if not (settings.rejudge_enabled or settings.rejudge_pair_enabled or settings.nonhuman_gate_enabled):
+    return None, None, None, None, None
+  from app.pipeline.rejudge import ClusterPairRejudger, NonhumanFaceGate, UncertainRejudger, render_rejudge_crop
+  from app.storage.nonhuman_verdicts import S3NonhumanVerdictStore
   from app.storage.rekognition_scores import S3RekognitionScoreStore
 
   rekognition_client = boto3.client("rekognition", region_name=settings.aws_region)
@@ -194,6 +196,19 @@ def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
   def crop(image, bbox: tuple[float, float, float, float]):
     return render_rejudge_crop(image, bbox, margin_ratio=margin, jpeg_quality=quality)
 
+  def detect_labels(crop_jpeg: bytes) -> dict[str, float]:
+    # 실측(2026-07-24 스윕)과 동일 호출 시맨틱스: MinConfidence로 하한만 걸고 응답 전체를 넘긴다 —
+    # 판정 임계(Doll 90·Sculpture 70)는 게이트가 적용한다. 권한 없음(AccessDenied)·스로틀 등 실패는
+    # 전부 raise → 게이트가 얼굴 단위 보류 → best-effort 폴백으로 종전 동작 + 경고 로그.
+    response = rekognition_client.detect_labels(
+      Image={"Bytes": crop_jpeg}, MinConfidence=float(settings.nonhuman_label_min_confidence)
+    )
+    return {label["Name"]: float(label["Confidence"]) for label in response.get("Labels", [])}
+
+  def count_faces(crop_jpeg: bytes) -> int:
+    # 규칙 A의 2콜째 — FaceDetails 개수만 필요하다. 실패는 raise → 게이트가 얼굴 단위 보류.
+    return len(rekognition_client.detect_faces(Image={"Bytes": crop_jpeg}).get("FaceDetails", []))
+
   rejudger = (
     UncertainRejudger(compare=compare, fetch_image=images.fetch, crop=crop, config=settings.to_rejudge_config())
     if settings.rejudge_enabled
@@ -204,8 +219,28 @@ def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
     if settings.rejudge_pair_enabled
     else None
   )
-  scores = S3RekognitionScoreStore(s3_client, settings.embeddings_bucket, settings.rejudge_scores_prefix)
-  return rejudger, pair_rejudger, scores
+  scores = (
+    S3RekognitionScoreStore(s3_client, settings.embeddings_bucket, settings.rejudge_scores_prefix)
+    if settings.rejudge_enabled or settings.rejudge_pair_enabled
+    else None
+  )
+  nonhuman_gate = (
+    NonhumanFaceGate(
+      detect_labels=detect_labels,
+      count_faces=count_faces,
+      fetch_image=images.fetch,
+      crop=crop,
+      config=settings.to_nonhuman_config(),
+    )
+    if settings.nonhuman_gate_enabled
+    else None
+  )
+  nonhuman_verdicts = (
+    S3NonhumanVerdictStore(s3_client, settings.embeddings_bucket, settings.nonhuman_verdicts_prefix)
+    if settings.nonhuman_gate_enabled
+    else None
+  )
+  return rejudger, pair_rejudger, scores, nonhuman_gate, nonhuman_verdicts
 
 
 def _available_cores() -> int:
@@ -251,8 +286,10 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
 
   thumbnail_renderer = _build_thumbnail_renderer(settings)
   images = S3ImageSource(s3_client, settings.images_bucket)
-  # 재판정(ADR-030)은 핸들러와 같은 ImageSource 인스턴스를 공유한다 — crop 원본 재fetch 경로 통일
-  rejudger, pair_rejudger, rejudge_scores = _build_rejudger(settings, s3_client, images)
+  # 재판정(ADR-030)·게이트(ADR-032)는 핸들러와 같은 ImageSource 인스턴스를 공유한다 — crop 원본 재fetch 경로 통일
+  rejudger, pair_rejudger, rejudge_scores, nonhuman_gate, nonhuman_verdicts = _build_rekognition(
+    settings, s3_client, images
+  )
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=images,
@@ -277,6 +314,9 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
     rejudge_scores=rejudge_scores,
     pair_rejudger=pair_rejudger,
     apply_pair_merges=settings.rejudge_pair_apply,
+    # 비인간 얼굴 게이트 (ADR-032) — NONHUMAN_GATE_ENABLED=false면 둘 다 None으로 종전 동작 (롤백 스위치)
+    nonhuman_gate=nonhuman_gate,
+    nonhuman_verdicts=nonhuman_verdicts,
   )
   return WorkerDeps(
     consumer=SqsConsumer(sqs_client, settings.inbound_queue_url, settings.sqs_wait_time_seconds),

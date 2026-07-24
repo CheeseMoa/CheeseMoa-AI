@@ -17,7 +17,7 @@ if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
   from app.pipeline.detect import DetectorConfig
   from app.pipeline.quality import QualityConfig
-  from app.pipeline.rejudge import PairRejudgeConfig, RejudgeConfig
+  from app.pipeline.rejudge import NonhumanConfig, PairRejudgeConfig, RejudgeConfig
   from app.pipeline.thumbnail import ThumbnailConfig
 
 
@@ -199,6 +199,21 @@ class Settings(BaseSettings):
   rejudge_pair_reps: int = 2  # 앨범당 대표 수 K (쌍당 K² 호출). K=1(argmax)은 실측 기각
   rejudge_pair_max_calls_per_job: int = 200  # 앨범 쌍 수는 인물 수의 제곱으로 는다 — 비용 안전판
 
+  # ── 비인간 얼굴 게이트 — 인형·조형물 오검출 (ADR-032, 2026-07-24 실측 스윕) ────
+  # 얼굴 crop에 DetectLabels 1콜을 물어 2신호 AND로만 강등한다: Sculpture|Statue ≥ sculpture면 즉시,
+  # Doll|Toy ≥ doll이면 DetectFaces 2콜째가 얼굴 0개일 때만(단독 미검출 규칙은 실제 아이 24% 오거부라
+  # 금지). 강등 얼굴은 npz nonhuman_face_ids에 기록돼 재군집 입력에서 빠지고, 전량 강등 사진은 공용
+  # 앨범으로 간다. 기본 ON(사용자 결정 — 표본이 얇아 첫 실사용자 이벤트가 첫 실측) — false가 롤백
+  # 스위치이며 npz에 남은 강등 기록도 무시돼 강등 얼굴이 전부 되살아난다. 운영 전제 조건은 ADR 030과
+  # 동일 + 워커 IAM에 rekognition:DetectLabels·DetectFaces (없으면 best-effort 폴백 = 종전 동작 + 경고).
+  nonhuman_gate_enabled: bool = True
+  nonhuman_doll_confidence: float = 90.0  # Doll|Toy 임계 (인형 실측 96.9~99.7, 실인물 오탐 0/54)
+  nonhuman_sculpture_confidence: float = 70.0  # Sculpture|Statue 임계 (조형물 실측 77.1~92.5, 오탐 0/55)
+  nonhuman_label_min_confidence: float = 50.0  # DetectLabels MinConfidence — 응답 하한 (판정 임계와 별개)
+  nonhuman_cluster_probe_faces: int = 3  # 신규 앨범 후보당 판정 얼굴 수 — 과반 강등의 분모 상한
+  nonhuman_max_calls_per_job: int = 100  # 얼굴당 최대 2콜 × $0.001 — 비용 폭주 안전판
+  nonhuman_verdicts_prefix: str = "nonhuman-verdicts/"  # 판정 캐시 키 = {prefix}{event_id}.json
+
   log_level: str = "INFO"
 
   def to_cluster_config(self) -> "ClusterConfig":
@@ -303,6 +318,23 @@ class Settings(BaseSettings):
       max_spread=self.rejudge_pair_max_spread,
       reps=self.rejudge_pair_reps,
       max_calls=self.rejudge_pair_max_calls_per_job,
+    )
+
+  def to_nonhuman_config(self) -> "NonhumanConfig":
+    """설정값을 비인간 얼굴 게이트의 NonhumanConfig로 변환한다 (값 검증은 dataclass __post_init__).
+
+    활성 여부(nonhuman_gate_enabled)는 호출자(deps)가 판단한다. label_min_confidence는
+    NonhumanConfig에도 들어가지만 실제 소비자는 deps의 detect_labels 클로저다 (crop 파라미터는
+    두 재판정과 공유 — to_rejudge_config 참조).
+    """
+    from app.pipeline.rejudge import NonhumanConfig
+
+    return NonhumanConfig(
+      doll_confidence=self.nonhuman_doll_confidence,
+      sculpture_confidence=self.nonhuman_sculpture_confidence,
+      label_min_confidence=self.nonhuman_label_min_confidence,
+      cluster_probe_faces=self.nonhuman_cluster_probe_faces,
+      max_calls=self.nonhuman_max_calls_per_job,
     )
 
   def to_quality_config(self) -> "QualityConfig":
