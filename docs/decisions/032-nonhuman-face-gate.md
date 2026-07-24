@@ -11,6 +11,9 @@
   ADR 030(재판정 훅·crop 파리티·점수 캐시·2차 패스 구조 — 본 ADR이 그대로 재사용) ·
   ADR 007(재군집 흐름·단일 writer) · [ADR 031](031-rekognition-cluster-pair-merge.md)(같은 시점의 또 하나의
   Rekognition 훅 — 실행 순서는 게이트가 두 재판정보다 먼저, 2차 패스는 셋이 1회 공유로 확정 §적용 지점) ·
+  [ADR 033](033-edge-truncated-face-gate.md)(프레임 밖 잘린 얼굴 — **다른 축의 문제다.** 잘린 반쪽
+  얼굴은 진짜 사람이라 본 ADR의 규칙 A·B가 원리적으로 미발동임을 실측 확인:
+  [2026-07-24 스윕](../reviews/2026-07-24-edge-truncated-face-sweep.md) §실측 ②) ·
   CLAUDE.md §다음 구현 목표 0.5
 
 ## 문제
