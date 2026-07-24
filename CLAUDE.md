@@ -79,7 +79,11 @@ AuraFace가 원리적으로 못 가르는 하드케이스 대역을 실측으로
 게이트도 같은 API의 별건**이다 — 인형·조형물이 사람으로 잡혀 앨범을 만드는 문제(실 event 139)는 로컬
 신호로 원리적으로 못 걸러(조형물 score가 실얼굴보다 높음), 신규 앨범 후보·미배정 얼굴의 crop에
 `DetectLabels`(+`Doll|Toy`면 `DetectFaces` 확인)를 물어 **2신호 AND**로만 강등한다(단독 미검출 규칙은
-실제 아이 24% 오거부). 강등 행은 재군집·머릿수에서 빠지고 전량 강등 사진은 공용 앨범 — 구현 완료·
+실제 아이 24% 오거부). 두 재판정·게이트의 **미배정 단건 판정은 주 인물 자격 충족분만**이다 — 그 사진
+최대 얼굴폭의 50%(ADR 022와 동일 규칙) 미만인 배경 인물(행인)은 호출·crop 전송 없이 스킵(편입 성공
+전원이 0.6 이상 실측, 낭비 호출 60% 절감, `REJUDGE_MAIN_FACE_RATIO=0`·`NONHUMAN_MAIN_FACE_RATIO=0`
+롤백 — [ADR 034](docs/decisions/034-rejudge-main-face-gate.md) ·
+[분포 실측](docs/reviews/2026-07-24-rejudge-main-face-ratio-survey.md)). 강등 행은 재군집·머릿수에서 빠지고 전량 강등 사진은 공용 앨범 — 구현 완료·
 **기본 활성**(`NonhumanFaceGate`, `NONHUMAN_GATE_ENABLED=false` 롤백 시 npz 강등 기록도 무시돼 전부
 부활. 게이트가 두 재판정보다 먼저 돌아 강등분을 CompareFaces 후보에서 배제,
 [ADR 032](docs/decisions/032-nonhuman-face-gate.md) ·
@@ -269,6 +273,6 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 이력 전문(32건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
 [docs/completed-goals.md](docs/completed-goals.md)로 이동했다. **새 목표를 완료하면 CLAUDE.md가 아니라
-그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: 비인간 얼굴 게이트(ADR 032, 2026-07-24) ·
-Rekognition 앨범 쌍 병합 재판정(ADR 031, 2026-07-24) · Rekognition uncertain 재판정(ADR 030,
+그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: 재판정 주 인물 자격 — 행인 호출 차단(ADR 034,
+2026-07-24) · 비인간 얼굴 게이트(ADR 032, 2026-07-24) · Rekognition 앨범 쌍 병합 재판정(ADR 031,
 2026-07-24).
