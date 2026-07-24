@@ -71,8 +71,9 @@ AuraFace가 원리적으로 못 가르는 하드케이스 대역을 실측으로
 [실측 리뷰](docs/reviews/2026-07-23-rekognition-uncertain-ab.md)). **동일 인물 앨범 쪼개짐 회수는
 같은 API의 별건**이다 — 얼굴 단위 재판정은 미배정 얼굴만 보므로 앨범 A·B가 둘 다 형성되면 훅이 아예
 실행되지 않는다. 그래서 회색지대 앨범 쌍(centroid ≥0.35)을 대표 2장씩 K×K로 재판정해 **전원 ≥90 AND
-산포 ≤5**일 때만 병합하는 훅을 별도로 두었다 — 구현 완료·**기본 비활성**(2단 스위치
-`REJUDGE_PAIR_ENABLED` 판정·로그 / `REJUDGE_PAIR_APPLY` 반영, 관측 후 켠다,
+산포 ≤5**일 때만 병합하는 훅을 별도로 두었다 — 구현 완료·**기본 활성**(2단 롤백:
+`REJUDGE_PAIR_APPLY=false` 판정 로그만 / `REJUDGE_PAIR_ENABLED=false` 호출 0회. 실 이벤트 회귀는
+미수행이라 첫 실사용자 이벤트가 첫 실측 — 감시 항목은 ADR 031 §롤아웃,
 [ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md) ·
 [실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md), §다음 구현 목표 0.2).
 
@@ -206,14 +207,15 @@ python -m app.worker                                # 실 워커 (모델 적재 
     잔여: Spring ETag 재업로드 검사 + `delete_request` 발행 검증(PIPA, 유령 행 자체는 여전히 존재) +
     S3 버킷 버저닝 ([backlog](docs/backlog/2026-07-11-followups.md) ·
     [원인·재현](docs/reviews/2026-07-11-duplicate-embedding-split.md))
-0.2 **[P0] 앨범 쪼개짐 회수 — 앨범 쌍 재판정 활성화 (구현 완료, 기본 비활성)** — 워커 구현은
-    2026-07-24 완료(CHMO-420, [ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md)).
-    잔여는 켜는 절차뿐이다: ⓐ **실 이벤트 회귀** — 실측 회수 12개 이벤트(104·105·108·111·114·117·
-    121·123·127·134·135·51)가 붙고 적대 이벤트(105 체인·121·131 남매·128)가 붙지 않는지 파티션 diff
-    (실 S3 원본 + 유료 호출 필요) ⓑ `REJUDGE_PAIR_ENABLED=true`로 **관측 모드** 며칠 — 판정 로그로
-    회색지대 비율·통과율이 실측(아동 치우침 코퍼스)과 어긋나지 않는지 확인(호출 비용은 발생)
-    ⓒ 이상 없으면 `REJUDGE_PAIR_APPLY=true` (이상 시 즉시 false 롤백). 비용 이벤트당 최초 $0.19 +
-    월 $1.48(아이 20명) ([실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
+0.2 **[P0] 앨범 쪼개짐 회수 — 앨범 쌍 재판정 (구현 완료·기본 활성, 사후 검증 잔여)** — 워커 구현·
+    활성화는 2026-07-24 완료(CHMO-420, [ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md)).
+    잔여: ⓐ **실 이벤트 회귀(활성화보다 늦게 수행)** — 실측 회수 12개 이벤트(104·105·108·111·114·
+    117·121·123·127·134·135·51)가 붙고 적대 이벤트(105 체인·121·131 남매·128)가 붙지 않는지 파티션
+    diff(실 S3 원본 + 유료 호출 필요) ⓑ **초기 운영 감시** — 앨범 수 급감 이벤트·산포가 0에 가깝지
+    않은 병합 로그·병합 직후 사용자 split 중 하나라도 보이면 `REJUDGE_PAIR_APPLY=false`가 첫 조치
+    (ADR 031 §롤아웃) ⓒ 관측 로그로 회색지대 비율·통과율이 실측(아동 치우침 코퍼스)과 맞는지 확인.
+    비용 이벤트당 최초 $0.19 + 월 $1.48(아이 20명)
+    ([실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
 0.3 **[P1] 비인간 얼굴 오검출 — 인형·조형물·그림 (미구현, ADR 초안 확정)** — 인형이 사람으로 잡혀
     **앨범이 만들어지고**(실 event 139: 몽치치 인형 3장만으로 된 앨범), 얼굴형 조형물은 uncertain으로
     샌다. 로컬 신호는 전부 실측 기각됐고(조형물 검출 score 0.89~0.92가 실얼굴 0.70~0.93보다 높음)

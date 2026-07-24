@@ -187,10 +187,12 @@ class Settings(BaseSettings):
   # ── Rekognition 앨범 쌍 병합 재판정 (ADR-031, 2026-07-24 실측 리뷰) ───────────
   # 같은 인물이 두 앨범으로 갈라진 것을 회수한다: 회색지대 앨범 쌍(centroid ≥ probe_floor)을 대표
   # K장씩 K×K로 비교해 전원이 merge_similarity 이상 AND 산포 ≤ max_spread면 병합한다. 2단 스위치 —
-  # enabled가 호출·판정·로그, apply가 실제 반영이다. 초기 롤아웃은 둘 다 false이며, enabled만 켜
-  # 실사용자 이벤트에서 회색지대 비율·통과율을 관측한 뒤(비용은 발생) apply를 켠다 (ADR-031 §롤아웃).
-  rejudge_pair_enabled: bool = False
-  rejudge_pair_apply: bool = False
+  # enabled가 호출·판정·로그, apply가 실제 반영이다. 기본 ON(2026-07-24 활성화): apply=false가 1단
+  # 롤백(판정 로그만 남고 파티션 불변, 비용은 계속 발생), enabled=false가 완전 롤백(호출 0회).
+  # 실 이벤트 회귀는 미수행이라 첫 실사용자 이벤트가 사실상 첫 실측이다 — 오병합 관측 시 apply부터
+  # 내리고 로그의 점수·산포로 원인을 본다 (ADR-031 §롤아웃·§한계). 운영 전제 조건은 ADR 030과 동일.
+  rejudge_pair_enabled: bool = True
+  rejudge_pair_apply: bool = True
   rejudge_pair_probe_floor: float = 0.35  # 정확도가 아니라 비용 통제용 바닥 (실측 회수분 최저 0.438)
   rejudge_pair_merge_similarity: float = 90.0  # 통과분이 전부 98점 이상이라 95와 결과 동일 — 방어선은 전원 합의
   rejudge_pair_max_spread: float = 5.0  # 통과 13쌍 산포 0.0~1.9 vs 대조군 15.0~98.4
