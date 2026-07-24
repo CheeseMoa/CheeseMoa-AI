@@ -162,15 +162,17 @@ def _build_thumbnail_renderer(settings: Settings) -> ThumbnailRenderer | None:
 
 
 def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
-  """Rekognition 재판정기 + 점수 캐시 저장소를 만든다 (ADR-030) — 비활성이면 (None, None).
+  """Rekognition 재판정기 2종 + 점수 캐시 저장소를 만든다 — 전부 비활성이면 (None, None, None).
 
   핸들러는 콜러블·Protocol만 안다 — boto3 Rekognition 합성·crop 파라미터는 여기서 가둔다
-  (_build_thumbnail_renderer와 같은 관심사 분리). 반환 튜플이 (None, None)이면 핸들러가 전
-  경로에서 재판정을 생략한다 = 종전 동작 (REJUDGE_ENABLED=false 롤백 경로 — 운영 전제 조건은 ADR 030).
+  (_build_thumbnail_renderer와 같은 관심사 분리). 얼굴 단위 편입(ADR-030)과 앨범 쌍 병합(ADR-031)은
+  같은 CompareFaces 클로저·같은 crop·같은 점수 캐시를 공유하고 스위치만 독립이다: 각각
+  REJUDGE_ENABLED / REJUDGE_PAIR_ENABLED가 false면 그 판정기가 None이고 핸들러가 해당 경로를
+  생략한다 = 종전 동작 (롤백 경로 — 운영 전제 조건은 ADR 030 §활성화 게이트).
   """
-  if not settings.rejudge_enabled:
-    return None, None
-  from app.pipeline.rejudge import UncertainRejudger, render_rejudge_crop
+  if not (settings.rejudge_enabled or settings.rejudge_pair_enabled):
+    return None, None, None
+  from app.pipeline.rejudge import ClusterPairRejudger, UncertainRejudger, render_rejudge_crop
   from app.storage.rekognition_scores import S3RekognitionScoreStore
 
   rekognition_client = boto3.client("rekognition", region_name=settings.aws_region)
@@ -189,14 +191,21 @@ def _build_rejudger(settings: Settings, s3_client, images: S3ImageSource):
     matches = [match["Similarity"] for match in response.get("FaceMatches", [])]
     return float(max(matches)) if matches else 0.0
 
-  rejudger = UncertainRejudger(
-    compare=compare,
-    fetch_image=images.fetch,
-    crop=lambda image, bbox: render_rejudge_crop(image, bbox, margin_ratio=margin, jpeg_quality=quality),
-    config=settings.to_rejudge_config(),
+  def crop(image, bbox: tuple[float, float, float, float]):
+    return render_rejudge_crop(image, bbox, margin_ratio=margin, jpeg_quality=quality)
+
+  rejudger = (
+    UncertainRejudger(compare=compare, fetch_image=images.fetch, crop=crop, config=settings.to_rejudge_config())
+    if settings.rejudge_enabled
+    else None
+  )
+  pair_rejudger = (
+    ClusterPairRejudger(compare=compare, fetch_image=images.fetch, crop=crop, config=settings.to_pair_rejudge_config())
+    if settings.rejudge_pair_enabled
+    else None
   )
   scores = S3RekognitionScoreStore(s3_client, settings.embeddings_bucket, settings.rejudge_scores_prefix)
-  return rejudger, scores
+  return rejudger, pair_rejudger, scores
 
 
 def _available_cores() -> int:
@@ -243,7 +252,7 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
   thumbnail_renderer = _build_thumbnail_renderer(settings)
   images = S3ImageSource(s3_client, settings.images_bucket)
   # 재판정(ADR-030)은 핸들러와 같은 ImageSource 인스턴스를 공유한다 — crop 원본 재fetch 경로 통일
-  rejudger, rejudge_scores = _build_rejudger(settings, s3_client, images)
+  rejudger, pair_rejudger, rejudge_scores = _build_rejudger(settings, s3_client, images)
   handlers = JobHandlers(
     store=S3EmbeddingStore(s3_client, settings.embeddings_bucket, settings.embeddings_prefix),
     images=images,
@@ -262,9 +271,12 @@ def build_worker_deps(settings: Settings) -> WorkerDeps:
     thumbnails=S3ThumbnailStore(s3_client, settings.embeddings_bucket, settings.thumbnail_prefix)
     if thumbnail_renderer is not None
     else None,
-    # Rekognition 재판정은 둘 다 있어야 활성 — 비활성(rejudge_enabled=false)이면 둘 다 None으로 종전 동작 (ADR-030)
+    # Rekognition 재판정은 점수 저장소 + 해당 판정기가 있어야 활성 — 비활성이면 None으로 종전 동작
+    # (얼굴 단위 ADR-030 / 앨범 쌍 ADR-031, 각각 REJUDGE_ENABLED·REJUDGE_PAIR_ENABLED가 롤백 스위치)
     rejudger=rejudger,
     rejudge_scores=rejudge_scores,
+    pair_rejudger=pair_rejudger,
+    apply_pair_merges=settings.rejudge_pair_apply,
   )
   return WorkerDeps(
     consumer=SqsConsumer(sqs_client, settings.inbound_queue_url, settings.sqs_wait_time_seconds),

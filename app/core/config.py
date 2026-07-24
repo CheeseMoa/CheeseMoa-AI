@@ -17,7 +17,7 @@ if TYPE_CHECKING:
   from app.pipeline.cluster import ClusterConfig
   from app.pipeline.detect import DetectorConfig
   from app.pipeline.quality import QualityConfig
-  from app.pipeline.rejudge import RejudgeConfig
+  from app.pipeline.rejudge import PairRejudgeConfig, RejudgeConfig
   from app.pipeline.thumbnail import ThumbnailConfig
 
 
@@ -184,6 +184,19 @@ class Settings(BaseSettings):
   rejudge_crop_jpeg_quality: int = Field(default=92, ge=1, le=100)
   rejudge_scores_prefix: str = "rekognition-scores/"  # (face, 대표) 점수 캐시 키 = {prefix}{event_id}.json
 
+  # ── Rekognition 앨범 쌍 병합 재판정 (ADR-031, 2026-07-24 실측 리뷰) ───────────
+  # 같은 인물이 두 앨범으로 갈라진 것을 회수한다: 회색지대 앨범 쌍(centroid ≥ probe_floor)을 대표
+  # K장씩 K×K로 비교해 전원이 merge_similarity 이상 AND 산포 ≤ max_spread면 병합한다. 2단 스위치 —
+  # enabled가 호출·판정·로그, apply가 실제 반영이다. 초기 롤아웃은 둘 다 false이며, enabled만 켜
+  # 실사용자 이벤트에서 회색지대 비율·통과율을 관측한 뒤(비용은 발생) apply를 켠다 (ADR-031 §롤아웃).
+  rejudge_pair_enabled: bool = False
+  rejudge_pair_apply: bool = False
+  rejudge_pair_probe_floor: float = 0.35  # 정확도가 아니라 비용 통제용 바닥 (실측 회수분 최저 0.438)
+  rejudge_pair_merge_similarity: float = 90.0  # 통과분이 전부 98점 이상이라 95와 결과 동일 — 방어선은 전원 합의
+  rejudge_pair_max_spread: float = 5.0  # 통과 13쌍 산포 0.0~1.9 vs 대조군 15.0~98.4
+  rejudge_pair_reps: int = 2  # 앨범당 대표 수 K (쌍당 K² 호출). K=1(argmax)은 실측 기각
+  rejudge_pair_max_calls_per_job: int = 200  # 앨범 쌍 수는 인물 수의 제곱으로 는다 — 비용 안전판
+
   log_level: str = "INFO"
 
   def to_cluster_config(self) -> "ClusterConfig":
@@ -272,6 +285,22 @@ class Settings(BaseSettings):
       fragment_similarity=self.rejudge_fragment_similarity,
       top_k=self.rejudge_top_k,
       max_calls=self.rejudge_max_calls_per_job,
+    )
+
+  def to_pair_rejudge_config(self) -> "PairRejudgeConfig":
+    """설정값을 앨범 쌍 재판정의 PairRejudgeConfig로 변환한다 (값 검증은 dataclass __post_init__).
+
+    활성 여부(rejudge_pair_enabled)와 반영 여부(rejudge_pair_apply)는 호출자(deps·handlers)가
+    판단한다 — 판정기 자체는 "판정만" 아는 순수 로직이다. crop 파라미터는 얼굴 단위와 공유한다.
+    """
+    from app.pipeline.rejudge import PairRejudgeConfig
+
+    return PairRejudgeConfig(
+      probe_floor=self.rejudge_pair_probe_floor,
+      merge_similarity=self.rejudge_pair_merge_similarity,
+      max_spread=self.rejudge_pair_max_spread,
+      reps=self.rejudge_pair_reps,
+      max_calls=self.rejudge_pair_max_calls_per_job,
     )
 
   def to_quality_config(self) -> "QualityConfig":
