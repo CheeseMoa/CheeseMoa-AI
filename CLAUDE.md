@@ -210,8 +210,20 @@ python -m app.worker                                # 실 워커 (모델 적재 
     비용 이벤트당 최초 $0.19 + 월 $1.48(아이 20명)
     ([ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md) ·
     [실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
+0.3 **[P1] 비인간 얼굴 오검출 — 인형·조형물·그림 (미구현, ADR 초안 확정)** — 인형이 사람으로 잡혀
+    **앨범이 만들어지고**(실 event 139: 몽치치 인형 3장만으로 된 앨범), 얼굴형 조형물은 uncertain으로
+    샌다. 로컬 신호는 전부 실측 기각됐고(조형물 검출 score 0.89~0.92가 실얼굴 0.70~0.93보다 높음)
+    "확신이 낮을 때만 외부 호출"도 성립 안 한다 — 비인간 얼굴이야말로 score가 높고 잘 뭉친다. 설계:
+    얼굴 crop(rejudge 파리티)에 `DetectLabels` 1콜 → `Sculpture|Statue ≥70`이면 강등, `Doll|Toy ≥90`이면
+    `DetectFaces` 2콜째로 확인 후 강등. **2신호 AND가 필수** — `DetectFaces` 단독은 교실 단체사진의
+    실제 아이 4/17(24%)을 오거부한다(실측). 강등 = `nonhuman_face_ids`(npz v6) 기록 → 재군집 입력
+    제외 → 공용 앨범. 기본 비활성, 활성화 선행 조건은 표본 축적(3D 캐릭터 피규어·사실적 회화 미측정)
+    ([ADR 032](docs/decisions/032-nonhuman-face-gate.md) ·
+    [실측](docs/reviews/2026-07-24-nonhuman-face-rekognition-sweep.md) ·
+    [로컬 신호 기각](docs/reviews/2026-07-20-ornament-face-false-positive-survey.md))
 0.5 **[P1] 화장품 팔레트 그림 오검출** — 크게 찍힌 얼굴 그림은 크기·score·종횡비 필터 전부 정상값으로
-    통과, 임베딩 단계 신호가 필요한 별도 문제
+    통과, 임베딩 단계 신호가 필요한 별도 문제. 목표 0.3의 게이트가 애니 프린트는 잡았으나 **사실적
+    회화는 `Doll`/`Toy`가 안 붙을 수 있어 미검증**이다
     ([분포 조사](docs/reviews/2026-07-15-detect-score-aspect-survey.md) §한계)
 1. 배포 후속 — CloudWatch 지표 연동, Spring 실계약 통합검증, 큐 visibility timeout·redrive 설정,
    **인스턴스 분리 검토**(Spring과 t4g.small 공유 — 버스터블 크레딧 소진 시 API까지 스로틀,
