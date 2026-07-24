@@ -75,7 +75,15 @@ AuraFace가 원리적으로 못 가르는 하드케이스 대역을 실측으로
 `REJUDGE_PAIR_APPLY=false` 판정 로그만 / `REJUDGE_PAIR_ENABLED=false` 호출 0회. 실 이벤트 회귀는
 미수행이라 첫 실사용자 이벤트가 첫 실측 — 감시 항목은 ADR 031 §롤아웃,
 [ADR 031](docs/decisions/031-rekognition-cluster-pair-merge.md) ·
-[실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md), §다음 구현 목표 0.2).
+[실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md), §다음 구현 목표 0.2). **비인간 얼굴
+게이트도 같은 API의 별건**이다 — 인형·조형물이 사람으로 잡혀 앨범을 만드는 문제(실 event 139)는 로컬
+신호로 원리적으로 못 걸러(조형물 score가 실얼굴보다 높음), 신규 앨범 후보·미배정 얼굴의 crop에
+`DetectLabels`(+`Doll|Toy`면 `DetectFaces` 확인)를 물어 **2신호 AND**로만 강등한다(단독 미검출 규칙은
+실제 아이 24% 오거부). 강등 행은 재군집·머릿수에서 빠지고 전량 강등 사진은 공용 앨범 — 구현 완료·
+**기본 활성**(`NonhumanFaceGate`, `NONHUMAN_GATE_ENABLED=false` 롤백 시 npz 강등 기록도 무시돼 전부
+부활. 게이트가 두 재판정보다 먼저 돌아 강등분을 CompareFaces 후보에서 배제,
+[ADR 032](docs/decisions/032-nonhuman-face-gate.md) ·
+[실측](docs/reviews/2026-07-24-nonhuman-face-rekognition-sweep.md), §다음 구현 목표 0.3 잔여 참조).
 
 **HDBSCAN — PoC numpy 이식본** ([ADR 005](docs/decisions/005-hdbscan-standalone-port.md), 파라미터 스윕
 [ADR 009](docs/decisions/009-clustering-parameter-tuning.md)): `min_cluster_size=2, min_samples=2,
@@ -93,7 +101,9 @@ metric='cosine', cluster_selection_epsilon=0.15`. 재군집 후 결정적 후처
 `soft_merge` [ADR 031] → 미배정 부착 `soft_attach` [ADR 030] — 이 순서가 계약: 앨범 합치기가 끝나야
 어태치 대상이 최종 상태다. 둘 다 응집 게이트에 불참해 대상 앨범을 흔들지 않는다). 재군집 입력은 근중복 행(≥0.985 — 재업로드·
 유령 행 복제)을 대표 1행으로 접고 결과에서 펼친다([ADR 029](docs/decisions/029-duplicate-embedding-collapse.md),
-쌍 앨범 와해 방어). 임계는 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.
+쌍 앨범 와해 방어). 비인간 강등 행(npz v7 `nonhuman_face_ids`)은 입력에서 통째로 제외한다
+(`excluded_rows` — [ADR 032](docs/decisions/032-nonhuman-face-gate.md), 아래 비인간 게이트 참조).
+임계는 전부 `ClusterConfig` 설정값. 클러스터링은 전체 비용 0.1% 미만.
 
 **전체 재군집 + ID 재조정 (정확도 최우선)** ([ADR 007](docs/decisions/007-embedding-storage-s3.md)):
 재군집 격리 단위는 **event**. 군집의 진실은 항상 event 전체 임베딩(S3 `.npz` 보관) 재군집이며, 파티션은
@@ -150,7 +160,8 @@ CheeseMoa-AI/
 │   ├── storage/             # event .npz 코덱·저장소·이미지 소스·썸네일 저장소 + 인메모리 페이크
 │   ├── pipeline/            # detect(YuNet)·align(Umeyama)·embed(AuraFace)·cluster(재군집)·
 │   │                        # quality(품질 게이트)·blink(눈감음)·thumbnail(대표 얼굴)·hdbscan_standalone·
-│   │                        # rejudge(Rekognition 재판정 — 얼굴 편입 ADR 030 / 앨범 쌍 병합 ADR 031)
+│   │                        # rejudge(Rekognition 판정 3종 — 얼굴 편입 ADR 030 / 앨범 쌍 병합 ADR 031 /
+│   │                        #         비인간 얼굴 게이트 ADR 032)
 │   └── schemas/             # Pydantic 스키마 (SQS 메시지)
 ├── .env.example             # 환경변수 예시
 └── .pre-commit-config.yaml  # ruff linter + formatter (저장 시 포맷은 .vscode/settings.json)
@@ -216,17 +227,30 @@ python -m app.worker                                # 실 워커 (모델 적재 
     (ADR 031 §롤아웃) ⓒ 관측 로그로 회색지대 비율·통과율이 실측(아동 치우침 코퍼스)과 맞는지 확인.
     비용 이벤트당 최초 $0.19 + 월 $1.48(아이 20명)
     ([실측](docs/reviews/2026-07-24-rekognition-cluster-pair-survey.md))
-0.3 **[P1] 비인간 얼굴 오검출 — 인형·조형물·그림 (미구현, ADR 초안 확정)** — 인형이 사람으로 잡혀
-    **앨범이 만들어지고**(실 event 139: 몽치치 인형 3장만으로 된 앨범), 얼굴형 조형물은 uncertain으로
-    샌다. 로컬 신호는 전부 실측 기각됐고(조형물 검출 score 0.89~0.92가 실얼굴 0.70~0.93보다 높음)
-    "확신이 낮을 때만 외부 호출"도 성립 안 한다 — 비인간 얼굴이야말로 score가 높고 잘 뭉친다. 설계:
-    얼굴 crop(rejudge 파리티)에 `DetectLabels` 1콜 → `Sculpture|Statue ≥70`이면 강등, `Doll|Toy ≥90`이면
-    `DetectFaces` 2콜째로 확인 후 강등. **2신호 AND가 필수** — `DetectFaces` 단독은 교실 단체사진의
-    실제 아이 4/17(24%)을 오거부한다(실측). 강등 = `nonhuman_face_ids`(npz v6) 기록 → 재군집 입력
-    제외 → 공용 앨범. 기본 비활성, 활성화 선행 조건은 표본 축적(3D 캐릭터 피규어·사실적 회화 미측정)
-    ([ADR 032](docs/decisions/032-nonhuman-face-gate.md) ·
-    [실측](docs/reviews/2026-07-24-nonhuman-face-rekognition-sweep.md) ·
+0.3 **[P1] 비인간 얼굴 게이트 — 운영 잔여분 (구현 완료·기본 활성 2026-07-24)** — 워커 구현
+    (`NonhumanFaceGate`·npz v7 `nonhuman_face_ids`·판정 캐시·머릿수 교정·보정 해제,
+    [ADR 032](docs/decisions/032-nonhuman-face-gate.md))은 완료, `NONHUMAN_GATE_ENABLED=false`가
+    롤백(npz 강등 기록도 무시돼 강등 얼굴 전부 부활). 워커 IAM은 완료 —
+    `rekognition:DetectLabels`·`DetectFaces` + `nonhuman-verdicts/` 캐시 RW를 정책 v5로 추가·인스턴스
+    실측 검증(이때 v4까지의 임베딩·점수 캐시 문이 죽은 버킷을 가리키던 것도 정정 —
+    [ec2-deployment.md §3](docs/guides/ec2-deployment.md) 주의 참조). 잔여: ⓐ **표본 축적** —
+    키노피오류 3D 플라스틱 피규어·사실적 회화·마네킹 미측정(ADR 032 §한계), 오판 관측 시 표본 채우기
+    전까지 false ⓑ **초기 운영 감시** — 앨범 수 급감·실인물 누락 리포트·강등 로그에 실아동 crop 중
+    하나라도 보이면 스위치 다운이 첫 조치 ⓒ 승계 앨범은 판정하지 않으므로 **기존에 이미 만들어진
+    인형 앨범(event 139)은 소급 정리되지 않는다** — 사용자 삭제/보정 또는 npz 정리가 경로
+    ([실측](docs/reviews/2026-07-24-nonhuman-face-rekognition-sweep.md) ·
     [로컬 신호 기각](docs/reviews/2026-07-20-ornament-face-false-positive-survey.md))
+0.4 **[P1] 프레임 밖 잘린 얼굴 (미구현, ADR 초안 확정)** — 경계에서 잘린 반쪽 얼굴이 주 인물로
+    취급돼 사진이 uncertain으로 샌다(실 event 144). YuNet은 프레임 밖 부위의 랜드마크도 **추측해서**
+    찍기 때문에 정렬 기준점이 가짜고 임베딩이 성립하지 않는다(최근접 0.234). 기존 검출 방어층은 전부
+    미발동(score 0.866이라 ADR 015·028이 안 걸림)이고, **ADR 032의 비인간 게이트도 원리적으로 미발동**
+    이다 — 진짜 사람의 반쪽 얼굴이라 Rekognition이 사람으로 본다(실측 확인). 해법은 무과금 로컬 신호:
+    **양눈 중 하나라도 이미지 밖이면 검출 단계에서 폐기**(정제·회복 이후 판정). 판별선은 개수가 아니라
+    부위다 — 눈 밖 3종은 앨범 배정 0/18행, 코·입만 밖인 2종 중 하나는 5개 이벤트에서 정상 앨범 멤버라
+    "1개라도 밖이면 폐기"는 기각. 기본 활성 제안(`truncated_eye_gate=false` 롤백), 소급 불가(재군집은
+    재검출을 안 하므로 기존 npz 행은 그대로)
+    ([ADR 033](docs/decisions/033-edge-truncated-face-gate.md) ·
+    [실측](docs/reviews/2026-07-24-edge-truncated-face-sweep.md))
 0.5 **[P1] 화장품 팔레트 그림 오검출** — 크게 찍힌 얼굴 그림은 크기·score·종횡비 필터 전부 정상값으로
     통과, 임베딩 단계 신호가 필요한 별도 문제. 목표 0.3의 게이트가 애니 프린트는 잡았으나 **사실적
     회화는 `Doll`/`Toy`가 안 붙을 수 있어 미검증**이다
@@ -243,8 +267,8 @@ python -m app.worker                                # 실 워커 (모델 적재 
 
 ### 완료된 목표
 
-이력 전문(31건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
+이력 전문(32건 — 문제·원인·해법·실측 검증·롤백 스위치 기록)은
 [docs/completed-goals.md](docs/completed-goals.md)로 이동했다. **새 목표를 완료하면 CLAUDE.md가 아니라
-그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: Rekognition 앨범 쌍 병합 재판정(ADR 031,
-2026-07-24) · Rekognition uncertain 재판정(ADR 030, 2026-07-24) ·
-근중복 행 붕괴(CHMO-419/ADR 029, 2026-07-23).
+그 파일 맨 위에 같은 형식으로 추가할 것.** 최근 3건: 비인간 얼굴 게이트(ADR 032, 2026-07-24) ·
+Rekognition 앨범 쌍 병합 재판정(ADR 031, 2026-07-24) · Rekognition uncertain 재판정(ADR 030,
+2026-07-24).

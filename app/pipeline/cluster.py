@@ -1134,12 +1134,72 @@ def _collapse_and_recluster(
   )
 
 
+def _exclude_and_recluster(
+  emb: np.ndarray,
+  previous_cluster_ids: Sequence[str | None],
+  resolved_constraints: Constraints,
+  resolved_config: ClusterConfig,
+  factory: Callable[[], str],
+  excluded: Sequence[int],
+) -> ReclusterResult:
+  """비인간 강등 행(ADR-032)을 뺀 입력으로 재군집하고 결과 인덱스를 원 행으로 되돌린다.
+
+  제외 행은 clusters/noise/ambiguous 어디에도 등장하지 않는다 — 라우팅(전량 강등 사진 → 공용
+  앨범)은 호출자(handlers)의 책임이다. 제외 행이 한쪽이라도 낀 제약 쌍은 탈락한다: 강등 얼굴은
+  재군집 세계에 존재하지 않으므로 그 제약도 성립하지 않는다(사람 보정이 강등 얼굴을 건드리면
+  handlers가 강등 자체를 해제하므로 이 탈락이 사람 결정을 삼키는 경우는 없다).
+
+  은퇴 목록은 전체 previous_cluster_ids 기준으로 재계산한다 — 강등으로 멤버가 전부 사라진 앨범도
+  은퇴 통보가 나가야 하류(Spring)가 유령 인물을 잡고 있지 않는다 (_collapse_and_recluster 말미의
+  inherited/retired 계산과 같은 패턴).
+  """
+  excluded_set = set(excluded)
+  kept = [row for row in range(emb.shape[0]) if row not in excluded_set]
+  pos_of = {row: pos for pos, row in enumerate(kept)}
+
+  def remap(pairs: tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+    return tuple((pos_of[i], pos_of[j]) for i, j in pairs if i not in excluded_set and j not in excluded_set)
+
+  inner = recluster(
+    emb[kept],
+    [previous_cluster_ids[row] for row in kept],
+    Constraints(
+      must_link=remap(resolved_constraints.must_link),
+      cannot_link=remap(resolved_constraints.cannot_link),
+      auto_cannot_link=remap(resolved_constraints.auto_cannot_link),
+      soft_attach=remap(resolved_constraints.soft_attach),
+      soft_merge=remap(resolved_constraints.soft_merge),
+    ),
+    resolved_config,
+    factory,
+  )
+  clusters = tuple(
+    PersonCluster(
+      cluster_id=cluster.cluster_id,
+      is_new=cluster.is_new,
+      member_indices=tuple(kept[pos] for pos in cluster.member_indices),
+      membership_similarities=cluster.membership_similarities,
+      centroid=cluster.centroid,
+    )
+    for cluster in inner.clusters
+  )
+  inherited = {cluster.cluster_id for cluster in clusters if not cluster.is_new}
+  retired = tuple(dict.fromkeys(pid for pid in previous_cluster_ids if pid is not None and pid not in inherited))
+  return ReclusterResult(
+    clusters=clusters,
+    noise_indices=tuple(kept[pos] for pos in inner.noise_indices),
+    ambiguous_indices=tuple(kept[pos] for pos in inner.ambiguous_indices),
+    retired_cluster_ids=retired,
+  )
+
+
 def recluster(
   embeddings: np.ndarray,
   previous_cluster_ids: Sequence[str | None],
   constraints: Constraints | None = None,
   config: ClusterConfig | None = None,
   new_id_factory: Callable[[], str] | None = None,
+  excluded_rows: Sequence[int] = (),
 ) -> ReclusterResult:
   """event 전체 임베딩을 재군집하고 기존 cluster_id를 재조정한다 (feature-spec §4 ③④⑤).
 
@@ -1153,6 +1213,8 @@ def recluster(
     constraints: 사용자 보정 제약. 모순 셋은 ValueError.
     config: HDBSCAN·후처리·매칭 파라미터 (기본: PoC 검증 레시피 + 보수적 후처리 임계).
     new_id_factory: 신규 cluster_id 발급자 (기본 uuid4) — 테스트에서 결정적 주입용.
+    excluded_rows: 재군집 입력에서 통째로 빼는 행 인덱스 — 비인간 강등 얼굴(ADR-032). 제외 행은
+      clusters/noise/ambiguous 어디에도 등장하지 않고, 제외 행이 낀 제약 쌍은 탈락한다.
 
   같은 입력(과 같은 factory)에 대해 결과는 항상 동일하다(결정적).
   """
@@ -1185,6 +1247,14 @@ def recluster(
   _validate_pairs(resolved_constraints.auto_cannot_link, n, "auto-cannot-link")
   _validate_pairs(resolved_constraints.soft_attach, n, "soft-attach")
   _validate_pairs(resolved_constraints.soft_merge, n, "soft-merge")
+
+  # 비인간 강등 행 제외 (ADR-032) — 제외 행을 뺀 입력으로 자기 재귀해 근중복 붕괴(⓪)를 포함한
+  # 전 경로가 그대로 돌게 하고, 결과 인덱스를 원 행으로 되돌린다.
+  excluded = sorted({int(row) for row in excluded_rows})
+  if excluded:
+    if excluded[0] < 0 or excluded[-1] >= n:
+      raise ValueError(f"excluded_rows 인덱스가 임베딩 범위를 벗어났습니다. n={n}, 받은 값: {excluded}")
+    return _exclude_and_recluster(emb, previous_cluster_ids, resolved_constraints, resolved_config, factory, excluded)
 
   # ⓪ 근중복 행 붕괴 (ADR-029) — HDBSCAN이 거리 0의 복제 쌍을 실제 인물 덩어리보다 우선 선택해
   # 앨범이 쌍 단위로 와해되는 재업로드·유령 행 오염(실 event 8)을 재군집 전에 차단한다.
@@ -1881,6 +1951,41 @@ if __name__ == "__main__":
   check(
     "(q) 근중복 붕괴 경로: 접힌 대표 행의 soft_merge도 remap돼 병합이 유지",
     len(dup_res.clusters) == 1 and dup_res.clusters[0].member_indices == tuple(range(8)),
+  )
+
+  # (r) 비인간 강등 행 제외 (ADR-032) — 제외 행은 결과 어디에도 없고, 은퇴는 전체 previous 기준.
+  # frozen_event: 0,1,2 = 앨범 A ; 3,4,5,6 = 앨범 B
+  prev_ab = ["A", "A", "A", "B", "B", "B", "B"]
+  excl_res = recluster(frozen_event, prev_ab, excluded_rows=(3, 4, 5, 6))
+  excl_seen = (
+    {i for c in excl_res.clusters for i in c.member_indices}
+    | set(excl_res.noise_indices)
+    | set(excl_res.ambiguous_indices)
+  )
+  check(
+    "(r) 제외 행은 clusters/noise/ambiguous 어디에도 없음 + 남은 앨범은 id 승계",
+    excl_seen == {0, 1, 2}
+    and len(excl_res.clusters) == 1
+    and excl_res.clusters[0].cluster_id == "A"
+    and not excl_res.clusters[0].is_new,
+  )
+  check("(r) 전량 강등된 앨범 B는 은퇴 통보 (전체 previous 기준 재계산)", excl_res.retired_cluster_ids == ("B",))
+  one_excl = recluster(frozen_event, prev_ab, Constraints(must_link=((6, 0),)), excluded_rows=(6,))
+  check(
+    "(r) 결과 인덱스는 원 행 기준 + 제외 행이 낀 제약 쌍은 탈락 (must-link(6,0)이 6을 되살리지 못함)",
+    any(c.member_indices == (3, 4, 5) for c in one_excl.clusters)
+    and all(6 not in c.member_indices for c in one_excl.clusters)
+    and 6 not in one_excl.noise_indices
+    and 6 not in one_excl.ambiguous_indices,
+  )
+  all_excl = recluster(frozen_event, prev_ab, excluded_rows=tuple(range(7)))
+  check(
+    "(r) 전 행 제외 → 빈 결과 + 기존 앨범 전부 은퇴",
+    all_excl.clusters == () and all_excl.noise_indices == () and all_excl.retired_cluster_ids == ("A", "B"),
+  )
+  check(
+    "(r) 범위 밖 excluded_rows 거부",
+    raises_value_error(lambda: recluster(frozen_event, prev_ab, excluded_rows=(7,))),
   )
 
   print(f"\n합성 자가 검증 {passed}건 전부 통과")

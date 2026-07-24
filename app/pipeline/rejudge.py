@@ -1,4 +1,4 @@
-"""Rekognition CompareFaces 보조 재판정 2종 — 얼굴 단위(ADR-030)와 앨범 쌍 단위(ADR-031).
+"""Rekognition 보조 판정 3종 — 얼굴 편입(ADR-030)·앨범 쌍 병합(ADR-031)·비인간 얼굴 게이트(ADR-032).
 
 **얼굴 단위 (`UncertainRejudger`, ADR-030 · 2026-07-23 실측 리뷰)**
 
@@ -29,19 +29,31 @@ AuraFace 순위를 못 믿는 하드케이스라, 1순위가 임계를 넘겼다
   - 3개 이상이 합쳐질 땐 컴포넌트 완전 연결을 요구한다 — A–B·B–C만 보고 합치면 아무도 검사하지 않은
     A–C가 남아 체인 융합(이 레포에서 가장 많이 데인 실패 모드)이 된다.
 
-두 판정기는 crop 렌더·점수 캐시·호출 예산을 `_RekognitionProbe`로 공유한다(같은 event의 두 재판정이
-한 dict를 쓰므로 겹치는 쌍은 한 번만 과금된다). 반영은 둘 다 재군집의 응집 게이트 이후 단계다
-(`Constraints.soft_attach` / `soft_merge`) — must-link 강제는 대상 앨범을 흔든다(실 event 134 회귀).
+**비인간 얼굴 게이트 (`NonhumanFaceGate`, ADR-032 · 2026-07-24 실측 스윕)**
 
-이 모듈은 boto3·S3를 모른다: CompareFaces 호출(FaceComparer)·원본 fetch·crop 렌더는 전부
-콜러블 주입이다(handlers.FaceExtractor와 같은 구도, 합성은 core.deps의 책임). 덕분에 스모크가
-AWS 없이 돈다. rejudge()는 절대 raise하지 않는 계약이 아니다 — best-effort 격리(실패가 job을
-죽이지 않게)는 handlers의 몫이고, 여기서는 쌍 단위 실패만 로그 후 건너뛴다.
+인형·조형물 얼굴은 YuNet score(0.89~0.92)가 실얼굴보다 오히려 높아 로컬 신호로는 원리적으로 못
+거른다(2026-07-20 조사 전면 기각) — 인형 3장만으로 앨범이 만들어지고(실 event 139) 조형물이
+uncertain으로 샌다. 얼굴 crop에 `DetectLabels` 1콜을 물어 **2신호 AND**로만 강등한다:
+`Sculpture|Statue ≥ 70`이면 즉시 강등(규칙 B), `Doll|Toy ≥ 90`이면 `DetectFaces` 2콜째로 확인해
+얼굴 0개일 때만 강등(규칙 A). `DetectFaces` 미검출 단독 규칙은 금지다 — 실제 아이 4/17(24%)을
+오거부한다(실측). 강등 = npz `nonhuman_face_ids` 기록 → 재군집 입력 제외(반영은 handlers).
+
+세 판정기는 crop 렌더·행 단위 crop 캐시를 `_RekognitionProbe`로 공유하고, CompareFaces 쌍 점수
+캐시·예산 소비는 두 재판정기만의 부품(`_CompareFacesProbe`)이다 — 같은 event의 두 재판정이 한
+점수 dict를 쓰므로 겹치는 쌍은 한 번만 과금된다. 재판정 반영은 둘 다 재군집의 응집 게이트 이후
+단계다(`Constraints.soft_attach` / `soft_merge`) — must-link 강제는 대상 앨범을 흔든다(실 event
+134 회귀).
+
+이 모듈은 boto3·S3를 모른다: Rekognition 호출(FaceComparer·LabelDetector·FaceCounter)·원본
+fetch·crop 렌더는 전부 콜러블 주입이다(handlers.FaceExtractor와 같은 구도, 합성은 core.deps의
+책임). 덕분에 스모크가 AWS 없이 돈다. 판정 메서드들은 절대 raise하지 않는 계약이 아니다 —
+best-effort 격리(실패가 job을 죽이지 않게)는 handlers의 몫이고, 여기서는 건 단위 실패만 로그 후
+건너뛴다.
 """
 
 import logging
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -63,6 +75,13 @@ CropRenderer = Callable[[np.ndarray, tuple[float, float, float, float]], "bytes 
 
 # 원본 이미지 fetch — storage.ImageSource.fetch와 동일 시그니처 (실패는 예외로 던진다)
 ImageFetcher = Callable[[str], np.ndarray]
+
+# crop JPEG → DetectLabels 응답 {레이블 이름: 신뢰도 0~100} (ADR-032). MinConfidence 필터는 deps
+# 클로저가 소비한다. 스로틀·권한 없음 등 실패는 raise가 계약 — 게이트가 그 얼굴만 판정 보류한다.
+LabelDetector = Callable[[bytes], "dict[str, float]"]
+
+# crop JPEG → DetectFaces FaceDetails 개수 (ADR-032 규칙 A의 2콜째). 실패는 raise가 계약.
+FaceCounter = Callable[[bytes], int]
 
 
 @dataclass(frozen=True)
@@ -200,6 +219,67 @@ class PairRejudgeOutcome:
     return tuple(merge.rep_face_ids for merge in self.merges)
 
 
+# 판정 규칙의 관심 레이블 (ADR-032 실측 확정 — 바꾸면 근거가 무효). `Art`·`Person`·`Painting`은
+# 쓰지 않는다: 흐린 실제 아이가 `Art` 55.1을 받고 인형이 `Person` 95.1을 받는다(오판 축).
+_DOLL_LABELS = ("Doll", "Toy")
+_SCULPTURE_LABELS = ("Sculpture", "Statue")
+
+
+@dataclass(frozen=True)
+class NonhumanConfig:
+  """비인간 얼굴 게이트의 임계·상한 — 기본값은 2026-07-24 실측 스윕의 확정값 (Settings.to_nonhuman_config).
+
+  임계 근거: 인형 3종 `Doll` 96.9~99.7 vs 실인물 최고 오탐 대역 없음(0/54), 조형물 2종
+  `Sculpture` 77.1~92.5 vs 실인물 0/55. `DetectFaces` 미검출 단독은 실제 아이 4/17 오거부라 금지 —
+  `Doll|Toy` 레이블과의 AND(규칙 A)만 허용된다.
+  """
+
+  doll_confidence: float = 90.0  # Doll|Toy 임계 — 이상이면 DetectFaces 2콜째로 확인 (규칙 A)
+  sculpture_confidence: float = 70.0  # Sculpture|Statue 임계 — 이상이면 즉시 강등 (규칙 B, 2콜 없음)
+  label_min_confidence: float = 50.0  # DetectLabels MinConfidence — deps의 detect_labels 클로저가 소비
+  cluster_probe_faces: int = 3  # 신규 앨범 후보당 판정 얼굴 수 (폭 내림차순) — 과반 규칙의 분모 상한
+  max_calls: int = 100  # job당 Rekognition 호출 상한 (DetectLabels+DetectFaces 합산) — 비용 폭주 안전판
+
+  def __post_init__(self) -> None:
+    for name, value in (
+      ("doll_confidence", self.doll_confidence),
+      ("sculpture_confidence", self.sculpture_confidence),
+    ):
+      if not (0.0 < value <= 100.0):
+        raise ValueError(f"{name}는 (0, 100] 범위여야 합니다. 받은 값: {value}")
+    if not (0.0 <= self.label_min_confidence <= 100.0):
+      raise ValueError(f"label_min_confidence는 [0, 100] 범위여야 합니다. 받은 값: {self.label_min_confidence}")
+    if self.cluster_probe_faces < 1:
+      raise ValueError(f"cluster_probe_faces는 1 이상이어야 합니다. 받은 값: {self.cluster_probe_faces}")
+    if self.max_calls < 1:
+      raise ValueError(f"max_calls는 1 이상이어야 합니다. 받은 값: {self.max_calls}")
+
+
+@dataclass(frozen=True)
+class NonhumanVerdict:
+  """얼굴 1개의 비인간 판정 — 통과(nonhuman=False)도 판정이다(캐싱돼 재호출을 막는다).
+
+  n_faces는 DetectFaces FaceDetails 개수, -1 = 미호출(규칙 B 강등·레이블 미달 통과는 2콜째가
+  없다). labels는 DetectLabels 응답 전체 — 오판 사후 분석(ADR-032 §롤아웃 감시)의 근거.
+  """
+
+  face_id: str
+  nonhuman: bool
+  rule: str = ""  # "doll" | "sculpture" | "" (통과)
+  labels: "dict[str, float]" = field(default_factory=dict)
+  n_faces: int = -1
+
+
+@dataclass(frozen=True)
+class NonhumanOutcome:
+  """비인간 게이트 1회 실행의 결과 — verdicts는 (기존 캐시 + 신규 측정) 병합본 (저장은 핸들러의 책임)."""
+
+  demoted_face_ids: tuple[str, ...] = ()
+  verdicts: "dict[str, NonhumanVerdict] | None" = None
+  calls_made: int = 0
+  truncated: bool = False  # max_calls 도달로 일부 얼굴을 판정하지 못함
+
+
 def render_rejudge_crop(
   image: np.ndarray,
   bbox: tuple[float, float, float, float],
@@ -274,14 +354,13 @@ def _cluster_representatives(event: "EventEmbeddings", cluster: "PersonCluster",
 
 
 class _RekognitionProbe:
-  """CompareFaces 채점의 공통 부품 — crop 렌더·점수 캐시·호출 예산 (두 재판정기가 상속).
+  """Rekognition 판정의 공통 부품 — 원본 fetch·crop 렌더·행 단위 crop 캐시 (세 판정기가 상속).
 
-  이 계층은 boto3·S3를 모른다: 비교 호출·원본 fetch·crop 렌더는 전부 콜러블 주입이다
+  이 계층은 boto3·S3를 모른다: 원본 fetch·crop 렌더는 전부 콜러블 주입이다
   (합성은 core.deps의 책임). 덕분에 스모크가 AWS 없이 돈다.
   """
 
-  def __init__(self, compare: FaceComparer, fetch_image: ImageFetcher, crop: CropRenderer) -> None:
-    self._compare = compare
+  def __init__(self, fetch_image: ImageFetcher, crop: CropRenderer) -> None:
     self._fetch_image = fetch_image
     self._crop = crop
 
@@ -301,6 +380,17 @@ class _RekognitionProbe:
       logger.warning("재판정 crop 실패 s3_key=%s — 해당 쌍 보류", event.s3_keys[row], exc_info=True)
     cache[row] = result
     return result
+
+
+class _CompareFacesProbe(_RekognitionProbe):
+  """CompareFaces 채점 부품 — crop 부품 위에 쌍 점수 캐시·예산 소비를 얹는다 (두 재판정기가 상속).
+
+  비인간 게이트(NonhumanFaceGate)는 CompareFaces를 쓰지 않으므로 이 계층에 불참한다 (ADR-032).
+  """
+
+  def __init__(self, compare: FaceComparer, fetch_image: ImageFetcher, crop: CropRenderer) -> None:
+    super().__init__(fetch_image, crop)
+    self._compare = compare
 
   def _pair_score(
     self,
@@ -336,7 +426,7 @@ class _RekognitionProbe:
     return scores[pair]
 
 
-class UncertainRejudger(_RekognitionProbe):
+class UncertainRejudger(_CompareFacesProbe):
   """uncertain 얼굴 × top-k 앨범 대표의 CompareFaces 재판정기 — 순수 판정 로직 (저장·발행은 handlers)."""
 
   def __init__(
@@ -519,7 +609,7 @@ class UncertainRejudger(_RekognitionProbe):
     return True
 
 
-class ClusterPairRejudger(_RekognitionProbe):
+class ClusterPairRejudger(_CompareFacesProbe):
   """회색지대 앨범 쌍의 CompareFaces 병합 재판정기 (ADR-031) — 순수 판정 로직 (반영·저장은 handlers).
 
   로컬 게이트(파편 병합)가 거절한 앨범 쌍만 본다: 통과했다면 이미 합쳐졌을 것이고, 확정적 반증
@@ -708,6 +798,153 @@ class ClusterPairRejudger(_RekognitionProbe):
       for cluster_id in members[root_a]:
         root_of[cluster_id] = root_a
     return sorted(tuple(sorted(group)) for group in members.values() if len(group) >= 2)
+
+
+class NonhumanFaceGate(_RekognitionProbe):
+  """인형·조형물 얼굴의 DetectLabels 2신호 판정기 (ADR-032) — 순수 판정 로직 (강등 반영·저장은 handlers).
+
+  판정 대상은 두 가지뿐이다: ① 신규 앨범 후보(`is_new`) — 폭 상위 대표들을 판정해 과반이
+  비인간이면 클러스터 전 멤버 강등(작고 흐린 실얼굴 1장이 앨범을 통째로 날리는 사고 방지),
+  ② 미배정 얼굴(노이즈+ambiguous) — 단건 판정. 승계 앨범은 이미 사람 앨범으로 확정된
+  역사(과거 재군집 통과)가 있어 판정하지 않는다 — 호출 0회.
+
+  사람 결정이 기계 증거에 우선한다: 얼굴 자신 또는 그 클러스터 멤버가 must/cannot-link에
+  등장하면 판정 자체를 생략한다 (UncertainRejudger._passes_screens ①과 같은 철학).
+  """
+
+  def __init__(
+    self,
+    detect_labels: LabelDetector,
+    count_faces: FaceCounter,
+    fetch_image: ImageFetcher,
+    crop: CropRenderer,
+    config: NonhumanConfig | None = None,
+  ) -> None:
+    super().__init__(fetch_image, crop)
+    self._detect_labels = detect_labels
+    self._count_faces = count_faces
+    self._config = config if config is not None else NonhumanConfig()
+
+  def judge(
+    self,
+    event: "EventEmbeddings",
+    clusters: Sequence["PersonCluster"],
+    uncertain_indices: Sequence[int],
+    cached_verdicts: "dict[str, NonhumanVerdict]",
+  ) -> NonhumanOutcome:
+    """얼굴들의 비인간 여부를 판정한다 — 결정적: 같은 (event, clusters, 캐시)면 같은 결과.
+
+    캐시 히트는 호출 0회다 — 통과 판정도 캐싱돼(verdicts 병합본) 매 재군집의 재과금을 막는다.
+    얼굴 단위 실패(crop 실패·일시 장애·예산 소진)는 그 얼굴만 판정 보류(강등 없음 = 종전 동작)다.
+    """
+    config = self._config
+    verdicts: dict[str, NonhumanVerdict] = dict(cached_verdicts)
+    budget = _CallBudget(config.max_calls)
+    crop_cache: dict[int, bytes | None] = {}
+    constrained = {face_id for pair in event.must_link_pairs + event.cannot_link_pairs for face_id in pair}
+    demoted: list[str] = []
+
+    # ① 신규 앨범 후보 — 대표 폭 상위 최대 cluster_probe_faces장 판정, 과반 규칙으로 전 멤버 강등
+    for cluster in clusters:
+      if not cluster.is_new:
+        continue
+      if any(event.face_ids[i] in constrained for i in cluster.member_indices):
+        continue  # 사람이 지목한 얼굴이 낀 앨범 — 기계 증거로 뒤집지 않는다 (호출 0회)
+      judged = 0
+      nonhuman = 0
+      for row in _cluster_representatives(event, cluster, config.cluster_probe_faces):
+        verdict = self._face_verdict(event, row, verdicts, crop_cache, budget)
+        if verdict is None:
+          continue  # 판정 확보 실패분은 분모에서 뺀다
+        judged += 1
+        nonhuman += int(verdict.nonhuman)
+      if judged and nonhuman * 2 > judged:  # 과반 (2개 판정이면 2개 모두 필요) — 판정 0개면 강등 없음
+        demoted.extend(event.face_ids[i] for i in cluster.member_indices)
+        logger.info(
+          "비인간 앨범 강등: cluster_id=%s 멤버 %d명 (판정 %d 중 비인간 %d)",
+          cluster.cluster_id,
+          len(cluster.member_indices),
+          judged,
+          nonhuman,
+        )
+
+    # ② 미배정 얼굴 — uncertain 확정 직전의 노이즈+ambiguous 단건 판정
+    for row in sorted(uncertain_indices):
+      if event.face_ids[row] in constrained:
+        continue  # 사람 결정 존중 — 보정 당사자는 판정하지 않는다 (해제 후 재강등 방지도 이 규칙)
+      verdict = self._face_verdict(event, row, verdicts, crop_cache, budget)
+      if verdict is not None and verdict.nonhuman:
+        demoted.append(event.face_ids[row])
+
+    if demoted or budget.made:
+      logger.info(
+        "비인간 얼굴 게이트: 강등 %d건 (호출 %d회%s)",
+        len(demoted),
+        budget.made,
+        ", 호출 상한 도달로 일부 보류" if budget.truncated else "",
+      )
+    return NonhumanOutcome(
+      demoted_face_ids=tuple(dict.fromkeys(demoted)),
+      verdicts=verdicts,
+      calls_made=budget.made,
+      truncated=budget.truncated,
+    )
+
+  def _face_verdict(
+    self,
+    event: "EventEmbeddings",
+    row: int,
+    verdicts: "dict[str, NonhumanVerdict]",
+    crop_cache: dict[int, "bytes | None"],
+    budget: _CallBudget,
+  ) -> NonhumanVerdict | None:
+    """행 1개의 판정 — 캐시 우선, 없으면 예산 안에서 측정한다. 확보 실패(None)는 판정 보류.
+
+    규칙 A(인형)는 레이블과 DetectFaces가 **둘 다** 확보돼야 판정한다 — 레이블만 있고 2콜째가
+    실패하면 통과·강등 어느 쪽도 캐싱하지 않는다(부분 증거 판정 금지, 두 재판정기와 같은 원칙).
+    """
+    face_id = event.face_ids[row]
+    if face_id in verdicts:
+      return verdicts[face_id]
+    if event.bboxes[row][2] <= 0 or not event.s3_keys[row]:
+      return None  # crop 원천 미상(v2 이하 .npz 행) — 판정 불가
+    crop = self._crop_jpeg(event, row, crop_cache)
+    if crop is None:
+      return None
+    if budget.exhausted():
+      budget.truncated = True
+      return None
+    try:
+      budget.made += 1
+      labels = {str(name): float(confidence) for name, confidence in self._detect_labels(crop).items()}
+    except Exception:
+      logger.warning("DetectLabels 호출 실패 face_id=%s — 이 얼굴 판정 보류", face_id, exc_info=True)
+      return None
+
+    config = self._config
+    # 규칙 B 먼저 — 조형물은 Rekognition도 얼굴로 검출하므로 DetectFaces 확인이 무의미하다 (2콜 없음)
+    if max((labels.get(name, 0.0) for name in _SCULPTURE_LABELS), default=0.0) >= config.sculpture_confidence:
+      verdict = NonhumanVerdict(face_id=face_id, nonhuman=True, rule="sculpture", labels=labels)
+    elif max((labels.get(name, 0.0) for name in _DOLL_LABELS), default=0.0) >= config.doll_confidence:
+      # 규칙 A — Doll|Toy 단독으로는 강등하지 않는다: DetectFaces가 얼굴을 보면 인형을 든 실인물이다
+      if budget.exhausted():
+        budget.truncated = True
+        return None
+      try:
+        budget.made += 1
+        n_faces = int(self._count_faces(crop))
+      except Exception:
+        logger.warning("DetectFaces 호출 실패 face_id=%s — 이 얼굴 판정 보류", face_id, exc_info=True)
+        return None
+      verdict = NonhumanVerdict(
+        face_id=face_id, nonhuman=n_faces == 0, rule="doll" if n_faces == 0 else "", labels=labels, n_faces=n_faces
+      )
+    else:
+      verdict = NonhumanVerdict(face_id=face_id, nonhuman=False, labels=labels)
+    if verdict.nonhuman:
+      logger.info("비인간 얼굴 판정: face_id=%s rule=%s labels=%s", face_id, verdict.rule, verdict.labels)
+    verdicts[face_id] = verdict
+    return verdict
 
 
 if __name__ == "__main__":
@@ -1004,6 +1241,166 @@ if __name__ == "__main__":
   pair_calls.clear()
   no_pair = build_pair().judge(pair_event, (album_a,), {})
   check("앨범이 1개면 판정할 쌍이 없다 — 호출 0회", no_pair.merges == () and pair_calls == [])
+
+  # ── 비인간 얼굴 게이트 (ADR-032) ──────────────────────────────────────────
+  # 행 구성: 앨범 4개(NH 인형 과반·HM 실인물 다수·OLD 승계·CON 보정 당사자) + 미배정 9행.
+  # s3_key = face_id라 페이크 detect_labels/count_faces가 얼굴을 식별한다 (위 페이크들과 같은 배선).
+  nh_rows = [
+    ("nd1", "np-0", axis_vector(0), 120.0, (0.0, 0.0, 120.0, 120.0), "nd1"),  # NH — Doll 99.6·얼굴 0
+    ("nd2", "np-1", axis_vector(1), 110.0, (0.0, 0.0, 110.0, 110.0), "nd2"),  # NH — Doll 96.9·얼굴 0
+    ("nd3", "np-2", axis_vector(2), 100.0, (0.0, 0.0, 100.0, 100.0), "nd3"),  # NH — 관심 레이블 없음 (통과)
+    ("nh1", "np-3", axis_vector(3), 120.0, (0.0, 0.0, 120.0, 120.0), "nh1"),  # HM — Doll 99.0·얼굴 0
+    ("nh2", "np-4", axis_vector(4), 110.0, (0.0, 0.0, 110.0, 110.0), "nh2"),  # HM — 통과
+    ("nh3", "np-5", axis_vector(5), 100.0, (0.0, 0.0, 100.0, 100.0), "nh3"),  # HM — 통과
+    ("no1", "np-6", axis_vector(6), 120.0, (0.0, 0.0, 120.0, 120.0), "no1"),  # OLD(승계) — 판정 대상 아님
+    ("nc1", "np-7", axis_vector(7), 120.0, (0.0, 0.0, 120.0, 120.0), "nc1"),  # CON — must-link 당사자 면제
+    ("nc2", "np-8", axis_vector(8), 100.0, (0.0, 0.0, 100.0, 100.0), "nc2"),  # 미배정·must-link 당사자 면제
+    ("ns1", "np-9", axis_vector(9), 100.0, (0.0, 0.0, 100.0, 100.0), "ns1"),  # Sculpture 77.1 → 규칙 B 강등
+    ("nb1", "np-10", axis_vector(10), 100.0, (0.0, 0.0, 100.0, 100.0), "nb1"),  # Doll 89.9 → 경계 통과
+    ("nb2", "np-11", axis_vector(11), 100.0, (0.0, 0.0, 100.0, 100.0), "nb2"),  # Doll 90.0·얼굴 0 → 강등
+    ("nb3", "np-12", axis_vector(12), 100.0, (0.0, 0.0, 100.0, 100.0), "nb3"),  # Sculpture 69.9 → 경계 통과
+    ("nb4", "np-13", axis_vector(13), 100.0, (0.0, 0.0, 100.0, 100.0), "nb4"),  # Sculpture 70.0 → 강등
+    ("nr1", "np-14", axis_vector(14), 100.0, (0.0, 0.0, 100.0, 100.0), "nr1"),  # Art 55.1 흐린 아이 → 통과
+    ("nf1", "np-15", axis_vector(15), 100.0, (0.0, 0.0, 100.0, 100.0), "nf1"),  # Doll 99.0·얼굴 1 → 통과
+    ("nx1", "np-16", axis_vector(16), 0.0, (0.0, 0.0, 0.0, 0.0), ""),  # crop 원천 미상 — 건너뜀
+  ]
+  nh_event = EventEmbeddings.empty().append_faces(nh_rows)
+  nh_event = nh_event.with_cluster_ids(["NH", "NH", "NH", "HM", "HM", "HM", "OLD", "CON"] + [None] * 9)
+  nh_event = nh_event.with_constraints([("nc1", "nc2")], ())
+
+  def nh_album(cluster_id: str, member_indices: tuple[int, ...], is_new: bool) -> PersonCluster:
+    return PersonCluster(
+      cluster_id=cluster_id,
+      is_new=is_new,
+      member_indices=member_indices,
+      membership_similarities=(1.0,) * len(member_indices),
+      centroid=axis_vector(0),
+    )
+
+  nh_clusters = (
+    nh_album("NH", (0, 1, 2), True),
+    nh_album("HM", (3, 4, 5), True),
+    nh_album("OLD", (6,), False),
+    nh_album("CON", (7,), True),
+  )
+  nh_uncertain = (8, 9, 10, 11, 12, 13, 14, 15, 16)
+
+  NH_LABELS: dict[str, dict[str, float]] = {
+    "nd1": {"Doll": 99.6, "Toy": 99.6, "Person": 95.1},  # 인형이 Person 95.1을 받는 실측 재현 — Person은 안 쓴다
+    "nd2": {"Toy": 96.9},
+    "nd3": {"Person": 99.0},
+    "nh1": {"Doll": 99.0},
+    "nh2": {"Person": 99.0},
+    "nh3": {},
+    "no1": {"Doll": 99.0},  # 승계 앨범 — 호출되면 안 되는 값
+    "nc1": {"Doll": 99.0},  # 면제 — 호출되면 안 되는 값
+    "nc2": {"Doll": 99.0},  # 면제 — 호출되면 안 되는 값
+    "ns1": {"Sculpture": 77.1, "Art": 60.0},
+    "nb1": {"Doll": 89.9},
+    "nb2": {"Doll": 90.0},
+    "nb3": {"Statue": 69.9},
+    "nb4": {"Statue": 70.0},
+    "nr1": {"Art": 55.1, "Painting": 53.2},  # 흐린 실제 아이의 실측 레이블 — Art·Painting은 판정에 안 쓴다
+    "nf1": {"Doll": 99.0},  # 인형을 든 실인물 — DetectFaces가 얼굴 1개를 본다
+  }
+  NH_FACES: dict[str, int] = {"nd1": 0, "nd2": 0, "nh1": 0, "nb2": 0, "nf1": 1}
+  nh_label_calls: list[str] = []
+  nh_count_calls: list[str] = []
+
+  def nh_detect_labels(crop: bytes) -> dict[str, float]:
+    tag = crop.decode()
+    nh_label_calls.append(tag)
+    return NH_LABELS[tag]
+
+  def nh_count_faces(crop: bytes) -> int:
+    tag = crop.decode()
+    nh_count_calls.append(tag)
+    return NH_FACES[tag]
+
+  def build_gate(config: NonhumanConfig | None = None) -> NonhumanFaceGate:
+    return NonhumanFaceGate(
+      detect_labels=nh_detect_labels,
+      count_faces=nh_count_faces,
+      fetch_image=lambda key: np.frombuffer(key.encode(), dtype=np.uint8),
+      crop=lambda image, bbox: bytes(image),
+      config=config,
+    )
+
+  nh_outcome = build_gate().judge(nh_event, nh_clusters, nh_uncertain, {})
+  check(
+    "신규 앨범 과반 강등: 3장 중 2장 인형(규칙 A) → 클러스터 전 멤버 강등",
+    {"nd1", "nd2", "nd3"} <= set(nh_outcome.demoted_face_ids),
+  )
+  check(
+    "과반 미달 유지: 3장 중 1장만 비인간 → 앨범 강등 없음",
+    not ({"nh1", "nh2", "nh3"} & set(nh_outcome.demoted_face_ids)),
+  )
+  check("승계 앨범(is_new=False)은 판정 대상 아님 — 호출 0회", "no1" not in nh_label_calls)
+  check(
+    "면제: must-link 당사자(클러스터 멤버·미배정 모두)는 호출 0회",
+    "nc1" not in nh_label_calls and "nc2" not in nh_label_calls,
+  )
+  check(
+    "규칙 B: Sculpture 77.1 → 강등, DetectFaces 2콜째 없음",
+    "ns1" in nh_outcome.demoted_face_ids and "ns1" not in nh_count_calls,
+  )
+  check(
+    "경계값: Doll 89.9 통과 / 90.0 강등, Sculpture 69.9 통과 / 70.0 강등",
+    "nb1" not in nh_outcome.demoted_face_ids
+    and "nb2" in nh_outcome.demoted_face_ids
+    and "nb3" not in nh_outcome.demoted_face_ids
+    and "nb4" in nh_outcome.demoted_face_ids,
+  )
+  check("경계 미달 Doll(89.9)은 DetectFaces도 안 나간다", "nb1" not in nh_count_calls)
+  check(
+    "실인물 대조: 관심 레이블 없음·Art 55.1+Painting 53.2 전부 통과 판정 (Art·Person·Painting 미사용)",
+    "nr1" not in nh_outcome.demoted_face_ids
+    and nh_outcome.verdicts["nr1"].nonhuman is False
+    and nh_outcome.verdicts["nd3"].nonhuman is False,  # nd3 강등은 개별 판정이 아니라 앨범 과반 규칙의 결과
+  )
+  check(
+    "규칙 A 미발동: Doll 99.0이어도 DetectFaces가 얼굴을 보면 실인물(인형 든 아이)",
+    "nf1" not in nh_outcome.demoted_face_ids and "nf1" in nh_count_calls,
+  )
+  check("crop 원천 미상 행은 건너뜀 (호출 없음)", "" not in nh_label_calls)
+  check(
+    "통과 판정도 캐시에 남는다 (재과금 방지의 핵심)",
+    nh_outcome.verdicts is not None and nh_outcome.verdicts["nr1"].nonhuman is False,
+  )
+
+  nh_label_calls.clear()
+  nh_count_calls.clear()
+  nh_cached = build_gate().judge(nh_event, nh_clusters, nh_uncertain, nh_outcome.verdicts)
+  check(
+    "캐시 전량 히트: 호출 0회 + 같은 판정",
+    nh_label_calls == []
+    and nh_count_calls == []
+    and nh_cached.calls_made == 0
+    and nh_cached.demoted_face_ids == nh_outcome.demoted_face_ids,
+  )
+
+  nh_label_calls.clear()
+  nh_count_calls.clear()
+  nh_capped = build_gate(NonhumanConfig(max_calls=2)).judge(nh_event, nh_clusters, nh_uncertain, {})
+  check(
+    "호출 상한: 2콜(nd1 레이블+얼굴)로 소진 → truncated + 측정분(판정 1건)은 캐시에 잔존",
+    nh_capped.truncated and nh_capped.calls_made == 2 and len(nh_capped.verdicts) == 1,
+  )
+
+  # NonhumanConfig 검증
+  for name, kwargs in [
+    ("doll_confidence 0", {"doll_confidence": 0.0}),
+    ("sculpture_confidence 범위 밖", {"sculpture_confidence": 150.0}),
+    ("label_min_confidence 음수", {"label_min_confidence": -1.0}),
+    ("cluster_probe_faces 0", {"cluster_probe_faces": 0}),
+    ("max_calls 0", {"max_calls": 0}),
+  ]:
+    try:
+      NonhumanConfig(**kwargs)
+    except ValueError:
+      check(f"거부: NonhumanConfig {name}", True)
+    else:
+      raise SystemExit(f"실패: NonhumanConfig {name} — ValueError가 발생해야 하는데 통과됨")
 
   # RejudgeConfig 검증
   for name, kwargs in [

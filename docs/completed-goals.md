@@ -3,6 +3,35 @@
 CLAUDE.md에서 이동한 완료 목표 아카이브 (2026-07-22, 컨텍스트 절감). 새 목표를 완료하면 이 파일
 **맨 위에** 같은 형식(문제 → 원인 → 해법 → 실측 검증 → 롤백 스위치)으로 추가한다 — CLAUDE.md에는 넣지 않는다.
 
+- **비인간 얼굴 게이트 — 인형·조형물 오검출 강등 (P1 목표 0.3 구현분)** (2026-07-24,
+  [ADR 032](decisions/032-nonhuman-face-gate.md),
+  [실측 스윕](reviews/2026-07-24-nonhuman-face-rekognition-sweep.md),
+  [로컬 신호 기각](reviews/2026-07-20-ornament-face-false-positive-survey.md)) — 인형이 사람으로 잡혀
+  **앨범이 만들어지고**(실 event 139: 몽치치 인형 3장 앨범) 얼굴형 조형물이 uncertain으로 새던 문제.
+  로컬 신호는 원리적으로 불가(조형물 검출 score 0.89~0.92가 실얼굴보다 높고 임베딩·크기·종횡비 전부
+  정상값 — 2026-07-20 전면 기각), "확신 낮을 때만 외부 호출"도 성립 안 함(비인간이야말로 score가 높고
+  잘 뭉친다). 해법: 얼굴 crop(ADR 030 `render_rejudge_crop` 파리티 — 넓은 crop은 `Doll` 99.6→70.4로
+  되레 악화)에 `DetectLabels` 1콜 → `Sculpture|Statue ≥70` 즉시 강등(규칙 B), `Doll|Toy ≥90`이면
+  `DetectFaces` 2콜째가 얼굴 0개일 때만 강등(규칙 A) — **2신호 AND가 필수**(`DetectFaces` 미검출 단독은
+  교실 단체사진 실제 아이 4/17=24% 오거부, `Art`·`Person`·`Painting`은 실인물 `Art` 55.1·인형 `Person`
+  95.1이라 미사용). 판정 대상은 신규 앨범 후보(폭 상위 3장 과반 강등 — 흐린 실얼굴 1장이 앨범을 못
+  날리게)와 미배정 얼굴 단건뿐, 승계 앨범은 판정 안 함(소급 정리는 범위 밖). 강등 = npz **v7**
+  `nonhuman_face_ids`(초안의 v6은 ADR 031 `soft_merge_pairs`가 선점해 정정) 기록 → `recluster(...,
+  excluded_rows)`로 재군집 입력 제외 → 전량 강등 사진은 event 스코프로 `common_album`(안 하면 결과
+  메시지에서 사진이 통째로 증발) → 머릿수 자격 ③으로 아이1+인형1의 "2인 단체" 오노출도 교정. 게이트는
+  두 재판정(ADR 030·031)보다 **먼저** 돌아 강등분을 CompareFaces 후보에서 배제(event 139 점수 캐시에
+  인형 대표 4쌍 전부 -1.0 낭비 실기록), 2차 패스는 셋이 1회 공유. 사람 결정 우선: must/cannot-link
+  당사자(클러스터 멤버 포함)는 판정 생략, 사용자 보정이 강등 얼굴을 건드리면 목록에서 제거(영구 복구
+  — 이후 면제가 재강등 차단). 통과 판정은 `nonhuman-verdicts/{event_id}.json`에 캐싱(통과분은 npz에 안
+  남아 캐시 없이는 매 재군집 재과금 — 손상은 빈 캐시, 진실은 npz). 검증(AWS 0원): rejudge 63건(규칙
+  A/B·경계값 89.9/90.0·69.9/70.0·과반·면제·캐시 0호출)·cluster 56건(excluded_rows 제외·제약 remap 탈락·
+  전량 강등 앨범 은퇴 재계산)·event_embeddings 36건(v7 왕복·v6 폴백·유령 참조 거부)·verdicts 코덱·
+  handlers 86건 종단(㉕ 앨범 소멸→공용·재분류 0호출·머릿수 교정·retired 통보·보정 해제·전면 장애 =
+  비활성 동일·delete 캐시 삭제·재판정 순서). 롤백: `NONHUMAN_GATE_ENABLED=false` — npz에 남은 강등
+  기록도 무시돼 강등 얼굴 전부 부활(**기본 활성**, 사용자 결정 — 표본이 얇아 첫 실사용자 이벤트가 첫
+  실측). 잔여: 워커 IAM `rekognition:DetectLabels`·`DetectFaces`(없으면 무음 폴백+경고 로그), 표본
+  축적(3D 피규어·사실적 회화·마네킹 미측정), 초기 감시(앨범 수 급감·실인물 누락 리포트·강등 로그
+  실아동 crop → 스위치 다운이 첫 조치).
 - **Rekognition 앨범 쌍 병합 재판정 — 동일 인물 앨범 쪼개짐 회수 (P0 목표 0.2 구현분)** (2026-07-24,
   CHMO-420, [ADR 031](decisions/031-rekognition-cluster-pair-merge.md),
   [실측](reviews/2026-07-24-rekognition-cluster-pair-survey.md)) — 오병합은 거의 없는데 같은 인물이 두

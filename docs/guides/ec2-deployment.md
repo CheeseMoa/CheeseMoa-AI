@@ -134,21 +134,30 @@ SQS 폴링 시작
 
 ## 3. IAM
 
-인스턴스 롤 `cheesemoa-ec2-role`에 `CheeseMoaAiWorkerPolicy`가 붙어 있다. 워커가 실제로 호출하는 API만 담았다:
+인스턴스 롤 `cheesemoa-ec2-role`에 `CheeseMoaAiWorkerPolicy`가 붙어 있다. 워커가 실제로 호출하는 API만 담았다
+(현행 v5, 2026-07-24):
 
 - 인바운드 큐(`CheeseMoa-cluster-request.fifo`): `ReceiveMessage` · `DeleteMessage` · `GetQueueAttributes`
 - 결과 큐(`CheeseMoa-cluster-response.fifo`): `SendMessage`
 - `cheesemoa-dev`(이미지): `GetObject`
-- `cheesemoa-test-...-an`(임베딩): `GetObject` · `PutObject` (`embeddings/` 프리픽스)
-- `cheesemoa-test-...-an`(재판정 점수 캐시): `GetObject`·`PutObject`·`DeleteObject` (`rekognition-scores/`
+- `cheesemoa-dev`(임베딩): `GetObject` · `PutObject` (`embeddings/` 프리픽스)
+- `cheesemoa-dev`(재판정 점수 캐시): `GetObject`·`PutObject`·`DeleteObject` (`rekognition-scores/`
   프리픽스, CHMO-420) — 없으면 캐시 I/O가 best-effort로 조용히 실패해 매 재군집마다 Rekognition 재호출(재과금)
-- Rekognition 재판정(CHMO-420, ADR 030·031): `rekognition:CompareFaces` — `aws:RequestedRegion` 조건으로
-  서울 리전 한정(CompareFaces는 리소스 레벨 미지원이라 `Resource: "*"` + 리전 조건). 없어도 워커는
-  best-effort 폴백으로 종전 동작 + 경고 로그(재판정만 무효). `REJUDGE_ENABLED=false`면 호출 자체가 없다.
-  얼굴 단위 편입(ADR 030)과 앨범 쌍 병합(ADR 031, `REJUDGE_PAIR_ENABLED`)이 **같은 이 권한 하나**를
-  쓴다 — 앨범 쌍 활성화로 새로 필요한 IAM 항목은 없고 호출량만 는다(이벤트당 최초 $0.19 + 월 $1.48 추정)
-- 두 버킷: `ListBucket` — 레디니스의 `head_bucket`이 이 권한을 요구한다
+- `cheesemoa-dev`(비인간 판정 캐시): `GetObject`·`PutObject`·`DeleteObject` (`nonhuman-verdicts/`
+  프리픽스, ADR 032) — 없으면 위와 같은 무음 재과금 함정
+- Rekognition(CHMO-420, ADR 030·031·032): `rekognition:CompareFaces` · `DetectLabels` · `DetectFaces` —
+  `aws:RequestedRegion` 조건으로 서울 리전 한정(리소스 레벨 미지원이라 `Resource: "*"` + 리전 조건).
+  없어도 워커는 best-effort 폴백으로 종전 동작 + 경고 로그(해당 판정만 무효). 얼굴 단위 편입·앨범 쌍
+  병합(ADR 030·031, `REJUDGE_*`)이 CompareFaces를, 비인간 게이트(ADR 032, `NONHUMAN_GATE_ENABLED`)가
+  DetectLabels·DetectFaces를 쓴다. 스위치가 꺼져 있으면 호출 자체가 없다.
+- `cheesemoa-dev`: `ListBucket` — 레디니스의 `head_bucket`이 이 권한을 요구한다
 - ECR pull (인스턴스 롤엔 `AmazonEC2ContainerRegistryReadOnly`도 이미 있음)
+
+> **주의 — 죽은 버킷 참조 이력 (v4 이전)**: v4까지의 임베딩·점수 캐시 문은 존재하지 않는 옛 버킷
+> (`cheesemoa-test-889918307386-ap-northeast-2-an`)을 가리키고 있었다. 그동안 워커가 동작한 것은
+> Spring의 인라인 정책 `cheesemoa-app`이 `cheesemoa-dev/*` 전체 RW를 갖고 있어서다(컨테이너별 롤
+> 분리가 불가한 공유 롤의 부수효과 — §리스크). v5에서 실제 버킷으로 정정했다. 워커 신규 권한을 추가할
+> 때는 이 정책의 ARN이 실재하는지 확인할 것(정책 문서만 보면 통과처럼 보이는 함정).
 
 CloudWatch Logs 쓰기는 별도 인라인 정책 `cheesemoa-cloudwatch-logs`에 있다 — Spring(`/cheesemoa/app`)과
 워커(`/cheesemoa/ai-worker`) 두 로그 그룹에 `logs:CreateLogStream`·`logs:PutLogEvents`만 허용.

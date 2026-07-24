@@ -31,7 +31,11 @@ EMBED_DIM = 512
 # v6: soft_merge_pairs(대표↔대표, 방향 없음) 열 추가 — Rekognition 앨범 쌍 병합 재판정(ADR-031). 두 대표가
 # 최종적으로 속한 클러스터를 응집 게이트 이후에 통째로 합친다(같은 인물이 두 앨범으로 갈라진 것의 회수).
 # v5 이하 파일은 빈 튜플로 로드된다: 앨범 쌍 병합이 없던 상태와 정확히 일치하는 안전 폴백.
-SCHEMA_VERSION = 6
+# v7: nonhuman_face_ids(희소 face_id 목록) 열 추가 — 비인간 얼굴 게이트(ADR-032). 인형·조형물로 강등된
+# 얼굴 행은 재군집 입력에서 제외돼 앨범을 만들지도 uncertain으로 새지도 않는다. 사용자 보정이 강등
+# 얼굴을 건드리면 목록에서 제거된다(handlers의 해제 경로). v6 이하 파일은 빈 튜플로 로드된다:
+# 게이트가 없던 상태와 정확히 일치하는 안전 폴백.
+SCHEMA_VERSION = 7
 # numpy 문자열 배열에는 null이 없어 "직전 배정 없음"을 빈 문자열로 인코딩한다 (ADR-007)
 _NO_CLUSTER = ""
 _ID_KEYS = ("face_ids", "photo_ids", "cluster_ids")
@@ -93,6 +97,11 @@ class EventEmbeddings:
   # soft-attach와 같은 이유로 must-link가 아니며(초반 강제는 앨범을 흔든다), 사람 보정이 우선이라
   # split/reassign이 대표 얼굴을 덮으면 해당 병합 기록은 폐기된다(handlers의 superseded 프루닝).
   soft_merge_pairs: tuple[tuple[str, str], ...] = ()
+  # 비인간(인형·조형물)으로 강등된 face_id 목록 (ADR-032) — 이 행들은 재군집 입력에서 제외된다.
+  # 고정 행 열이 아니라 희소 목록인 이유는 soft_attach_pairs(v5)와 같다: 대상이 극소수라 N열이 낭비고,
+  # face_id 키라 삭제·append로 행 인덱스가 바뀌어도 안전하다. 사용자 보정이 이 얼굴을 건드리면
+  # 목록에서 제거된다(오판의 영구 복구 경로 — handlers의 해제 프루닝).
+  nonhuman_face_ids: tuple[str, ...] = ()
 
   def __post_init__(self) -> None:
     n = len(self.face_ids)
@@ -158,6 +167,11 @@ class EventEmbeddings:
           raise ValueError(f"{kind} 쌍은 서로 다른 얼굴이어야 합니다. 받은 쌍: ({a}, {b})")
         if a not in known or b not in known:
           raise ValueError(f"{kind} 쌍이 존재하지 않는 face_id를 참조합니다. 받은 쌍: ({a}, {b})")
+    if len(set(self.nonhuman_face_ids)) != len(self.nonhuman_face_ids):
+      raise ValueError("nonhuman_face_ids에 중복이 있습니다.")
+    for face_id in self.nonhuman_face_ids:
+      if face_id not in known:
+        raise ValueError(f"nonhuman_face_ids가 존재하지 않는 face_id를 참조합니다. 받은 값: {face_id}")
     self.embeddings.flags.writeable = False  # frozen dataclass 내용이 하류에서 변형되지 않도록 보호
 
   @classmethod
@@ -232,6 +246,7 @@ class EventEmbeddings:
         pair for pair in self.soft_attach_pairs if pair[0] in kept_faces and pair[1] in kept_faces
       ),
       soft_merge_pairs=tuple(pair for pair in self.soft_merge_pairs if pair[0] in kept_faces and pair[1] in kept_faces),
+      nonhuman_face_ids=tuple(face_id for face_id in self.nonhuman_face_ids if face_id in kept_faces),
     )
 
   def with_cluster_ids(self, cluster_ids: Sequence[str | None]) -> "EventEmbeddings":
@@ -262,6 +277,10 @@ class EventEmbeddings:
     """소프트 병합 쌍(대표↔대표) 셋을 교체한 새 인스턴스를 만든다 (앨범 쌍 재판정 병합 반영용, ADR-031)."""
     return replace(self, soft_merge_pairs=tuple(soft_merge_pairs))
 
+  def with_nonhuman_face_ids(self, nonhuman_face_ids: Sequence[str]) -> "EventEmbeddings":
+    """비인간 강등 face_id 목록을 교체한 새 인스턴스를 만든다 (비인간 얼굴 게이트 반영용, ADR-032)."""
+    return replace(self, nonhuman_face_ids=tuple(nonhuman_face_ids))
+
   def row_index_of(self) -> dict[str, int]:
     """face_id → 행 인덱스 매핑 — 제약 쌍을 recluster의 인덱스 쌍으로 번역할 때 쓴다."""
     return {face_id: index for index, face_id in enumerate(self.face_ids)}
@@ -284,6 +303,7 @@ class EventEmbeddings:
       image_long_sides=np.asarray(self.image_long_sides, dtype=np.float32),
       soft_attach_pairs=_as_str_array(self.soft_attach_pairs, columns=2),
       soft_merge_pairs=_as_str_array(self.soft_merge_pairs, columns=2),
+      nonhuman_face_ids=_as_str_array(self.nonhuman_face_ids),
     )
     return buffer.getvalue()
 
@@ -296,7 +316,7 @@ class EventEmbeddings:
     try:
       with np.load(io.BytesIO(blob), allow_pickle=False) as archive:
         version = int(archive["schema_version"])
-        if version not in (1, 2, 3, 4, 5, SCHEMA_VERSION):
+        if version not in (1, 2, 3, 4, 5, 6, SCHEMA_VERSION):
           raise StoreCorruptionError(
             f"지원하지 않는 schema_version입니다. 받은 값: {version}, 지원: 1~{SCHEMA_VERSION}"
           )
@@ -336,6 +356,8 @@ class EventEmbeddings:
 
         soft_attach_pairs = optional_pairs("soft_attach_pairs", 5)
         soft_merge_pairs = optional_pairs("soft_merge_pairs", 6)
+        # v6 이하에는 nonhuman_face_ids가 없다 — 빈 튜플(게이트가 없던 상태)로 폴백하면 동작이 종전과 동일
+        nonhuman_face_ids = tuple(str(face_id) for face_id in archive["nonhuman_face_ids"]) if version >= 7 else ()
     except StoreCorruptionError:
       raise
     except (KeyError, ValueError, OSError, zipfile.BadZipFile) as exc:
@@ -355,6 +377,7 @@ class EventEmbeddings:
         image_long_sides=image_long_sides,
         soft_attach_pairs=soft_attach_pairs,
         soft_merge_pairs=soft_merge_pairs,
+        nonhuman_face_ids=nonhuman_face_ids,
       )
     except ValueError as exc:  # __post_init__ 불변식 위반 (길이 정합·face_id 유일·제약 참조 존재 등)
       raise StoreCorruptionError(f".npz 불변식 위반: {exc}") from exc
@@ -404,10 +427,12 @@ if __name__ == "__main__":
   event = event.with_constraints([("face-1", "face-3")], [("face-2", "face-3")])
   event = event.with_soft_attach_pairs([("face-2", "face-1")])  # 재판정 편입 (F=face-2 → R=face-1)
   event = event.with_soft_merge_pairs([("face-1", "face-3")])  # 앨범 쌍 병합 (대표 ↔ 대표)
+  event = event.with_nonhuman_face_ids(["face-2"])  # 비인간 강등 (ADR-032)
   restored = EventEmbeddings.from_npz_bytes(event.to_npz_bytes())
   check("직렬화 왕복 (id·제약 보존)", restored == event)
   check("소프트 어태치 쌍 직렬화 왕복", restored.soft_attach_pairs == (("face-2", "face-1"),))
   check("소프트 병합 쌍 직렬화 왕복", restored.soft_merge_pairs == (("face-1", "face-3"),))
+  check("비인간 강등 목록 직렬화 왕복", restored.nonhuman_face_ids == ("face-2",))
   check(
     "with_constraints는 soft_attach·soft_merge를 건드리지 않음",
     event.with_constraints([], []).soft_attach_pairs == (("face-2", "face-1"),)
@@ -422,14 +447,15 @@ if __name__ == "__main__":
 
   masked = event.masked_by_photo_ids(["img-1", "img-1"])  # 중복 삭제 id 멱등
   check(
-    "삭제 마스킹 + 댕글링 제약 프루닝 (must/cannot/soft-attach/soft-merge 전부)",
+    "삭제 마스킹 + 댕글링 제약 프루닝 (must/cannot/soft-attach/soft-merge/nonhuman 전부)",
     masked.face_ids == ("face-3",)
     and masked.photo_ids == ("img-2",)
     and masked.cluster_ids == ("person-B",)
     and masked.must_link_pairs == ()
     and masked.cannot_link_pairs == ()
     and masked.soft_attach_pairs == ()
-    and masked.soft_merge_pairs == (),
+    and masked.soft_merge_pairs == ()
+    and masked.nonhuman_face_ids == (),
   )
   check("삭제 마스킹이 폭도 함께 마스킹", masked.face_widths == (0.0,))
   check(
@@ -552,6 +578,31 @@ if __name__ == "__main__":
     from_v5.soft_merge_pairs == () and from_v5.soft_attach_pairs == event.soft_attach_pairs,
   )
 
+  # v6 하위호환: nonhuman_face_ids 열이 없는 .npz는 빈 튜플(게이트가 없던 상태)로 로드된다 —
+  # soft_merge·soft_attach·제약은 보존된다 (SCHEMA_VERSION 주석, ADR-032).
+  v6_buffer = io.BytesIO()
+  np.savez_compressed(
+    v6_buffer,
+    schema_version=np.int64(6),
+    embeddings=event.embeddings,
+    face_ids=_as_str_array(event.face_ids),
+    photo_ids=_as_str_array(event.photo_ids),
+    cluster_ids=_as_str_array([cid if cid is not None else _NO_CLUSTER for cid in event.cluster_ids]),
+    must_link_pairs=_as_str_array(event.must_link_pairs, columns=2),
+    cannot_link_pairs=_as_str_array(event.cannot_link_pairs, columns=2),
+    face_widths=np.asarray(event.face_widths, dtype=np.float32),
+    bboxes=np.asarray(event.bboxes, dtype=np.float32).reshape(-1, 4),
+    s3_keys=_as_str_array(event.s3_keys),
+    image_long_sides=np.asarray(event.image_long_sides, dtype=np.float32),
+    soft_attach_pairs=_as_str_array(event.soft_attach_pairs, columns=2),
+    soft_merge_pairs=_as_str_array(event.soft_merge_pairs, columns=2),
+  )
+  from_v6 = EventEmbeddings.from_npz_bytes(v6_buffer.getvalue())
+  check(
+    "v6 .npz 로드: nonhuman 빈 튜플 폴백 + soft_merge 보존",
+    from_v6.nonhuman_face_ids == () and from_v6.soft_merge_pairs == event.soft_merge_pairs,
+  )
+
   invalid_cases = [
     (
       "photo_ids 길이 불일치",
@@ -641,6 +692,30 @@ if __name__ == "__main__":
         must_link_pairs=(),
         cannot_link_pairs=(),
         bboxes=((float("nan"), 0.0, 10.0, 10.0),),
+      ),
+    ),
+    (
+      "존재하지 않는 face_id 참조 nonhuman",
+      dict(
+        embeddings=np.stack([unit(0)]),
+        face_ids=("face-1",),
+        photo_ids=("img-1",),
+        cluster_ids=(None,),
+        must_link_pairs=(),
+        cannot_link_pairs=(),
+        nonhuman_face_ids=("face-유령",),
+      ),
+    ),
+    (
+      "nonhuman face_id 중복",
+      dict(
+        embeddings=np.stack([unit(0)]),
+        face_ids=("face-1",),
+        photo_ids=("img-1",),
+        cluster_ids=(None,),
+        must_link_pairs=(),
+        cannot_link_pairs=(),
+        nonhuman_face_ids=("face-1", "face-1"),
       ),
     ),
   ]

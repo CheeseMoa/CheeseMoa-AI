@@ -17,14 +17,22 @@ import logging
 import uuid
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import NamedTuple
 
 import numpy as np
 
 from app.pipeline.cluster import ClusterConfig, Constraints, PersonCluster, recluster
-from app.pipeline.rejudge import ClusterPairRejudger, PairRejudgeOutcome, RejudgeOutcome, UncertainRejudger
+from app.pipeline.rejudge import (
+  ClusterPairRejudger,
+  NonhumanFaceGate,
+  NonhumanOutcome,
+  NonhumanVerdict,
+  PairRejudgeOutcome,
+  RejudgeOutcome,
+  UncertainRejudger,
+)
 from app.schemas.messages import (
   UNCERTAIN_ALBUM_ID,
   ClassifyRequest,
@@ -43,6 +51,7 @@ from app.schemas.messages import (
 from app.storage.embedding_store import EmbeddingStore
 from app.storage.event_embeddings import EventEmbeddings
 from app.storage.image_source import ImageSource
+from app.storage.nonhuman_verdicts import NonhumanVerdictRecord, NonhumanVerdictStore
 from app.storage.rekognition_scores import RekognitionScoreStore
 from app.storage.thumbnail_store import ThumbnailStore
 
@@ -293,6 +302,8 @@ class JobHandlers:
     rejudge_scores: RekognitionScoreStore | None = None,
     pair_rejudger: ClusterPairRejudger | None = None,
     apply_pair_merges: bool = False,
+    nonhuman_gate: NonhumanFaceGate | None = None,
+    nonhuman_verdicts: NonhumanVerdictStore | None = None,
   ) -> None:
     self._store = store
     self._images = images
@@ -309,6 +320,14 @@ class JobHandlers:
     # 회색지대 비율·통과율을 확인한 뒤 켠다, ADR-031 §롤아웃). 점수 캐시 저장소는 얼굴 단위와 공유한다.
     self._pair_rejudger = pair_rejudger
     self._apply_pair_merges = apply_pair_merges
+    # 둘 다 주입돼야 비인간 얼굴 게이트 활성 (ADR-032) — 하나라도 None이면 전 경로 생략 = 종전 동작
+    # (NONHUMAN_GATE_ENABLED=false 롤백 경로). 판정 저장소가 필수인 이유: 통과 판정은 npz에 안 남아
+    # 캐시 없이는 매 재군집마다 같은 얼굴을 DetectLabels로 재과금한다. 비활성이면 npz에 이미 남은
+    # 강등 기록(nonhuman_face_ids)도 무시한다 — 스위치 한 번으로 강등 얼굴이 전부 되살아나는 것이
+    # 롤백 계약이다(기록 자체는 npz에 남아 재활성 시 다시 적용된다).
+    self._nonhuman_gate = nonhuman_gate
+    self._nonhuman_verdicts = nonhuman_verdicts
+    self._nonhuman_active = nonhuman_gate is not None and nonhuman_verdicts is not None
     # 기본 uuid4 — 스모크/테스트에서 결정적 팩토리를 주입한다 (recluster.new_id_factory와 같은 패턴)
     self._new_cluster_id = new_cluster_id if new_cluster_id is not None else (lambda: str(uuid.uuid4()))
     self._new_face_id = new_face_id if new_face_id is not None else (lambda: str(uuid.uuid4()))
@@ -436,10 +455,16 @@ class JobHandlers:
     kept_soft_merge = [
       pair for pair in stored.soft_merge_pairs if pair[0] not in superseded_faces and pair[1] not in superseded_faces
     ]
+    # 비인간 강등 해제 (ADR-032): 사용자 보정이 강등 얼굴을 건드리면 오판으로 보고 목록에서 제거한다 —
+    # 오판이 사용자 조작 한 번으로 영구 복구되는 경로. 다음 재군집에서 그 행이 되살아나고, 이후에는
+    # 보정 당사자 면제(NonhumanFaceGate의 must/cannot-link 생략)가 재강등을 영구히 막는다.
+    touched_faces = {face_id for pair in (*new_must, *new_cannot) for face_id in pair} | superseded_faces
+    kept_nonhuman = [face_id for face_id in stored.nonhuman_face_ids if face_id not in touched_faces]
     event = (
       stored.with_constraints(must, cannot)
       .with_soft_attach_pairs(kept_soft_attach)
       .with_soft_merge_pairs(kept_soft_merge)
+      .with_nonhuman_face_ids(kept_nonhuman)
     )
     snapshot = self._recluster_and_save(message.event_id, event)
     return self._assemble_result(message.job_id, message.event_id, snapshot)
@@ -594,7 +619,17 @@ class JobHandlers:
       # (전원 합의·완전 연결)은 rejudge에서 끝났고 여기서는 반영만 한다 — soft_attach와 같은 구도.
       soft_merge=tuple((row_of[a], row_of[b]) for a, b in event.soft_merge_pairs),
     )
-    result = recluster(event.embeddings, event.cluster_ids, constraints, self._cluster_config, self._new_cluster_id)
+    # 비인간 강등 행(ADR-032)은 재군집 입력에서 통째로 뺀다 — clusters/noise/ambiguous 어디에도
+    # 등장하지 않아 new_cluster_ids가 None(미배정)으로 남고, 전량 강등 사진의 공용 앨범 라우팅은
+    # _assemble_result의 책임이다. 게이트 비활성(롤백)이면 npz 기록을 무시해 강등 얼굴이 되살아난다.
+    result = recluster(
+      event.embeddings,
+      event.cluster_ids,
+      constraints,
+      self._cluster_config,
+      self._new_cluster_id,
+      excluded_rows=tuple(row_of[face_id] for face_id in event.nonhuman_face_ids) if self._nonhuman_active else (),
+    )
 
     # 단일 사진 클러스터 강등: 같은 사진에 같은 인물이 두 번 나올 수 없으므로, 한 장의 사진 안
     # 얼굴들로만 구성된 군집은 우연히 닮은 타인들이다(단체 사진에서 재현) — 인물로 승격하지 않고
@@ -630,18 +665,20 @@ class JobHandlers:
     """event 전체를 재군집·강등 판정하고 새 배정을 반영해 저장한다 — 이 저장이 유일한 쓰기이자 마지막 변이다.
 
     저장 후 크래시(발행·삭제 전)로 메시지가 재전달돼도, photo_id 멱등 append + 결정적 재군집이
-    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조). Rekognition 재판정이
-    활성이면 1차 패스가 끝난 상태에서 두 가지를 판정한다 — 미배정 얼굴의 앨범 편입(ADR-030)과
-    회색지대 앨범 쌍의 병합(ADR-031). 둘 다 soft-attach·soft-merge 제약으로 기록하고 재군집을 한 번
+    같은 상태에서 같은 결과를 다시 만들므로 안전하다 (오류 매트릭스 참조). Rekognition 판정이
+    활성이면 1차 패스가 끝난 상태에서 세 가지를 판정한다 — 비인간 얼굴 강등(ADR-032, 가장 먼저:
+    강등 얼굴을 뒤 재판정의 후보에서 뺀다), 미배정 얼굴의 앨범 편입(ADR-030), 회색지대 앨범 쌍의
+    병합(ADR-031). 전부 npz 기록(nonhuman_face_ids·soft-attach·soft-merge)으로 남기고 재군집을 한 번
     더 돌린다 — 스냅샷 직접 수정 대신 2차 패스를 쓰는 이유는 같은사진 cannot-link·강등·병합 게이트 등
     모든 후처리 불변식이 자동 재적용되고, 저장된 .npz를 재군집한 결과와 발행 결과가 항상 일치해
     재전달 안전성이 유지되기 때문이다 (군집 비용 <0.1%).
     """
     if not event.face_ids:
       # 전부 삭제된(또는 애초에 빈) event — 재군집할 것이 없어도 빈 파일을 저장해 단일 진실을 유지한다.
-      # 재판정 점수 캐시도 함께 지운다 — 생체 파생 정보가 원본 얼굴보다 오래 남지 않게 (ADR-030)
+      # 재판정 점수·비인간 판정 캐시도 함께 지운다 — 생체 파생 정보가 원본 얼굴보다 오래 남지 않게 (ADR-030·032)
       self._store.save(event_id, event)
       self._delete_rejudge_scores(event_id)
+      self._delete_nonhuman_verdicts(event_id)
       return _ClusterSnapshot(
         event=event, clusters=(), unmatched_indices=(), ambiguous_indices=(), retired_cluster_ids=()
       )
@@ -649,24 +686,76 @@ class JobHandlers:
     current = self._cluster_pass(event)
     outcome: RejudgeOutcome | None = None
     pair_outcome: PairRejudgeOutcome | None = None
-    if self._rejudge_scores is not None and (self._rejudger is not None or self._pair_rejudger is not None):
-      # best-effort 격리 (썸네일과 동일 정책): 재판정·캐시의 어떤 실패도 job을 죽이지 않는다 — 실패 시
-      # 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 편입 soft-attach·
-      # 병합 soft-merge가 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 제약이 저장되면 이후 모든 재군집이
-      # 죽는다(오염 방지). 두 재판정은 같은 1차 패스 클러스터 위에서 판정하고 2차 패스 한 번에 반영한다.
+    nonhuman_outcome: NonhumanOutcome | None = None
+    gate_active = self._nonhuman_active
+    rejudge_active = self._rejudge_scores is not None and (
+      self._rejudger is not None or self._pair_rejudger is not None
+    )
+    if gate_active or rejudge_active:
+      # best-effort 격리 (썸네일과 동일 정책): 게이트·재판정·캐시의 어떤 실패도 job을 죽이지 않는다 —
+      # 실패 시 1차 패스 결과 그대로(현 동작 유지). event 교체는 2차 패스 성공 후에만 커밋한다: 강등·
+      # 편입 soft-attach·병합 soft-merge가 예상 밖 모순으로 재군집을 깨뜨리는 경우 그 기록이 저장되면
+      # 이후 모든 재군집이 죽는다(오염 방지). 세 판정은 같은 1차 패스 위에서 끝내고 2차 패스는 한 번만 돈다.
       try:
-        scores = self._rejudge_scores.load(event_id)
-        if self._rejudger is not None and (current.unmatched_indices or current.ambiguous_indices):
-          outcome = self._rejudger.rejudge(
-            event, current.clusters, (*current.ambiguous_indices, *current.unmatched_indices), scores
-          )
-          scores = outcome.scores if outcome.scores is not None else scores
-        if self._pair_rejudger is not None and len(current.clusters) >= 2:
-          # 같은 점수 dict를 이어 쓴다 — 얼굴 단위와 겹치는 (얼굴, 대표) 쌍은 재과금되지 않는다
-          pair_outcome = self._pair_rejudger.judge(event, current.clusters, scores)
-          scores = pair_outcome.scores if pair_outcome.scores is not None else scores
-
         augmented = event
+        # ① 비인간 얼굴 게이트 (ADR-032) — 두 재판정보다 먼저가 계약: 강등 얼굴을 CompareFaces의
+        # source·대표 후보에서 배제해 호출 낭비를 없앤다 (실 event 139에서 인형이 앨범 대표로 뽑혀
+        # 미배정 4명과 비교된 4쌍이 전부 -1.0으로 버려진 실기록이 근거).
+        demoted_rows: set[int] = set()
+        if gate_active:
+          nonhuman_outcome = self._nonhuman_gate.judge(
+            event,
+            current.clusters,
+            (*current.ambiguous_indices, *current.unmatched_indices),
+            {
+              face_id: NonhumanVerdict(
+                face_id=face_id,
+                nonhuman=record.nonhuman,
+                rule=record.rule,
+                labels=dict(record.labels),
+                n_faces=record.n_faces,
+              )
+              for face_id, record in self._nonhuman_verdicts.load(event_id).items()
+            },
+          )
+          if nonhuman_outcome.demoted_face_ids:
+            augmented = augmented.with_nonhuman_face_ids(
+              tuple(dict.fromkeys(augmented.nonhuman_face_ids + nonhuman_outcome.demoted_face_ids))
+            )
+            row_of = event.row_index_of()
+            demoted_rows = {row_of[face_id] for face_id in nonhuman_outcome.demoted_face_ids}
+        # ② 강등분을 제거한 뷰로 두 재판정 — 클러스터 멤버에서 강등 행을 빼고(전원 강등 앨범은 드롭),
+        # uncertain 목록에서도 강등 행을 뺀다. centroid는 판정 시점 값 그대로 둔다 — 후보 순위용이라
+        # 재계산 불필요, 정확한 값은 2차 패스가 다시 만든다.
+        live_clusters = current.clusters
+        live_uncertain = (*current.ambiguous_indices, *current.unmatched_indices)
+        if demoted_rows:
+          trimmed: list[PersonCluster] = []
+          for cluster in current.clusters:
+            members = [
+              (i, s) for i, s in zip(cluster.member_indices, cluster.membership_similarities) if i not in demoted_rows
+            ]
+            if not members:
+              continue  # 전원 강등된 앨범 — 재판정 후보가 아니다 (소멸은 2차 패스가 확정)
+            trimmed.append(
+              replace(
+                cluster,
+                member_indices=tuple(i for i, _ in members),
+                membership_similarities=tuple(s for _, s in members),
+              )
+            )
+          live_clusters = tuple(trimmed)
+          live_uncertain = tuple(i for i in live_uncertain if i not in demoted_rows)
+        if rejudge_active:
+          scores = self._rejudge_scores.load(event_id)
+          if self._rejudger is not None and live_uncertain:
+            outcome = self._rejudger.rejudge(event, live_clusters, live_uncertain, scores)
+            scores = outcome.scores if outcome.scores is not None else scores
+          if self._pair_rejudger is not None and len(live_clusters) >= 2:
+            # 같은 점수 dict를 이어 쓴다 — 얼굴 단위와 겹치는 (얼굴, 대표) 쌍은 재과금되지 않는다
+            pair_outcome = self._pair_rejudger.judge(event, live_clusters, scores)
+            scores = pair_outcome.scores if pair_outcome.scores is not None else scores
+
         if outcome is not None and outcome.assignments:
           # 편입은 must-link가 아니라 soft-attach로 기록한다 (ADR-030 개정): 저응집 F를 must-link로 강제하면
           # 대상 클러스터의 응집이 내려가 파편병합 게이트 탈락·기존 멤버 축출을 유발했다(실 event 134 회귀).
@@ -687,11 +776,14 @@ class JobHandlers:
             )
         if augmented is not event:
           current = self._cluster_pass(augmented)
-          event = augmented  # 2차 패스 성공 — 재판정 제약을 저장 대상으로 확정 (이후 재군집에서 유지)
+          event = augmented  # 2차 패스 성공 — 강등·재판정 기록을 저장 대상으로 확정 (이후 재군집에서 유지)
       except Exception:
-        logger.warning("Rekognition 재판정 실패 event_id=%s — 무시하고 진행 (현 동작 유지)", event_id, exc_info=True)
+        logger.warning(
+          "Rekognition 판정(게이트·재판정) 실패 event_id=%s — 무시하고 진행 (현 동작 유지)", event_id, exc_info=True
+        )
         outcome = None
         pair_outcome = None
+        nonhuman_outcome = None
 
     saved = event.with_cluster_ids(current.new_cluster_ids)
     self._store.save(event_id, saved)
@@ -706,6 +798,23 @@ class JobHandlers:
         )
       except Exception:
         logger.warning("재판정 점수 캐시 저장 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
+    if nonhuman_outcome is not None and nonhuman_outcome.verdicts is not None:
+      # 비인간 판정 캐시 갱신 — best-effort. 통과 판정의 캐싱이 이 저장의 존재 이유다(강등분은 npz에
+      # 남지만 통과분은 안 남는다). 죽은 face_id 항목은 프루닝한다 (점수 캐시와 같은 위생)
+      try:
+        alive = set(saved.face_ids)
+        self._nonhuman_verdicts.save(
+          event_id,
+          {
+            face_id: NonhumanVerdictRecord(
+              nonhuman=verdict.nonhuman, rule=verdict.rule, labels=dict(verdict.labels), n_faces=verdict.n_faces
+            )
+            for face_id, verdict in nonhuman_outcome.verdicts.items()
+            if face_id in alive
+          },
+        )
+      except Exception:
+        logger.warning("비인간 판정 캐시 저장 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
     return _ClusterSnapshot(
       event=saved,
       clusters=current.clusters,
@@ -723,6 +832,15 @@ class JobHandlers:
       self._rejudge_scores.delete(event_id)
     except Exception:
       logger.warning("재판정 점수 캐시 삭제 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
+
+  def _delete_nonhuman_verdicts(self, event_id: str) -> None:
+    """비인간 판정 캐시를 지운다 — best-effort (_delete_rejudge_scores와 같은 정책, ADR-032)."""
+    if self._nonhuman_verdicts is None:
+      return
+    try:
+      self._nonhuman_verdicts.delete(event_id)
+    except Exception:
+      logger.warning("비인간 판정 캐시 삭제 실패 event_id=%s — 무시하고 진행", event_id, exc_info=True)
 
   # ── 대표 얼굴 썸네일 (CHMO-335) ──────────────────────────────────────────────
 
@@ -849,6 +967,17 @@ class JobHandlers:
         for photo_id in dict.fromkeys(event.photo_ids)
         if faces_per_photo[photo_id] >= 2 or albums_per_photo[photo_id] >= 2
       ]
+    # 전량 강등 사진 → 공용 앨범 (ADR-032): 강등 행은 clusters/unmatched/ambiguous 어디에도 없어
+    # 그대로 두면 그 사진이 결과 메시지에서 통째로 사라진다(앱에서 사진 증발). "얼굴 0개" 경로와 같은
+    # 목적지다. event 스코프로 계산해 재전달·재분류에도 같은 결과이며, 얼굴 미검출 common(요청 스코프)과
+    # 달리 과거분도 복원된다 — 강등 행이 npz에 남아 있어 가능한 비대칭.
+    demoted_common: list[str] = []
+    if self._nonhuman_active and event.nonhuman_face_ids:
+      nonhuman_faces = set(event.nonhuman_face_ids)
+      human_photos = {
+        photo_id for face_id, photo_id in zip(event.face_ids, event.photo_ids) if face_id not in nonhuman_faces
+      }
+      demoted_common = [photo_id for photo_id in dict.fromkeys(event.photo_ids) if photo_id not in human_photos]
     # 상세 화면 얼굴 crop용 bbox (계약 교체 CHMO-407, BE#107): 그 사진의 uncertain 얼굴 중 주 인물
     # 자격(counted — ADR 025·027 AND 폭 게이트 — ADR 022) 통과 얼굴 전부. 행인·오검출·파편은 싣지 않는다
     # — 자격 얼굴이 없으면(오검출 전용 사진) 빈 배열: 박스를 그릴 주 인물이 없다.
@@ -903,7 +1032,7 @@ class JobHandlers:
       job_id=job_id,
       status="partial" if failed_images else "succeeded",
       clusters=clusters,
-      common_album=list(dict.fromkeys([*common_album, *group_common])),
+      common_album=list(dict.fromkeys([*common_album, *group_common, *demoted_common])),
       uncertain=uncertain,
       # 품질 게이트로 분리된 사진들 (이번 요청분). 재군집에서 제외됐으므로 clusters/common/uncertain과 겹치지 않는다.
       eyes_closed=list(dict.fromkeys(eyes_closed)),
@@ -951,18 +1080,21 @@ class JobHandlers:
     뚫는다(ADR 027). 근중복이 아닌 같은사진 타인은 종전대로 증거다(전면 제외는 그 사진에만 등장하는
     낯선 단체를 오검출로 오판한다). 클러스터 배정 얼굴(실측 전역 최근접 최저 0.407)과, 비교 상대가
     없는 단독 얼굴은 판단 근거가 없어 항상 센다.
+    ③ 비인간 강등 (ADR 032): 인형·조형물로 강등된 행은 처음부터 자격이 없다 — 아이 1명 + 인형 1개
+    사진이 "주 인물 2명 단체"로 공용 앨범에 노출되던 것을 고친다. ①의 파편 대표 선정에서도 제외한다.
     """
     floor = self._cluster_config.common_face_min_similarity
     duplicate_floor = self._cluster_config.common_duplicate_face_similarity
     total = len(event.face_ids)
+    nonhuman = set(event.nonhuman_face_ids) if self._nonhuman_active else set()
+    eligible = [face_id not in nonhuman for face_id in event.face_ids]
     if (floor <= 0 and duplicate_floor <= 0) or total < 2:
-      return [True] * total
+      return eligible
     embeddings = np.asarray(event.embeddings, dtype=np.float32)
     similarities = embeddings @ embeddings.T
     rows_by_photo: dict[str, list[int]] = {}
     for index, photo_id in enumerate(event.photo_ids):
       rows_by_photo.setdefault(photo_id, []).append(index)
-    eligible = [True] * total
 
     if duplicate_floor > 0:
       for rows in rows_by_photo.values():
@@ -979,7 +1111,9 @@ class JobHandlers:
             group.extend(linked)
             frontier.extend(linked)
           if len(group) > 1:
-            keep = max(group, key=lambda row: event.face_widths[row])
+            # 강등 행(③)은 파편 대표가 될 수 없다 — 전원 강등 그룹이면 대표 없음 (자격 전원 상실 유지)
+            candidates = [row for row in group if eligible[row]]
+            keep = max(candidates, key=lambda row: event.face_widths[row]) if candidates else -1
             for row in group:
               eligible[row] = row == keep
 
@@ -2344,6 +2478,241 @@ if __name__ == "__main__":
   check(
     "(㉔) 앨범 쌍 재판정 전면 장애: 비활성 실행과 동일 결과 (best-effort)",
     [sorted(c.image_ids) for c in pm_broken.clusters] == [sorted(c.image_ids) for c in pm_off.clusters],
+  )
+
+  # ㉕ 비인간 얼굴 게이트 (ADR-032): 인형·조형물이 앨범을 만들지도, uncertain으로 새지도 않는다.
+  # 인물 9 = 인형(Doll 99·DetectFaces 0), 인물 10 = 실제 아이, 인물 11 = 조형물(Sculpture 92.5).
+  from app.pipeline.rejudge import NonhumanFaceGate
+  from app.storage.nonhuman_verdicts import InMemoryNonhumanVerdictStore
+
+  image_source.images.update(
+    {
+      "nh-d1.jpg": fake_image([(9, 0)]),
+      "nh-d2.jpg": fake_image([(9, 1)]),
+      "nh-d3.jpg": fake_image([(9, 2)]),
+      "nh-k1.jpg": fake_image([(10, 0)]),
+      "nh-k2.jpg": fake_image([(10, 1)]),
+      "nh-kd.jpg": fake_image([(10, 2), (9, 3)]),  # 아이 1명 + 인형 1개 한 장
+      "nh-s1.jpg": fake_image([(11, 0)]),
+      "nh-s2.jpg": fake_image([(11, 1)]),
+    }
+  )
+  NH_LABELS: dict[str, dict[str, float]] = {  # 페이크 crop 태그("p{인물}-{step}") → DetectLabels 응답
+    **{f"p9-{k}": {"Doll": 99.0, "Toy": 98.0, "Person": 95.1} for k in range(4)},  # 인형의 Person 95.1 실측 재현
+    **{f"p10-{k}": {"Person": 99.0} for k in range(3)},
+    **{f"p11-{k}": {"Sculpture": 92.5} for k in range(2)},
+  }
+  NH_FACES: dict[str, int] = {f"p9-{k}": 0 for k in range(4)}  # 인형 crop은 Rekognition도 얼굴 0개
+  nh_label_calls: list[str] = []
+  nh_gate_down = {"flag": False}
+
+  def nh_detect_labels(crop: bytes) -> dict[str, float]:
+    if nh_gate_down["flag"]:
+      raise RuntimeError("rekognition down")
+    tag = crop.decode()
+    nh_label_calls.append(tag)
+    return NH_LABELS.get(tag, {})
+
+  def nh_count_faces(crop: bytes) -> int:
+    return NH_FACES.get(crop.decode(), 1)
+
+  def nh_gate() -> NonhumanFaceGate:
+    return NonhumanFaceGate(
+      detect_labels=nh_detect_labels, count_faces=nh_count_faces, fetch_image=image_source.fetch, crop=rj_crop
+    )
+
+  nh_verdict_store = InMemoryNonhumanVerdictStore()
+  nh_store = InMemoryEmbeddingStore()
+  nh_handlers = JobHandlers(
+    store=nh_store,
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("nh-person"),
+    new_face_id=counter("nh-face"),
+    nonhuman_gate=nh_gate(),
+    nonhuman_verdicts=nh_verdict_store,
+  )
+  NH_BASE = ["nh-d1", "nh-d2", "nh-d3", "nh-k1", "nh-k2", "nh-kd"]
+
+  def nh_body(job_id: str, image_ids: Sequence[str]) -> str:
+    return json.dumps(
+      {
+        "type": "classify_request",
+        "job_id": job_id,
+        "group_id": "group-1",
+        "event_id": "event-nh",
+        "images": [{"image_id": name, "s3_key": f"{name}.jpg"} for name in image_ids],
+      }
+    )
+
+  nh1 = nh_handlers.handle(parse_inbound_message(nh_body("job-nh1", NH_BASE)))
+  check(
+    "(㉕) 인형 3장: 1차 패스 앨범이 강등으로 소멸 + 세 사진 공용 앨범행 + npz에 강등 4건(인형 4얼굴) 기록",
+    all("nh-d1" not in c.image_ids for c in nh1.clusters)
+    and {"nh-d1", "nh-d2", "nh-d3"} <= set(nh1.common_album)
+    and all(not u.image_id.startswith("nh-d") for u in nh1.uncertain)
+    and len(nh_store.load("event-nh").nonhuman_face_ids) == 4,
+  )
+  check(
+    "(㉕) 아이 1명 + 인형 1개: 아이 앨범 유지 + 인형이 머릿수에서 빠져 '단체'로 공용에 노출되지 않음",
+    any({"nh-k1", "nh-k2", "nh-kd"} == set(c.image_ids) for c in nh1.clusters)
+    and "nh-kd" not in nh1.common_album
+    and all(u.image_id != "nh-kd" for u in nh1.uncertain),
+  )
+
+  nh_calls_before = len(nh_label_calls)
+  nh2 = nh_handlers.handle(parse_inbound_message(nh_body("job-nh2", NH_BASE)))
+  check(
+    "(㉕) 재분류: 강등 행이 재군집 입력에서 빠져 Rekognition 추가 호출 0회 + 라우팅 재현",
+    len(nh_label_calls) == nh_calls_before and {"nh-d1", "nh-d2", "nh-d3"} <= set(nh2.common_album),
+  )
+
+  # 게이트 배포 전(또는 장애 중) 형성된 조형물 앨범 모사 — 장애 플래그로 판정만 무력화해 앨범을 심는다
+  nh_gate_down["flag"] = True
+  nh_handlers.handle(parse_inbound_message(nh_body("job-nh-pre", [*NH_BASE, "nh-s1", "nh-s2"])))
+  nh_gate_down["flag"] = False
+  nh3 = nh_handlers.handle(parse_inbound_message(nh_body("job-nh3", [*NH_BASE, "nh-s1", "nh-s2"])))
+  check(
+    "(㉕) 승계 앨범은 판정하지 않음: 이미 형성된 조형물 앨범은 유지 + 호출 0회 (소급 정리는 범위 밖)",
+    any({"nh-s1", "nh-s2"} == set(c.image_ids) for c in nh3.clusters)
+    and all(not tag.startswith("p11") for tag in nh_label_calls),
+  )
+
+  # 삭제로 조형물 앨범이 1장이 되면 남은 얼굴이 미배정으로 떨어져 게이트가 잡는다 → 앨범 은퇴 통보
+  nh_sculpt_id = next(c.cluster_id for c in nh3.clusters if "nh-s1" in c.image_ids)
+  nh_del = nh_handlers.handle(
+    parse_inbound_message(
+      json.dumps({"type": "delete_request", "job_id": "job-nh-del1", "event_id": "event-nh", "image_ids": ["nh-s2"]})
+    )
+  )
+  check(
+    "(㉕) 강등이 기존 앨범을 비우면 retired 통보 + 남은 조형물 사진은 공용 앨범 (규칙 B)",
+    nh_sculpt_id in nh_del.retired_cluster_ids and "nh-s1" in nh_del.common_album,
+  )
+
+  # 사용자 보정이 강등 얼굴을 건드리면 영구 복구된다 — reassign(nh-d1을 아이 앨범으로)
+  nh_event = nh_store.load("event-nh")
+  nh_face_of = dict(zip(nh_event.photo_ids, nh_event.face_ids))
+  nh_kid_id = next(c.cluster_id for c in nh3.clusters if "nh-k1" in c.image_ids)
+  nh_fb = nh_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          "type": "cluster_feedback",
+          "job_id": "job-nh-fb",
+          "event_id": "event-nh",
+          "action": "reassign",
+          "reassign": {"image_id": "nh-d1", "from_cluster_id": UNCERTAIN_ALBUM_ID, "to_cluster_id": nh_kid_id},
+        }
+      )
+    )
+  )
+  check(
+    "(㉕) 사용자 보정이 강등을 해제: nonhuman 목록에서 제거 + 다음 재군집에서 얼굴이 되살아남",
+    "nh-d1" in next(c for c in nh_fb.clusters if "nh-k1" in c.image_ids).image_ids
+    and nh_face_of["nh-d1"] not in nh_store.load("event-nh").nonhuman_face_ids,
+  )
+  nh4 = nh_handlers.handle(parse_inbound_message(nh_body("job-nh4", [*NH_BASE, "nh-s1"])))
+  check(
+    "(㉕) 되살린 얼굴은 재강등되지 않음 (보정 당사자 면제 — must-link가 판정 자체를 생략)",
+    "nh-d1" in next(c for c in nh4.clusters if "nh-k1" in c.image_ids).image_ids
+    and nh_face_of["nh-d1"] not in nh_store.load("event-nh").nonhuman_face_ids,
+  )
+
+  # 게이트 전면 장애 = 비활성과 완전히 같은 결과 (best-effort 격리)
+  nh_gate_down["flag"] = True
+  nh_err = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("nhe-person"),
+    new_face_id=counter("nhe-face"),
+    nonhuman_gate=nh_gate(),
+    nonhuman_verdicts=InMemoryNonhumanVerdictStore(),
+  ).handle(parse_inbound_message(nh_body("job-nh-e", NH_BASE)))
+  nh_gate_down["flag"] = False
+  nh_off = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("nhe-person"),
+    new_face_id=counter("nhe-face"),
+  ).handle(parse_inbound_message(nh_body("job-nh-e", NH_BASE)))
+  check("(㉕) 게이트 전면 장애: 비활성 실행과 동일 결과 (best-effort — 현 동작 유지)", nh_err == nh_off)
+
+  # 전체 delete 시 비인간 판정 캐시도 삭제 (생체 파생 정보 위생)
+  nh_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          "type": "delete_request",
+          "job_id": "job-nh-del2",
+          "event_id": "event-nh",
+          "image_ids": [*NH_BASE, "nh-s1", "nh-s2"],
+        }
+      )
+    )
+  )
+  check(
+    "(㉕) 전체 delete: 비인간 판정 캐시 함께 삭제",
+    nh_verdict_store.blobs == {} and nh_store.load("event-nh").face_ids == (),
+  )
+
+  # 순서 계약: 게이트가 재판정보다 먼저라, 강등된 인형 앨범은 CompareFaces 대표 후보에서 배제된다
+  # (실 event 139에서 인형 대표와의 비교 4쌍이 전부 버려진 낭비의 재발 방지)
+  image_source.images.update(
+    {
+      "nh8-a1.jpg": fake_image([(12, 0)]),
+      "nh8-a2.jpg": fake_image([(12, 1, 150)]),  # 폭 최대 — 아이 앨범의 재판정 대표
+      "nh8-d1.jpg": fake_image([(13, 0)]),
+      "nh8-d2.jpg": fake_image([(13, 1, 150)]),
+      "nh8-u.jpg": fake_image([(63, 0)]),  # 하드케이스 미등록 — 재판정 대상
+    }
+  )
+  NH_LABELS.update(
+    {
+      **{f"p12-{k}": {} for k in range(2)},
+      **{f"p13-{k}": {"Doll": 99.0} for k in range(2)},
+      "p63-0": {},
+    }
+  )
+  NH_FACES.update({f"p13-{k}": 0 for k in range(2)})
+  nh8_compare_calls: list[tuple[str, str]] = []
+
+  def nh8_compare(source: bytes, target: bytes) -> float:
+    nh8_compare_calls.append((source.decode(), target.decode()))
+    return 5.0
+
+  nh8_handlers = JobHandlers(
+    store=InMemoryEmbeddingStore(),
+    images=image_source,
+    extract_faces=fake_extractor,
+    new_cluster_id=counter("nh8-person"),
+    new_face_id=counter("nh8-face"),
+    rejudger=UncertainRejudger(compare=nh8_compare, fetch_image=image_source.fetch, crop=rj_crop),
+    rejudge_scores=InMemoryRekognitionScoreStore(),
+    nonhuman_gate=nh_gate(),
+    nonhuman_verdicts=InMemoryNonhumanVerdictStore(),
+  )
+  nh8_handlers.handle(
+    parse_inbound_message(
+      json.dumps(
+        {
+          "type": "classify_request",
+          "job_id": "job-nh8",
+          "group_id": "group-1",
+          "event_id": "event-nh8",
+          "images": [
+            {"image_id": name, "s3_key": f"{name}.jpg"} for name in ["nh8-a1", "nh8-a2", "nh8-d1", "nh8-d2", "nh8-u"]
+          ],
+        }
+      )
+    )
+  )
+  check(
+    "(㉕) 게이트가 재판정보다 먼저: 강등된 인형 앨범은 CompareFaces 대표 후보에서 배제",
+    all("p13" not in tag for pair in nh8_compare_calls for tag in pair)
+    and any(pair[1] == "p12-1" for pair in nh8_compare_calls),
   )
 
   print(f"\n스모크 검증 {passed}건 전부 통과")
