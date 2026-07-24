@@ -38,6 +38,14 @@ uncertain으로 샌다. 얼굴 crop에 `DetectLabels` 1콜을 물어 **2신호 A
 얼굴 0개일 때만 강등(규칙 A). `DetectFaces` 미검출 단독 규칙은 금지다 — 실제 아이 4/17(24%)을
 오거부한다(실측). 강등 = npz `nonhuman_face_ids` 기록 → 재군집 입력 제외(반영은 handlers).
 
+**미배정 얼굴의 주 인물 자격 (ADR-034 · 2026-07-24 분포 실측)**
+
+얼굴 편입(ADR-030)과 비인간 게이트의 미배정 단건 판정(②)은 그 사진 최대 얼굴폭 대비
+main_face_ratio(기본 0.5, 품질 게이트 ADR-022와 같은 규칙) 미만인 배경 인물(행인)을 호출 없이
+건너뛴다 — 편입 성공 전원이 0.6 이상(고유 60얼굴 실측)이라 배경 얼굴 호출은 성과 없이 비용과
+행인 crop 외부 전송만 남겼다. 앨범 단위 판정(ADR-031·032의 ①)은 대상이 그 사진의 주인공(폭 최대
+대표)이라 이 자격과 무관하다.
+
 세 판정기는 crop 렌더·행 단위 crop 캐시를 `_RekognitionProbe`로 공유하고, CompareFaces 쌍 점수
 캐시·예산 소비는 두 재판정기만의 부품(`_CompareFacesProbe`)이다 — 같은 event의 두 재판정이 한
 점수 dict를 쓰므로 겹치는 쌍은 한 번만 과금된다. 재판정 반영은 둘 다 재군집의 응집 게이트 이후
@@ -97,6 +105,10 @@ class RejudgeConfig:
   fragment_similarity: float = 95.0  # 이상 복수 앨범 동시 매칭 = 파편 앨범 힌트
   top_k: int = 3  # 얼굴당 비교할 AuraFace 유사도 상위 앨범 수 (호출 수 상한의 1차 통제)
   max_calls: int = 150  # job당 CompareFaces 호출 상한 — 오염 이벤트의 비용 폭주 안전판
+  # 주 인물 자격(ADR-034): 그 사진 최대 얼굴폭 대비 이 비율 미만인 미배정 얼굴은 배경 인물(행인)로
+  # 보고 호출 없이 제외한다. 실측(고유 60얼굴): 편입 성공 전원이 0.6 이상, 미만 대역의 고점수는 전부
+  # 같은 사진 공존 스크린 탈락분(가치 0)이라 0.5에서 오컷 0·낭비 호출 60% 절감. 0 = 비활성(종전 동작).
+  main_face_ratio: float = 0.5
   # 같은 사진 검사의 이중 검출 안전판 — handlers._SAME_FACE_SIMILARITY(ADR-011)와 같은 원리·기본값.
   # 대상 앨범에 같은 사진의 얼굴이 있으면 편입을 기각하되, 그 얼굴이 이 값 이상 닮았으면 타인이
   # 아니라 YuNet 파편 박스라 기각하지 않는다.
@@ -116,6 +128,8 @@ class RejudgeConfig:
       raise ValueError(f"max_calls는 1 이상이어야 합니다. 받은 값: {self.max_calls}")
     if not (0.0 < self.same_face_similarity <= 1.0):
       raise ValueError(f"same_face_similarity는 (0, 1] 범위여야 합니다. 받은 값: {self.same_face_similarity}")
+    if not (0.0 <= self.main_face_ratio <= 1.0):
+      raise ValueError(f"main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.main_face_ratio}")
 
 
 @dataclass(frozen=True)
@@ -239,6 +253,9 @@ class NonhumanConfig:
   label_min_confidence: float = 50.0  # DetectLabels MinConfidence — deps의 detect_labels 클로저가 소비
   cluster_probe_faces: int = 3  # 신규 앨범 후보당 판정 얼굴 수 (폭 내림차순) — 과반 규칙의 분모 상한
   max_calls: int = 100  # job당 Rekognition 호출 상한 (DetectLabels+DetectFaces 합산) — 비용 폭주 안전판
+  # 주 인물 자격(ADR-034) — 미배정 단건 판정(②)에만 적용한다. 신규 앨범 후보(①)는 미적용:
+  # 인형 앨범의 대표는 그 사진의 최대 얼굴(주인공)이라 이 바닥을 통과하며, 거기가 게이트의 본업이다.
+  main_face_ratio: float = 0.5
 
   def __post_init__(self) -> None:
     for name, value in (
@@ -253,6 +270,8 @@ class NonhumanConfig:
       raise ValueError(f"cluster_probe_faces는 1 이상이어야 합니다. 받은 값: {self.cluster_probe_faces}")
     if self.max_calls < 1:
       raise ValueError(f"max_calls는 1 이상이어야 합니다. 받은 값: {self.max_calls}")
+    if not (0.0 <= self.main_face_ratio <= 1.0):
+      raise ValueError(f"main_face_ratio는 [0, 1] 범위여야 합니다. 받은 값: {self.main_face_ratio}")
 
 
 @dataclass(frozen=True)
@@ -351,6 +370,30 @@ def _cluster_representatives(event: "EventEmbeddings", cluster: "PersonCluster",
   """
   eligible = [i for i in cluster.member_indices if event.bboxes[i][2] > 0 and event.s3_keys[i]]
   return tuple(sorted(eligible, key=lambda i: (-event.face_widths[i], i))[:count])
+
+
+def _photo_max_face_widths(event: "EventEmbeddings") -> dict[str, float]:
+  """사진(photo_id)별 최대 얼굴 bbox 폭 — 주 인물 자격(ADR-034)의 분모."""
+  result: dict[str, float] = {}
+  for photo_id, width in zip(event.photo_ids, event.face_widths):
+    if width > result.get(photo_id, 0.0):
+      result[photo_id] = width
+  return result
+
+
+def _is_main_face(event: "EventEmbeddings", row: int, photo_max: dict[str, float], ratio: float) -> bool:
+  """미배정 얼굴의 주 인물 자격(ADR-034) — 그 사진 최대 얼굴폭 대비 ratio 미만이면 배경 인물(행인).
+
+  품질 게이트의 주 인물 규칙(ADR-022, blur/eye_main_face_ratio)과 같은 축·같은 기본값(0.5)이다.
+  실측: 편입 성공 전원이 0.6 이상이라 배경 얼굴 호출은 회수 성과 없이 비용·행인 crop 전송만 남겼다.
+  폭 미상(0, v1 행)은 자격 판정 불가라 종전대로 판정 대상으로 남긴다 (보수 폴백).
+  """
+  if ratio <= 0.0:
+    return True
+  width = event.face_widths[row]
+  if width <= 0.0:
+    return True
+  return width >= ratio * photo_max.get(event.photo_ids[row], 0.0)
 
 
 class _RekognitionProbe:
@@ -480,10 +523,15 @@ class UncertainRejudger(_CompareFacesProbe):
     raw_assignments: list[tuple[str, RejudgeAssignment]] = []  # (photo_id, 편입) — argmax 가드 입력
     suggestions: list[RejudgeSuggestion] = []
     fragment_hints: list[FragmentHint] = []
+    photo_max = _photo_max_face_widths(event)
+    skipped_minor = 0
 
     for row in sorted(uncertain_indices):
       if event.bboxes[row][2] <= 0 or not event.s3_keys[row]:
         continue  # crop 원천 미상(v2 이하 .npz 행) — 재판정 불가
+      if not _is_main_face(event, row, photo_max, config.main_face_ratio):
+        skipped_minor += 1
+        continue  # 배경 인물(ADR-034) — 호출 없이 종전 uncertain 동작 유지
       embedding = event.embeddings[row]
       # AuraFace 유사도 상위 top_k 앨범 — 동률은 cluster_id 순(결정성)
       ranked = sorted(reps, key=lambda entry: (-float(embedding @ entry[0].centroid), entry[0].cluster_id))
@@ -559,14 +607,15 @@ class UncertainRejudger(_CompareFacesProbe):
         logger.info("같은 사진·앨범 중복 편입 — 최고점만 유지: 탈락 face_id=%s", assignment.face_id)
 
     assignments = tuple(best_by_key.values())
-    if assignments or suggestions or fragment_hints or budget.made:
+    if assignments or suggestions or fragment_hints or budget.made or skipped_minor:
       logger.info(
-        "Rekognition 재판정: 편입 %d건, 제안 %d건, 파편 힌트 %d건 (호출 %d회%s)",
+        "Rekognition 재판정: 편입 %d건, 제안 %d건, 파편 힌트 %d건 (호출 %d회%s, 배경 인물 스킵 %d건)",
         len(assignments),
         len(suggestions),
         len(fragment_hints),
         budget.made,
         ", 호출 상한 도달로 일부 보류" if budget.truncated else "",
+        skipped_minor,
       )
     return RejudgeOutcome(
       assignments=assignments,
@@ -868,20 +917,28 @@ class NonhumanFaceGate(_RekognitionProbe):
           nonhuman,
         )
 
-    # ② 미배정 얼굴 — uncertain 확정 직전의 노이즈+ambiguous 단건 판정
+    # ② 미배정 얼굴 — uncertain 확정 직전의 노이즈+ambiguous 단건 판정.
+    # 배경 인물(주 인물 자격 미달, ADR-034)은 판정하지 않는다 — ①의 앨범 대표는 그 사진의 최대
+    # 얼굴이라 이 바닥과 무관하고, 배경 인형·조형물은 강등 실익 없이 호출·crop 전송만 남는다.
+    photo_max = _photo_max_face_widths(event)
+    skipped_minor = 0
     for row in sorted(uncertain_indices):
       if event.face_ids[row] in constrained:
         continue  # 사람 결정 존중 — 보정 당사자는 판정하지 않는다 (해제 후 재강등 방지도 이 규칙)
+      if not _is_main_face(event, row, photo_max, config.main_face_ratio):
+        skipped_minor += 1
+        continue
       verdict = self._face_verdict(event, row, verdicts, crop_cache, budget)
       if verdict is not None and verdict.nonhuman:
         demoted.append(event.face_ids[row])
 
-    if demoted or budget.made:
+    if demoted or budget.made or skipped_minor:
       logger.info(
-        "비인간 얼굴 게이트: 강등 %d건 (호출 %d회%s)",
+        "비인간 얼굴 게이트: 강등 %d건 (호출 %d회%s, 배경 인물 스킵 %d건)",
         len(demoted),
         budget.made,
         ", 호출 상한 도달로 일부 보류" if budget.truncated else "",
+        skipped_minor,
       )
     return NonhumanOutcome(
       demoted_face_ids=tuple(dict.fromkeys(demoted)),
@@ -982,9 +1039,10 @@ if __name__ == "__main__":
     ("fu-g2", "pu5", axis_vector(20), 80.0, (0.0, 0.0, 80.0, 80.0), "s3-9"),  # 같은 사진 쌍 — 94점 (유지)
     ("fu-frag", "pu6", axis_vector(22), 80.0, (0.0, 0.0, 80.0, 80.0), "s3-10"),  # A 96·B 97 → 힌트 + B 편입
     ("fu-nobox", "pu7", axis_vector(24), 0.0, (0.0, 0.0, 0.0, 0.0), ""),  # crop 원천 미상 — 건너뜀
+    ("fu-minor", "pu5", axis_vector(26), 30.0, (0.0, 0.0, 30.0, 30.0), "s3-11"),  # 배경 인물(30/80px) — 스킵
   ]
   event = EventEmbeddings.empty().append_faces(rows)
-  event = event.with_cluster_ids(["A", "A", "B", "B", None, None, None, None, None, None, None, None])
+  event = event.with_cluster_ids(["A", "A", "B", "B", None, None, None, None, None, None, None, None, None])
   event = event.with_constraints((), (("fu-cl", "fa1"),))  # 사용자 cannot-link: fu-cl ↔ 앨범 A 멤버
 
   def cluster_of(cluster_id: str, member_indices: tuple[int, ...], axis: int) -> PersonCluster:
@@ -997,7 +1055,7 @@ if __name__ == "__main__":
     )
 
   clusters = (cluster_of("A", (0, 1), 0), cluster_of("B", (2, 3), 2))
-  uncertain = (4, 5, 6, 7, 8, 9, 10, 11)
+  uncertain = (4, 5, 6, 7, 8, 9, 10, 11, 12)
 
   SCORES = {
     ("s3-4", "s3-1"): 99.0,
@@ -1014,6 +1072,8 @@ if __name__ == "__main__":
     ("s3-9", "s3-1"): 5.0,
     ("s3-10", "s3-1"): 96.0,
     ("s3-10", "s3-2"): 97.0,
+    ("s3-11", "s3-1"): 99.0,  # 배경 인물 — 기본 설정에선 스킵되고, 롤백(ratio=0)에서만 측정된다
+    ("s3-11", "s3-2"): 5.0,
   }
   calls: list[tuple[str, str]] = []
   raises: set[tuple[str, str]] = set()
@@ -1068,6 +1128,18 @@ if __name__ == "__main__":
     outcome.scores[("fu-sugg", "fb1")] == -1.0,
   )
   check("편입 3건·호출 14회 정산", len(outcome.assignments) == 3 and outcome.calls_made == len(calls) == 14)
+  check(
+    "배경 인물 스킵(ADR-034): 사진 최대 얼굴폭의 0.375배(30/80px)는 호출·판정 없음",
+    not any(k[0] == "s3-11" for k in calls) and all(a.face_id != "fu-minor" for a in outcome.assignments),
+  )
+
+  # 롤백: main_face_ratio=0이면 배경 얼굴도 종전대로 판정된다
+  calls.clear()
+  rollback = build(RejudgeConfig(main_face_ratio=0.0)).rejudge(event, clusters, uncertain, {})
+  check(
+    "롤백(main_face_ratio=0): 배경 얼굴도 판정 — 99점 편입 복원",
+    any(a == RejudgeAssignment("fu-minor", "A", "fa2", 99.0) for a in rollback.assignments),
+  )
 
   # 캐시 재사용: 병합본을 그대로 넘기면 호출 0회로 같은 판정
   calls.clear()
@@ -1263,9 +1335,14 @@ if __name__ == "__main__":
     ("nr1", "np-14", axis_vector(14), 100.0, (0.0, 0.0, 100.0, 100.0), "nr1"),  # Art 55.1 흐린 아이 → 통과
     ("nf1", "np-15", axis_vector(15), 100.0, (0.0, 0.0, 100.0, 100.0), "nf1"),  # Doll 99.0·얼굴 1 → 통과
     ("nx1", "np-16", axis_vector(16), 0.0, (0.0, 0.0, 0.0, 0.0), ""),  # crop 원천 미상 — 건너뜀
+    ("sm1", "np-3", axis_vector(17), 50.0, (0.0, 0.0, 50.0, 50.0), "sm1"),  # SM 대표 — 배경 크기(50/120px)
+    ("sm2", "np-17", axis_vector(18), 60.0, (0.0, 0.0, 60.0, 60.0), "sm2"),  # SM 대표 — 단독 사진
+    ("nm1", "np-9", axis_vector(19), 40.0, (0.0, 0.0, 40.0, 40.0), "nm1"),  # 미배정 배경 인형(40/100px) — 스킵
   ]
   nh_event = EventEmbeddings.empty().append_faces(nh_rows)
-  nh_event = nh_event.with_cluster_ids(["NH", "NH", "NH", "HM", "HM", "HM", "OLD", "CON"] + [None] * 9)
+  nh_event = nh_event.with_cluster_ids(
+    ["NH", "NH", "NH", "HM", "HM", "HM", "OLD", "CON"] + [None] * 9 + ["SM", "SM", None]
+  )
   nh_event = nh_event.with_constraints([("nc1", "nc2")], ())
 
   def nh_album(cluster_id: str, member_indices: tuple[int, ...], is_new: bool) -> PersonCluster:
@@ -1282,8 +1359,9 @@ if __name__ == "__main__":
     nh_album("HM", (3, 4, 5), True),
     nh_album("OLD", (6,), False),
     nh_album("CON", (7,), True),
+    nh_album("SM", (17, 18), True),
   )
-  nh_uncertain = (8, 9, 10, 11, 12, 13, 14, 15, 16)
+  nh_uncertain = (8, 9, 10, 11, 12, 13, 14, 15, 16, 19)
 
   NH_LABELS: dict[str, dict[str, float]] = {
     "nd1": {"Doll": 99.6, "Toy": 99.6, "Person": 95.1},  # 인형이 Person 95.1을 받는 실측 재현 — Person은 안 쓴다
@@ -1302,8 +1380,11 @@ if __name__ == "__main__":
     "nb4": {"Statue": 70.0},
     "nr1": {"Art": 55.1, "Painting": 53.2},  # 흐린 실제 아이의 실측 레이블 — Art·Painting은 판정에 안 쓴다
     "nf1": {"Doll": 99.0},  # 인형을 든 실인물 — DetectFaces가 얼굴 1개를 본다
+    "sm1": {"Doll": 99.0},  # 배경 크기지만 앨범 대표(①) — 주 인물 자격과 무관하게 판정된다
+    "sm2": {"Doll": 99.0},
+    "nm1": {"Doll": 99.9},  # 미배정 배경 인형 — 기본 설정에선 스킵, 롤백(ratio=0)에서만 강등
   }
-  NH_FACES: dict[str, int] = {"nd1": 0, "nd2": 0, "nh1": 0, "nb2": 0, "nf1": 1}
+  NH_FACES: dict[str, int] = {"nd1": 0, "nd2": 0, "nh1": 0, "nb2": 0, "nf1": 1, "sm1": 0, "sm2": 0, "nm1": 0}
   nh_label_calls: list[str] = []
   nh_count_calls: list[str] = []
 
@@ -1367,6 +1448,16 @@ if __name__ == "__main__":
     "통과 판정도 캐시에 남는다 (재과금 방지의 핵심)",
     nh_outcome.verdicts is not None and nh_outcome.verdicts["nr1"].nonhuman is False,
   )
+  check(
+    "배경 인물 스킵(ADR-034): 미배정 단건 판정(②)은 주 인물 자격 미달(40/100px)이면 호출·강등 없음",
+    "nm1" not in nh_label_calls and "nm1" not in nh_outcome.demoted_face_ids,
+  )
+  check(
+    "① 신규 앨범 후보는 주 인물 자격과 무관 — 배경 크기 대표(50/120px)도 판정·강등",
+    "sm1" in nh_label_calls and {"sm1", "sm2"} <= set(nh_outcome.demoted_face_ids),
+  )
+  nh_rollback = build_gate(NonhumanConfig(main_face_ratio=0.0)).judge(nh_event, nh_clusters, nh_uncertain, {})
+  check("롤백(main_face_ratio=0): 배경 인형도 종전대로 강등", "nm1" in nh_rollback.demoted_face_ids)
 
   nh_label_calls.clear()
   nh_count_calls.clear()
@@ -1394,6 +1485,7 @@ if __name__ == "__main__":
     ("label_min_confidence 음수", {"label_min_confidence": -1.0}),
     ("cluster_probe_faces 0", {"cluster_probe_faces": 0}),
     ("max_calls 0", {"max_calls": 0}),
+    ("main_face_ratio 범위 밖", {"main_face_ratio": 1.5}),
   ]:
     try:
       NonhumanConfig(**kwargs)
@@ -1409,6 +1501,7 @@ if __name__ == "__main__":
     ("max_calls 0", {"max_calls": 0}),
     ("same_face 0", {"same_face_similarity": 0.0}),
     ("fragment 0", {"fragment_similarity": 0.0}),
+    ("main_face_ratio 범위 밖", {"main_face_ratio": -0.1}),
   ]:
     try:
       RejudgeConfig(**kwargs)

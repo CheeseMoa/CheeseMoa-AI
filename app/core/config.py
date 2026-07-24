@@ -179,6 +179,9 @@ class Settings(BaseSettings):
   rejudge_fragment_similarity: float = 95.0
   rejudge_top_k: int = 3
   rejudge_max_calls_per_job: int = 150  # $0.001/호출 — 오염 이벤트의 비용 폭주 안전판
+  # 주 인물 자격(ADR-034): 그 사진 최대 얼굴폭 대비 미만인 미배정 얼굴은 배경 인물(행인)로 보고 호출
+  # 없이 제외 — 실측 오컷 0·낭비 호출 60% 절감 + 행인 crop 외부 전송 축소. 0 = 비활성(종전 동작)
+  rejudge_main_face_ratio: float = 0.5
   # crop은 실측과 파리티가 계약 (bbox+0.25 여백·JPEG q92·축소 없음 — render_rejudge_crop 주석)
   rejudge_crop_margin: float = 0.25
   rejudge_crop_jpeg_quality: int = Field(default=92, ge=1, le=100)
@@ -212,6 +215,7 @@ class Settings(BaseSettings):
   nonhuman_label_min_confidence: float = 50.0  # DetectLabels MinConfidence — 응답 하한 (판정 임계와 별개)
   nonhuman_cluster_probe_faces: int = 3  # 신규 앨범 후보당 판정 얼굴 수 — 과반 강등의 분모 상한
   nonhuman_max_calls_per_job: int = 100  # 얼굴당 최대 2콜 × $0.001 — 비용 폭주 안전판
+  nonhuman_main_face_ratio: float = 0.5  # 주 인물 자격(ADR-034) — 미배정 단건 판정에만 적용, 0 = 비활성
   nonhuman_verdicts_prefix: str = "nonhuman-verdicts/"  # 판정 캐시 키 = {prefix}{event_id}.json
 
   log_level: str = "INFO"
@@ -302,6 +306,7 @@ class Settings(BaseSettings):
       fragment_similarity=self.rejudge_fragment_similarity,
       top_k=self.rejudge_top_k,
       max_calls=self.rejudge_max_calls_per_job,
+      main_face_ratio=self.rejudge_main_face_ratio,
     )
 
   def to_pair_rejudge_config(self) -> "PairRejudgeConfig":
@@ -335,6 +340,7 @@ class Settings(BaseSettings):
       label_min_confidence=self.nonhuman_label_min_confidence,
       cluster_probe_faces=self.nonhuman_cluster_probe_faces,
       max_calls=self.nonhuman_max_calls_per_job,
+      main_face_ratio=self.nonhuman_main_face_ratio,
     )
 
   def to_quality_config(self) -> "QualityConfig":
